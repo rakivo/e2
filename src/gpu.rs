@@ -8,8 +8,6 @@ use std::collections::HashMap;
 
 use winit::window::Window;
 
-pub const FONT_SIZE: f32 = 14.0;
-
 const ATLAS_SIZE: u32 = 1024; // 1MB
 const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
 

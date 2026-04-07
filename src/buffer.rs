@@ -80,8 +80,11 @@ impl Buffer {
         match cmd {
             EditorCommand::InsertChar(c)  => self.insert_char(c, cursor),
             EditorCommand::InsertNewline  => self.insert_char('\n', cursor),
+            EditorCommand::InsertNewlineAfter => self.insert_char_after('\n', cursor),
+            EditorCommand::InsertLiteral(l) => self.insert_literal(l, cursor),
             EditorCommand::DeleteBackward => self.delete_backward(cursor),
             EditorCommand::DeleteForward  => self.delete_forward(cursor),
+            EditorCommand::DeleteForwardUntilNewline => self.delete_forward_until_newline(cursor),
             EditorCommand::MoveLeft       => self.move_left(cursor),
             EditorCommand::MoveRight      => self.move_right(cursor),
             EditorCommand::MoveUp         => self.move_vertical(-1, cursor),
@@ -116,8 +119,28 @@ impl Buffer {
         self.relex();
     }
 
+    fn insert_char_after(&mut self, c: char, cursor: &mut Cursor) {
+        let idx = cursor.char_idx.min(self.text.len_chars());
+        self.text.insert_char(idx, c);
+        self.dirty = true;
+        self.relex();
+    }
+
+    fn insert_literal(&mut self, l: &str, cursor: &mut Cursor) {
+        for c in l.chars() {
+            let idx = cursor.char_idx.min(self.text.len_chars());
+            self.text.insert_char(idx, c);
+            cursor.char_idx = idx + 1;
+            cursor.preferred_col = None;
+        }
+
+        self.dirty = true;
+        self.relex();
+    }
+
     fn delete_backward(&mut self, cursor: &mut Cursor) {
         if cursor.char_idx == 0 { return; }
+
         let idx = cursor.char_idx - 1;
         self.text.remove(idx..cursor.char_idx);
         cursor.char_idx = idx;
@@ -129,7 +152,26 @@ impl Buffer {
     fn delete_forward(&mut self, cursor: &mut Cursor) {
         let len = self.text.len_chars();
         if cursor.char_idx >= len { return; }
+
         self.text.remove(cursor.char_idx..cursor.char_idx + 1);
+        cursor.char_idx = cursor.char_idx.min(self.text.len_chars());
+        cursor.preferred_col = None;
+        self.dirty = true;
+        self.relex();
+    }
+
+    fn delete_forward_until_newline(&mut self, cursor: &mut Cursor) {
+        let len = self.text.len_chars();
+        if cursor.char_idx >= len { return; }
+
+        let first_newline = self.text.byte_slice(cursor.char_idx..)
+            .chars()
+            .position(|c| c == '\n')
+            .map(|idx| idx.max(1))
+            .unwrap_or(len);
+
+        self.text.remove(cursor.char_idx..cursor.char_idx+first_newline);
+
         cursor.char_idx = cursor.char_idx.min(self.text.len_chars());
         cursor.preferred_col = None;
         self.dirty = true;
