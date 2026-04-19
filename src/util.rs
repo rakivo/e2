@@ -1,3 +1,5 @@
+#![allow(unused, dead_code)]
+
 use std::{borrow::Cow, fmt::Display};
 
 // pixel coords -> NDC (Y flipped: screen top = NDC +1)

@@ -7,6 +7,7 @@ mod util;
 mod color;
 mod buffer;
 mod command;
+mod tracy;
 mod lexer;
 
 use std::sync::Arc;
@@ -15,16 +16,15 @@ use std::time::{Duration, Instant};
 
 use buffer::{Buffer, Cursor};
 use color::Color;
-use command::EditorCommand;
+use command::{CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::{EntityRef, PrimaryMap};
-use gpu::{Gpu, reset_atlas};
+use gpu::{Gpu, GpuGlyph, reset_atlas};
 use lexer::token_color;
 
 use smallstr::SmallString;
 use smallvec::SmallVec;
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
@@ -49,9 +49,9 @@ pub const fn palette() -> Palette {
     }
 }
 
-const MIN_SCALE:    f32 = 0.75;
-const MAX_SCALE:    f32 = 5.00;
-const SCALE_STEP:   f32 = 0.10;
+const MIN_SCALE:  f32 = 0.75;
+const MAX_SCALE:  f32 = 5.00;
+const SCALE_STEP: f32 = 0.25;
 
 const SCROLL_ANIM_RATE: f32 = 46.67;
 const CURSOR_ANIM_RATE: f32 = 99.420;
@@ -74,6 +74,7 @@ define_base_and_scale! {
     const BASE_FONT_SIZE:     f32 = 15.0;
     const BASE_CURSOR_HEIGHT: f32 = 2.0;
     const BASE_CURSOR_WIDTH:  f32 = 2.0;
+    const BASE_CURSOR_OUTLINE_THICKNESS: f32 = 1.5;
 }
 
 const BLINK_ON_MS:  u128 = 530;
@@ -104,9 +105,9 @@ impl Rect {
         px >= self.x && px < self.x1() && py >= self.y && py < self.y1()
     }
 
-    /// Split horizontally: left gets `ratio` of the width, right gets the rest.
+    /// Left gets `ratio` of the width, right gets the rest.
     #[inline]
-    pub fn split_x(self, ratio: f32) -> (Rect, Rect) {
+    pub fn split_horizontally(self, ratio: f32) -> (Rect, Rect) {
         let mid = (self.x + self.w * ratio).round();
         (
             Rect { x: self.x, y: self.y, w: mid - self.x,        h: self.h },
@@ -114,9 +115,9 @@ impl Rect {
         )
     }
 
-    /// Split vertically: top gets `ratio` of the height, bottom gets the rest.
+    /// Top gets `ratio` of the height, bottom gets the rest.
     #[inline]
-    pub fn split_y(self, ratio: f32) -> (Rect, Rect) {
+    pub fn split_vertically(self, ratio: f32) -> (Rect, Rect) {
         let mid = (self.y + self.h * ratio).round();
         (
             Rect { x: self.x, y: self.y,  w: self.w, h: mid - self.y       },
@@ -130,23 +131,32 @@ pub struct Glyph {
     /// X offset from the line's left content edge (rect.x + PADDING_LEFT)
     pub x:         f32,
 
-    pub width:     f32,
     pub color:     Color,
     pub char:      char,
 
     /// Byte offset within the buffer line's bytes
     pub line_byte: u32,
+
+    pub gpu_glyph: GpuGlyph
+}
+
+impl Glyph {
+    #[inline]
+    fn advance(&self) -> f32 {
+        self.gpu_glyph.advance
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct LineLayout {
     pub buffer_line:     u32,
-    pub wrap_index:      u8,       // Always 0 until word-wrap is added
+    pub wrap_index:      u8,       // Always 0 for now (@Incomplete) :WordWrapping
+
     pub glyph_start:     u32,      // index into TextLayout::glyphs
     pub glyph_count:     u32,
-    pub y:               f32,      // screen Y of the line top
-    pub width:           f32,      // total advance (all glyphs)
-    pub line_byte_start: usize,    // rope byte offset where this line begins
+
+    pub width:           f32,      // Total advance (all glyphs)
+    pub line_byte_start: usize,    // Rope byte offset where this line begins
 }
 
 impl LineLayout {
@@ -156,7 +166,7 @@ impl LineLayout {
     }
 
     /// Screen X of the left edge of column `col`.
-    /// col == glyphs.len()  ->  right edge of the last glyph (end-of-line cursor).
+    /// col == glyphs.len() -> right edge of the last glyph (EOL cursor)
     #[inline]
     pub fn x_for_col(&self, origin_x: f32, col: u32, all_glyphs: &[Glyph]) -> f32 {
         let col = col as usize;
@@ -169,13 +179,13 @@ impl LineLayout {
 
         if col >= glyphs.len() {
             let g = &glyphs[glyphs.len() - 1];
-            return origin_x + g.x + g.width;
+            return origin_x + g.x + g.advance();
         }
 
         origin_x + glyphs[col].x
     }
 
-    /// Width of the glyph at `col`; `fallback` when at/past end-of-line.
+    /// Width of the glyph at `col`; `fallback` when at/past EOL
     #[inline]
     pub fn glyph_width_at_col(&self, col: u32, fallback: f32, all_glyphs: &[Glyph]) -> f32 {
         let col = col as usize;
@@ -188,10 +198,10 @@ impl LineLayout {
 
         if col >= glyphs.len() {
             // At or past EOL - use last glyph's width to mirror Emacs
-            return glyphs.last().map(|g| g.width).unwrap_or(fallback);
+            return glyphs.last().map(|g| g.advance()).unwrap_or(fallback);
         }
 
-        glyphs[col].width.max(fallback)
+        glyphs[col].advance().max(fallback)
     }
 
     /// Hit-test a screen X coordinate to a column index (mid-point snap).
@@ -202,7 +212,7 @@ impl LineLayout {
         let local = screen_x - origin_x;
         let mut col = glyphs.len();
         for (i, g) in glyphs.iter().enumerate() {
-            if local <= g.x + g.width * 0.5 {
+            if local <= g.x + g.advance() * 0.5 {
                 col = i;
                 break;
             }
@@ -215,31 +225,37 @@ impl LineLayout {
 #[derive(Clone, Debug)]
 pub struct TextLayout {
     pub buffer_id:         BufferId,
-    pub rect:              Rect,
-    pub view_scroll:       f32,    // scroll_anim at build time - dirty check
+
+    pub view_scroll:       f32, // view.scroll
     pub line_h:            f32,
     pub font_size:         f32,
     pub first_buffer_line: u32,
+
+    pub rect:              Rect,
+
+    // @Memory @Speed: Reuse these allocations.
+    // Because currently they're being reallocated each frame.
     pub lines:             Vec<LineLayout>,
     pub glyphs:            Vec<Glyph>
 }
 
 impl TextLayout {
-    /// The buffer line of the first visible visual line.
     #[inline]
     pub fn first_visible_buffer_line(&self) -> u32 {
         self.first_buffer_line
     }
 
-    /// Find the LineLayout for a buffer line, if visible.
+    /// Find the LineLayout for a buffer line if visible.
     #[inline]
     pub fn line_for_buffer_line(&self, buffer_line: u32) -> Option<&LineLayout> {
         let offset = buffer_line.checked_sub(self.first_buffer_line)?;
+
         let ll = self.lines.get(offset as usize)?;
-        // Fast path: 1:1 mapping (no word-wrap yet)
         if ll.buffer_line == buffer_line && ll.wrap_index == 0 {
+            // :WordWrapping
             return Some(ll);
         }
+
         // Slow path for future word-wrap
         self.lines.iter().find(|ll| ll.buffer_line == buffer_line && ll.wrap_index == 0)
     }
@@ -253,41 +269,43 @@ impl TextLayout {
 
     /// Full glyph screen rect at (buffer_line, col): [x0, y0, x1, y1].
     #[inline]
-    pub fn glyph_rect(&self, buffer_line: u32, col: u32, fallback_w: f32) -> Option<[f32; 4]> {
+    pub fn glyph_rect(&self, buffer_line: u32, col: u32, fallback_w: f32, scroll_anim: f32) -> Option<[f32; 4]> {
         let ll = self.line_for_buffer_line(buffer_line)?;
+        let y = self.rect.y
+            + (ll.buffer_line - self.first_buffer_line) as f32 * self.line_h
+            - (scroll_anim % self.line_h);
+
         let x0 = ll.x_for_col(self.rect.x + PADDING_LEFT, col, &self.glyphs);
         let x1 = x0 + ll.glyph_width_at_col(col, fallback_w, &self.glyphs);
-        Some([x0, ll.y, x1, ll.y + self.line_h])
+        Some([x0, y, x1, y + self.line_h])
     }
 
     /// Hit-test (mx, my) -> (buffer_line, col).
     #[inline]
-    pub fn hit_test(&self, mx: f32, my: f32) -> (u32, u32) {
+    pub fn hit_test(&self, mx: f32, my: f32, scroll_anim: f32) -> (u32, u32) {
         if self.lines.is_empty() {
             return (self.first_buffer_line, 0);
         }
 
-        // my - rect.y gives offset from top of viewport.
-        // lines[0].y is the screen Y of the first visible line (may be negative
-        // if it's partially scrolled off the top).
-        // So the correct vis_index is derived from the line Y values directly.
-        let vis_index = self.lines
-            .partition_point(|ll| ll.y + self.line_h <= my)
-            .min(self.lines.len() - 1);
-
-        let ll  = &self.lines[vis_index];
-        let col = ll.col_for_screen_x(self.rect.x + PADDING_LEFT, mx, &self.glyphs);
+        let line_f   = (my - self.rect.y + scroll_anim) / self.line_h;
+        let line_idx = (line_f as u32).clamp(
+            self.first_buffer_line,
+            self.first_buffer_line + self.lines.len() as u32 - 1,
+        );
+        let vis_idx  = (line_idx - self.first_buffer_line) as usize;
+        let ll       = &self.lines[vis_idx];
+        let col      = ll.col_for_screen_x(self.rect.x + PADDING_LEFT, mx, &self.glyphs);
         (ll.buffer_line, col)
     }
 
     /// Screen X of the left edge of column `col`.
-    /// col == glyphs.len()  ->  right edge of the last glyph (end-of-line cursor).
+    /// col == glyphs.len()  ->  right edge of the last glyph (EOL cursor).
     #[inline]
     pub fn x_for_col(&self, origin_x: f32, col: u32, line_layout: &LineLayout) -> f32 {
         line_layout.x_for_col(origin_x, col, &self.glyphs)
     }
 
-    /// Width of the glyph at `col`; `fallback` when at/past end-of-line.
+    /// Width of the glyph at `col`; `fallback` when at/past EOL.
     #[inline]
     pub fn glyph_width_at_col(&self, col: u32, fallback: f32, line_layout: &LineLayout) -> f32 {
         line_layout.glyph_width_at_col(col, fallback, &self.glyphs)
@@ -301,6 +319,7 @@ impl TextLayout {
 }
 
 /// Build the TextLayout for a single leaf panel
+
 fn build_text_layout(
     gpu:       &mut Gpu,
     buffer:    &Buffer,
@@ -309,18 +328,20 @@ fn build_text_layout(
     font_size: f32,
     line_h:    f32,
 ) -> TextLayout {
-    let first_line = (view.scroll / line_h) as u32;
-    let line_count = (rect.h / line_h) as u32 + 2;
+    let _tracy = tracy::span!("build_text_layout");
+
+    let first_line = (view.scroll_anim / line_h) as u32;
+    let line_count = (rect.h / line_h) as u32 + 4;
 
     let default_color = token_color(lexer::TokenKind::Default);
-    let tokens        = &buffer.tokens;
+    let tokens        = &buffer.visible_tokens;
 
     let first_visible_byte = buffer.text.line_to_byte(first_line as usize);
 
     let mut current_token = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
 
+    // @Memory
     let mut lines  = Vec::with_capacity(line_count as usize);
-
     let mut glyphs = Vec::with_capacity(80);
 
     for vis_i in 0..line_count {
@@ -332,14 +353,9 @@ fn build_text_layout(
 
         let line_byte_start = buffer.text.line_to_byte(line_index as usize);
 
-        // Compute the Y of this visual line.
-        // Fractional scroll offset keeps the top line partially visible.
-        let screen_y = rect.y + vis_i as f32 * line_h - (view.scroll % line_h);
-
         let mut ll = LineLayout {
             buffer_line:     line_index,
             wrap_index:      0,
-            y:               screen_y,
             width:           0.0,
             glyph_count:     0,
             glyph_start:     0,
@@ -352,8 +368,8 @@ fn build_text_layout(
 
             let glyph_start = glyphs.len() as u32;
 
-            for ch in rope_line.chars() {
-                if ch == '\n' { break; }
+            for char in rope_line.chars() {
+                if char == '\n' { break; }
 
                 // Advance token cursor past tokens that end before this byte
                 while current_token < tokens.len() {
@@ -378,20 +394,21 @@ fn build_text_layout(
                     default_color
                 };
 
-                let advance = gpu::get_glyph(gpu, ch, font_size)
-                    .map(|g| g.advance)
-                    .unwrap_or(8.0);
+                let gpu_glyph = gpu::get_glyph(gpu, char, font_size)
+                    .unwrap_or_else(|| gpu::get_glyph(gpu, 'A', font_size).unwrap());
+
+                let advance = gpu_glyph.advance;
 
                 glyphs.push(Glyph {
                     x:         local_x,
-                    width:     advance,
                     color,
-                    char: ch,
+                    char,
                     line_byte: byte_off as u32,
+                    gpu_glyph,
                 });
 
                 local_x  += advance;
-                byte_off += ch.len_utf8();
+                byte_off += char.len_utf8();
             }
 
             ll.glyph_start = glyph_start;
@@ -405,7 +422,7 @@ fn build_text_layout(
     TextLayout {
         buffer_id:         view.buffer_id,
         rect,
-        view_scroll:       view.scroll_anim,
+        view_scroll:       view.scroll,
         line_h,
         font_size,
         first_buffer_line: first_line,
@@ -419,16 +436,23 @@ fn render_text_layout(
     layout:      &TextLayout,
     buffer:      &Buffer,
     view:        &View,
+    active_view_id: ViewId,
     scale:       f32,
     show_cursor: bool,
     scratch_paren: &mut Vec<char>,
-    scratch_line:  &mut String,
 ) {
+    let _tracy = tracy::span!("render_text_layout");
+
+    let line_y = |buffer_line: u32| -> f32 {
+        layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim
+    };
+
     let rect         = layout.rect;
     let line_h       = layout.line_h;
     let font_size    = layout.font_size;
     let min_cursor_w = scale_base_cursor_width(scale);
     let cursor_h     = scale_base_cursor_height(scale);
+    let cursor_outline_thickness = scale_base_cursor_outline_thickness(scale);
     let origin_x     = rect.x + PADDING_LEFT;
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
@@ -442,12 +466,16 @@ fn render_text_layout(
 
     let min_cursor_w = min_cursor_w.max(space_width);
 
+    let is_this_view_focused = active_view_id == view.id;
+
     //
     //
     // Selection
     //
     //
     if let Some(anchor) = view.cursor.anchor_char_index {
+        let _tracy = tracy::span!("render_text_layout::selection");
+
         let c = view.cursor.char_index;
         let (start_index, end_index) = if anchor <= c { (anchor, c) } else { (c, anchor) };
 
@@ -460,7 +488,7 @@ fn render_text_layout(
 
             for line_index in draw_start..=draw_end {
                 let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
-                let y = ll.y + cursor_h;
+                let y = line_y(line_index) + cursor_h;
 
                 let (x0, x1) = if start_line == end_line {
                     (layout.x_for_col(origin_x, start_col, ll), layout.x_for_col(origin_x, end_col, ll))
@@ -487,7 +515,9 @@ fn render_text_layout(
     //
     //
     if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
-        let y = ll.y + cursor_h;
+        let _tracy = tracy::span!("render_text_layout::current_line");
+
+        let y = view.cursor_anim_y + cursor_h;
 
         let has_selection = view.cursor.anchor_char_index
             .map(|a| a != view.cursor.char_index)
@@ -540,36 +570,39 @@ fn render_text_layout(
             if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
                 let x = layout.x_for_col(origin_x, cursor_col, ll);
                 let w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll);
-                gpu::draw_rect(gpu, x, ll.y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+                let y = line_y(cursor_line) + cursor_h;
+                gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
             }
         }
+
         // Matching paren
         if m_line >= vis_start && m_line < vis_end {
             if let Some(ll) = layout.line_for_buffer_line(m_line) {
                 let x = layout.x_for_col(origin_x, m_col, ll);
                 let w = layout.glyph_width_at_col(m_col, min_cursor_w, ll);
-                gpu::draw_rect(gpu, x, ll.y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+                let y = line_y(m_line) + cursor_h;
+                gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
             }
         }
     }
 
     //
     //
-    // Cursor
+    // Cursor (on the focused view (filled in rectangle))
     //
     //
-    if show_cursor {
-        if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
-            let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
-            gpu::draw_rect(
-                gpu,
-                view.cursor_anim_x,
-                view.cursor_anim_y + cursor_h,
-                cursor_glyph_w,
-                line_h + cursor_h,
-                palette().cursor,
-            );
-        }
+    if show_cursor && is_this_view_focused
+        && let Some(ll) = layout.line_for_buffer_line(cursor_line)
+    {
+        let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
+        gpu::draw_rect(
+            gpu,
+            view.cursor_anim_x,
+            view.cursor_anim_y + cursor_h,
+            cursor_glyph_w,
+            line_h + cursor_h,
+            palette().cursor,
+        );
     }
 
     //
@@ -580,21 +613,39 @@ fn render_text_layout(
     let default_color = token_color(lexer::TokenKind::Default);
 
     for ll in &layout.lines {
-        if ll.glyphs(&layout.glyphs).is_empty() { continue; }
+        let glyphs = ll.glyphs(&layout.glyphs);
+        if glyphs.is_empty() { continue; }
 
-        scratch_line.clear();
-        scratch_line.extend(ll.glyphs(&layout.glyphs).iter().map(|g| g.char));
-
-        let y = ll.y + line_h;
+        let y = line_y(ll.buffer_line) + line_h;
         let is_cursor_line = ll.buffer_line == cursor_line;
 
-        gpu::draw_text_colored(gpu, &scratch_line, origin_x, y, font_size, |char_index| {
-            if is_cursor_line && char_index as u32 == cursor_col && show_cursor {
+        gpu::draw_text_colored_with_precomputed_glyphs(gpu, glyphs, origin_x, y, |char_index| {
+            if is_this_view_focused && show_cursor && is_cursor_line && char_index as u32 == cursor_col {
                 palette().cursor_text
             } else {
-                ll.glyphs(&layout.glyphs).get(char_index).map(|g| g.color).unwrap_or(default_color)
+                glyphs.get(char_index).map(|g| g.color).unwrap_or(default_color)
             }
         });
+    }
+
+    //
+    //
+    // Cursor (on the UNfocused view (outlined rectangle))
+    //
+    //
+    if show_cursor && !is_this_view_focused
+        && let Some(ll) = layout.line_for_buffer_line(cursor_line)
+    {
+        let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
+        gpu::draw_rect_outline(
+            gpu,
+            view.cursor_anim_x,
+            view.cursor_anim_y + cursor_h,
+            cursor_glyph_w,
+            line_h + cursor_h,
+            cursor_outline_thickness,
+            palette().cursor,
+        );
     }
 }
 
@@ -670,15 +721,15 @@ impl View {
     pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top    = line as f32 * line_h;
         let cursor_bottom = cursor_top + line_h;
-        let margin        = line_h * 3.0;
 
-        if cursor_top - margin < self.scroll {
-            self.scroll = (cursor_top - margin).max(0.0);
+        // Only scroll when cursor is fully off screen - no margin
+        if cursor_top < self.scroll {
+            self.scroll = cursor_top;
         }
 
         let view_bottom = self.scroll + rect.h;
-        if cursor_bottom + margin > view_bottom {
-            self.scroll = cursor_bottom + margin - rect.h;
+        if cursor_bottom > view_bottom {
+            self.scroll = cursor_bottom - rect.h;
         }
     }
 
@@ -700,7 +751,7 @@ impl View {
 
     #[inline]
     pub fn line_to_screen_y(&self, line: u32, rect: Rect, line_h: f32) -> f32 {
-        rect.y + line as f32 * line_h - self.scroll_anim
+        rect.y + line as f32 * line_h - self.scroll
     }
 }
 
@@ -710,36 +761,38 @@ impl View {
 
 pub struct EditorState {
     // Storage
-    pub buffers:      PrimaryMap<BufferId, Buffer>,
-    pub views:        PrimaryMap<ViewId,   View>,
-    pub panels:       PrimaryMap<PanelId,  Panel>,
+    pub buffers:         PrimaryMap<BufferId, Buffer>,
+    pub views:           PrimaryMap<ViewId,   View>,
+    pub panels:          PrimaryMap<PanelId,  Panel>,
 
     // Which panel is active (receives keyboard input)
-    pub active_panel: PanelId,
+    pub active_panel:    PanelId,
 
     // Root panel id - its rect always equals the window
-    pub root_panel:   PanelId,
+    pub root_panel:      PanelId,
 
     // Scale for font/line-height
-    pub scale:        f32,
+    pub scale:           f32,
 
     // Cursor blink
-    pub blink_epoch:  Instant,
+    pub blink_epoch:     Instant,
 
     // Mouse
-    pub mouse_pos:            (f32, f32),
-    pub mouse_left_pressed:   bool,
+    pub mouse_pos:          (f32, f32),
+    pub mouse_left_pressed: bool,
 
-    scratch_line:       String,
-    scratch_paren:      Vec<char>,
+    scratch_paren:       Vec<char>,
 
     pub frame_count:     u32,
     pub last_fps_time:   Instant,
     pub last_frame_time: Instant,
     pub fps:             f32,
 
+    pub relex_us_acc:    f32,
     pub build_us_acc:    f32,
     pub render_us_acc:   f32,
+
+    pub relex_us:        f32,
     pub build_us:        f32,
     pub render_us:       f32,
 }
@@ -763,7 +816,6 @@ impl EditorState {
             views,
             panels,
             scratch_paren: Default::default(),
-            scratch_line: Default::default(),
             active_panel: panel_id,
             root_panel:   panel_id,
             scale:        1.0,
@@ -774,11 +826,20 @@ impl EditorState {
             frame_count:   0,
             last_fps_time: Instant::now(),
             fps:           0.0,
+            relex_us_acc:  0.0,
             build_us_acc:  0.0,
+            relex_us:  0.0,
             build_us:  0.0,
             render_us_acc:  0.0,
             render_us:  0.0,
         }
+    }
+
+    pub fn view_and_buffer(&mut self, view_id: ViewId) -> (&View, &Buffer) {
+        let buf_id = self.views[view_id].buffer_id;
+        let view   = &self.views[view_id];
+        let buffer = &self.buffers[buf_id];
+        (view, buffer)
     }
 
     pub fn view_and_buffer_mut(&mut self, view_id: ViewId) -> (&mut View, &mut Buffer) {
@@ -791,6 +852,11 @@ impl EditorState {
     pub fn active_view_and_buffer_mut(&mut self) -> (&mut View, &mut Buffer) {
         let view_id = self.active_view_id();
         self.view_and_buffer_mut(view_id)
+    }
+
+    pub fn active_view_and_buffer(&mut self) -> (&View, &Buffer) {
+        let view_id = self.active_view_id();
+        self.view_and_buffer(view_id)
     }
 
     pub fn panel(&self, id: PanelId) -> &Panel { &self.panels[id] }
@@ -832,9 +898,9 @@ impl EditorState {
         };
 
         let (r_left, r_right) = if split.vertical {
-            rect.split_x(split.ratio)
+            rect.split_horizontally(split.ratio)
         } else {
-            rect.split_y(split.ratio)
+            rect.split_vertically(split.ratio)
         };
 
         self.layout_panel(split.left_id,  r_left);
@@ -987,6 +1053,8 @@ impl EditorState {
 }
 
 fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
+    let _tracy = tracy::span!("animate_views");
+
     let epsilon       = 0.5f32; // Stop animating when close enough
     let mut animating = false;
 
@@ -1012,26 +1080,22 @@ fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
         let (cursor_line, cursor_col) = (view.cursor_target_line, view.cursor_target_col);
 
         if let Some(target_x) = layout.cursor_x(cursor_line, cursor_col) {
-            let target_y = layout.line_for_buffer_line(cursor_line)
-                .map(|ll| ll.y)
-                .unwrap_or_else(|| view.line_to_screen_y(cursor_line, layout.rect, line_h));
+            // Compute target Y from scroll_anim so cursor tracks the animated scroll,
+            // not the settled scroll position
+            let target_y = layout.rect.y + cursor_line as f32 * line_h - view.scroll_anim;
 
-            let dx = target_x - view.cursor_anim_x;
             let dy = target_y - view.cursor_anim_y;
 
-            if dx.abs() > epsilon {
-                view.cursor_anim_x += dx * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
-                animating = true;
-            } else {
-                view.cursor_anim_x = target_x;
-            }
-
-            if dy.abs() > epsilon {
+            if dy.abs() > layout.rect.h {
+                view.cursor_anim_y = target_y;
+            } else if dy.abs() > epsilon {
                 view.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
                 animating = true;
             } else {
                 view.cursor_anim_y = target_y;
             }
+
+            view.cursor_anim_x = target_x;
         }
     }
 
@@ -1043,6 +1107,8 @@ fn find_matching_paren(
     start_line: u32, start_col: u32,
     scratch_paren: &mut Vec<char>,
 ) -> Option<(u32, u32)> {
+    let _tracy = tracy::span!("find_matching_paren");
+
     let (open, close, dir) = {
         let ch = char_at_line_col(buffer, start_line, start_col)?;
 
@@ -1091,6 +1157,9 @@ fn find_matching_paren(
             scratch_paren.clear();
             scratch_paren.extend(text.chars().take(end_col as usize));
 
+            scratch_paren.clear();
+            scratch_paren.extend(text.chars().take(end_col as usize));
+
             for col in (0..scratch_paren.len()).rev() {
                 let ch = scratch_paren[col];
                 if ch == close      { depth += 1; }
@@ -1122,7 +1191,7 @@ fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, V
     }
 }
 
-fn apply_scale(editor: &mut EditorState, _gpu: &Gpu, new_scale: f32, anchor_my: Option<f32>) {
+fn apply_scale(editor: &mut EditorState, new_scale: f32, anchor_my: Option<f32>) {
     let old_line_h = editor.line_h();
     editor.scale = new_scale.clamp(MIN_SCALE, MAX_SCALE);
     let new_line_h = editor.line_h();
@@ -1136,6 +1205,21 @@ fn apply_scale(editor: &mut EditorState, _gpu: &Gpu, new_scale: f32, anchor_my: 
         // Recompute scroll so that same line stays at anchor_y
         view.scroll = (line_at_anchor * new_line_h - anchor_y).max(0.0);
         view.scroll_anim = view.scroll;
+        view.layout = None;
+    }
+}
+
+fn rescale(editor: &mut EditorState, gpu: &mut Gpu, new_scale: f32) {
+    let new = new_scale.clamp(MIN_SCALE, MAX_SCALE);
+    if new != editor.scale {
+        reset_atlas(gpu);
+        apply_scale(editor, new, None);
+        force_layouts_from_all_views_to_rebuild(editor);
+    }
+}
+
+fn force_layouts_from_all_views_to_rebuild(editor: &mut EditorState) {
+    for view in editor.views.values_mut() {
         view.layout = None;
     }
 }
@@ -1172,9 +1256,31 @@ fn scroll_page(editor: &mut EditorState, _gpu: &Gpu, direction: i32) {
     editor.reset_blink();
 }
 
-//
-// App - winit plumbing
-//
+pub fn snap_cursor_to_target_point_in_active_view(editor: &mut EditorState) {
+    let view_id  = editor.active_view_id();
+    let panel_id = editor.active_panel;
+    let rect     = editor.panels[panel_id].rect;
+
+    let (view, buf) = editor.active_view_and_buffer();
+    let (line, col) = buf.cursor_line_col(&view.cursor);
+
+    editor.snap_cursor_to_target(view_id, line, col, rect);
+}
+
+pub fn scroll_to_cursor(editor: &mut EditorState) {
+    let view_id = editor.active_view_id();
+    let (view, buf) = editor.active_view_and_buffer_mut();
+
+    let (line, col) = buf.cursor_line_col(&view.cursor);
+
+    let line_h   = editor.line_h();
+    let panel_id = editor.active_panel;
+    let rect     = editor.panels[panel_id].rect;
+
+    editor.views[view_id].scroll_to_cursor(line, line_h, rect);
+    editor.views[view_id].cursor_target_col  = col;
+    editor.views[view_id].cursor_target_line = line;
+}
 
 #[derive(Default)]
 struct App {
@@ -1182,6 +1288,8 @@ struct App {
     editor: Option<EditorState>,
     window: Option<Arc<Window>>,
     mods:   winit::event::Modifiers,
+    command_table: CommandTable,
+    keymap: Keymap
 }
 
 impl ApplicationHandler for App {
@@ -1198,8 +1306,7 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu::init(Arc::clone(&win)));
 
         let path   = std::env::args().nth(1).expect("usage: naysayer <file>");
-
-        let buffer = Buffer::from_file(std::path::Path::new(&path)).expect("failed to open file");
+        let buffer = Buffer::from_file(path.as_ref()).expect("failed to open file");
 
         let mut editor = EditorState::new(buffer);
         editor.layout_panels(Rect::full(w as f32, h as f32));
@@ -1239,6 +1346,16 @@ impl ApplicationHandler for App {
         let shift = self.mods.state().shift_key();
         let alt   = self.mods.state().alt_key();
 
+        macro_rules! make_command_context {
+            ($event: expr) => {
+                CommandContext {
+                    editor, gpu,
+                    mods: self.mods, event: $event, command_table: &self.command_table,
+                    last_executed_command: None
+                }
+            };
+        }
+
         match event {
             WindowEvent::CloseRequested => el.exit(),
 
@@ -1247,154 +1364,15 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed { return; }
 
-                // Scale
-                if ctrl {
-                    match &event.logical_key {
-                        Key::Character(s) => match s.as_str() {
-                            "=" | "+" => {
-                                let new = (editor.scale + SCALE_STEP).clamp(MIN_SCALE, MAX_SCALE);
-                                if new != editor.scale {
-                                    reset_atlas(gpu);
-                                    apply_scale(editor, gpu, new, None);
-                                    win.request_redraw();
-                                }
-                                return;
-                            }
-                            "-" => {
-                                let new = (editor.scale - SCALE_STEP).clamp(MIN_SCALE, MAX_SCALE);
-                                if new != editor.scale {
-                                    reset_atlas(gpu);
-                                    apply_scale(editor, gpu, new, None);
-                                    win.request_redraw();
-                                }
-                                return;
-                            }
-                            "0" => {
-                                reset_atlas(gpu);
-                                apply_scale(editor, gpu, 1.0, None);
-                                win.request_redraw();
-                                return;
-                            }
-                            _ => {}
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Split: Ctrl-2 = vertical split, Ctrl-1
-                if ctrl {
-                    if let PhysicalKey::Code(KeyCode::Digit2) = event.physical_key {
-                        let win_rect = Rect::full(gpu.win_w, gpu.win_h);
-                        editor.split_active(true, 0.5);
-                        editor.layout_panels(win_rect);
-                        win.request_redraw();
+                let mods = Mods { alt, ctrl, shift };
+                if let Some(command_name) = self.keymap.lookup(&event, mods) {
+                    let Some(command) = self.command_table.get(command_name) else {
                         return;
-                    }
+                    };
 
-                    if let PhysicalKey::Code(KeyCode::Digit1) = event.physical_key {
-                        let win_rect = Rect::full(gpu.win_w, gpu.win_h);
-                        editor.close_active();
-                        editor.layout_panels(win_rect);
-                        // Invalidate layouts
-                        for view in editor.views.values_mut() {
-                            view.layout = None;
-                        }
-                        win.request_redraw();
-                        return;
-                    }
-                }
-
-                if alt {
-                    if let PhysicalKey::Code(KeyCode::Digit2) = event.physical_key {
-                        editor.toggle_active_panel();
-                        return;
-                    }
-                }
-
-                let view_id = editor.active_view_id();
-                let (view, buf) = editor.active_view_and_buffer_mut();
-
-                let cmd = match &event.logical_key {
-                    Key::Named(NamedKey::ArrowLeft)  => Some(EditorCommand::MoveLeft),
-                    Key::Named(NamedKey::ArrowRight) => Some(EditorCommand::MoveRight),
-                    Key::Named(NamedKey::ArrowUp)    => Some(EditorCommand::MoveUp),
-                    Key::Named(NamedKey::ArrowDown)  => Some(EditorCommand::MoveDown),
-
-                    Key::Named(NamedKey::Home) => Some(if ctrl { EditorCommand::MoveFileStart } else { EditorCommand::MoveLineStart }),
-                    Key::Named(NamedKey::End)  => Some(if ctrl { EditorCommand::MoveFileEnd   } else { EditorCommand::MoveLineEnd   }),
-
-                    Key::Named(NamedKey::Backspace) => { view.cursor.unset_anchor(); Some(EditorCommand::DeleteBackward) }
-                    Key::Named(NamedKey::Delete)    => { view.cursor.unset_anchor(); Some(EditorCommand::DeleteForward)  }
-                    Key::Named(NamedKey::Enter)     => { view.cursor.unset_anchor(); Some(EditorCommand::InsertNewline)  }
-                    Key::Named(NamedKey::Tab)       => { view.cursor.unset_anchor(); Some(EditorCommand::InsertLiteral("    ")) }
-
-                    Key::Character(s) if ctrl => match s.as_str() {
-                        "a" => Some(EditorCommand::MoveLineStart),
-                        "e" => Some(EditorCommand::MoveLineEnd),
-                        "f" => Some(EditorCommand::MoveRight),
-                        "b" => Some(EditorCommand::MoveLeft),
-                        "n" => Some(EditorCommand::MoveDown),
-                        "p" => Some(EditorCommand::MoveUp),
-                        "o" => { view.cursor.unset_anchor(); Some(EditorCommand::InsertNewlineAfter) }
-                        "d" => { view.cursor.unset_anchor(); Some(EditorCommand::DeleteForward) }
-                        "k" => { view.cursor.unset_anchor(); Some(EditorCommand::DeleteForwardUntilNewline) },
-                        "g" => { view.cursor.unset_anchor(); None }
-                        "v" => { scroll_page(editor, gpu, 1);  editor.reset_blink(); win.request_redraw(); return; }
-                        _   => None,
-                    }
-
-                    Key::Character(s) if alt && shift => match s.as_str() {
-                        "<" => Some(EditorCommand::MoveFileStart),
-                        ">" => Some(EditorCommand::MoveFileEnd),
-                        _ => None
-                    }
-
-                    Key::Named(NamedKey::Space) => if ctrl {
-                        view.cursor.set_anchor();
-                        None
-                    } else {
-                        view.cursor.unset_anchor();
-                        Some(EditorCommand::InsertChar(' '))
-                    }
-
-                    Key::Character(s) if alt => match s.as_str() {
-                        "v" => { scroll_page(editor, gpu, -1); editor.reset_blink(); win.request_redraw(); return; }
-                        _ => None
-                    }
-
-                    //
-                    // Basic insert character
-                    //
-                    Key::Character(s) if !ctrl => {
-                        view.cursor.unset_anchor();
-                        s.chars().next().map(EditorCommand::InsertChar)
-                    }
-
-                    _ => None,
-                };
-
-                if let Some(cmd) = cmd {
-                    let _is_cmd_insert    = cmd.is_insert();
-                    let is_cmd_big_scroll = cmd.is_big_scroll();
-
-                    buf.apply(cmd, &mut view.cursor);
-
-                    let (line, col) = buf.cursor_line_col(&view.cursor);
-
-                    let line_h   = editor.line_h();
-                    let panel_id = editor.active_panel;
-                    let rect     = editor.panels[panel_id].rect;
-
-                    editor.views[view_id].scroll_to_cursor(line, line_h, rect);
-                    editor.views[view_id].cursor_target_col  = col;
-                    editor.views[view_id].cursor_target_line = line;
-
-                    if is_cmd_big_scroll {
-                        editor.snap_cursor_to_target(view_id, line, col, rect);
-                    }
-
-                    editor.reset_blink();
-
+                    let mut cx = make_command_context!(&event);
+                    cx.last_executed_command = Some(command);
+                    (command.func)(&mut cx);
                     win.request_redraw();
                 }
             }
@@ -1405,13 +1383,9 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p)   => p.y as f32 * 0.01,
                     };
-                    let new = (editor.scale + dy * 0.055).clamp(MIN_SCALE, MAX_SCALE);
-                    if new != editor.scale {
-                        reset_atlas(gpu);
-                        let (_, my) = editor.mouse_pos;
-                        apply_scale(editor, gpu, new, Some(my));
-                        win.request_redraw();
-                    }
+                    let new = (editor.scale + dy * 0.075).clamp(MIN_SCALE, MAX_SCALE);
+                    rescale(editor, gpu, new);
+                    win.request_redraw();
                     return;
                 }
 
@@ -1449,7 +1423,7 @@ impl ApplicationHandler for App {
                 } else if cur_line > last_vis {
                     last_vis.min(total.saturating_sub(1) as u32) as u32
                 } else {
-                    cur_line // still visible, don't move
+                    cur_line // Still visible, don't move
                 };
 
                 if new_line != cur_line {
@@ -1481,9 +1455,10 @@ impl ApplicationHandler for App {
                 if let PanelKind::Leaf { view_id } = editor.panels[editor.active_panel].kind {
                     let rect      = editor.panels[editor.active_panel].rect;
                     let buf_id    = editor.views[view_id].buffer_id;
+                    let scroll_anim = editor.views[view_id].scroll_anim;
 
                     let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
-                        layout.hit_test(mx, my)
+                        layout.hit_test(mx, my, scroll_anim)
                     } else { // @Robustness
                         let line_h = editor.line_h();
                         let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
@@ -1515,9 +1490,10 @@ impl ApplicationHandler for App {
                     if let PanelKind::Leaf { view_id } = editor.panels[pid].kind {
                         let rect      = editor.panels[pid].rect;
                         let buf_id    = editor.views[view_id].buffer_id;
+                        let scroll_anim = editor.views[view_id].scroll_anim;
 
                         let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
-                            layout.hit_test(mx, my)
+                            layout.hit_test(mx, my, scroll_anim)
                         } else { // @Robustness
                             let line_h = editor.line_h();
                             let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
@@ -1555,6 +1531,8 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                tracy_client::frame_mark();
+
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
                 editor.last_frame_time = now;
@@ -1563,12 +1541,14 @@ impl ApplicationHandler for App {
                 let elapsed = editor.last_fps_time.elapsed().as_secs_f32();
                 if elapsed >= 0.5 {
                     editor.fps       = editor.frame_count as f32 / elapsed;
-                    editor.build_us  = editor.build_us_acc  / editor.frame_count as f32;
-                    editor.render_us = editor.render_us_acc / editor.frame_count as f32;
+                    editor.build_us  = editor.build_us_acc       / editor.frame_count as f32;
+                    editor.render_us = editor.render_us_acc      / editor.frame_count as f32;
+                    editor.relex_us  = editor.relex_us_acc       / editor.frame_count as f32;
 
                     editor.frame_count    = 0;
                     editor.last_fps_time  = Instant::now();
                     editor.build_us_acc   = 0.0;
+                    editor.relex_us_acc   = 0.0;
                     editor.render_us_acc  = 0.0;
                 }
 
@@ -1590,7 +1570,7 @@ impl ApplicationHandler for App {
                     ));
                 }
 
-                let _still_animating = animate_views(editor, dt);
+                let still_animating = animate_views(editor, dt);
 
                 let font_size    = editor.font_size();
                 let line_h       = editor.line_h();
@@ -1600,30 +1580,57 @@ impl ApplicationHandler for App {
                 let mut leaf_panels = Default::default();
                 collect_leaves(editor.panels.as_values_slice(), editor.root_panel, &mut leaf_panels);
 
-                for (panel_id, view_id, rect) in leaf_panels {
-                    let buf_id  = editor.views[view_id].buffer_id;
+                let mut should_request_redraw = false;
 
-                    let dirty = editor.buffers[buf_id].dirty
-                        || editor.views[view_id].layout.is_none()
+                should_request_redraw |= still_animating;
+
+                for (panel_id, view_id, rect) in leaf_panels {
+                    let buf_id = editor.views[view_id].buffer_id;
+
+                    let screen_lines = (rect.h / line_h) as u32;
+                    let anim_first = (editor.views[view_id].scroll_anim / line_h) as u32;
+                    let is_dirty = editor.buffers[buf_id].dirty
                         || editor.views[view_id].layout.as_ref().map(|l| {
-                            let current_first = (editor.views[view_id].scroll / line_h) as usize;
-                            let layout_first  = l.first_buffer_line as usize;
-                            // Rebuild when the target scroll would show different lines,
-                            // or when rect changes, or font changes.
-                            // NOT when scroll_anim changes - that's just animation.
-                            current_first != layout_first
+                            anim_first < l.first_buffer_line
+                                || anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
                                 || (l.rect.w - rect.w).abs() > 0.5
                                 || (l.rect.h - rect.h).abs() > 0.5
                                 || (l.font_size - font_size).abs() > 0.01
                         }).unwrap_or(true);
 
-                    if dirty {
+                    should_request_redraw |= is_dirty;
+
+                    if is_dirty {
+                        //
+                        // @Speed @Note:
+                        //
+                        // Currently we re-lex visible tokens on every dirty frame,
+                        // thats fine for now, since those conditions inside is_dirty
+                        // make sure that either the amount of lines we see has changed,
+                        // OR we now see completely different lines that in the previous frame.
+                        //
+                        // BUT, in the future, we might wanna have a different flag for this re-lex step.
+                        //
+                        {
+                            let t0 = Instant::now();
+
+                            let total      = editor.buffers[buf_id].text.len_lines();
+                            let scroll     = editor.views[view_id].scroll;
+                            let first_vis  = (scroll / line_h) as u32;
+                            let last_vis = (((scroll + rect.h) / line_h) as usize)
+                                .saturating_sub(1)
+                                .min(total.saturating_sub(1)) as u32;
+
+                            editor.buffers[buf_id].lex_visible(first_vis as _, last_vis as _);
+
+                            editor.relex_us_acc = t0.elapsed().as_micros() as f32;
+                        }
+
                         let should_snap = editor.views[view_id].layout.as_ref()
                             .map(|l| {
                                 (l.rect.w - rect.w).abs() > 0.5
                                     || (l.rect.h - rect.h).abs() > 0.5
-                            })
-                            .unwrap_or(true);
+                            }).unwrap_or(true); // true = first build
 
                         let t0 = Instant::now();
                         let layout = build_text_layout(
@@ -1636,12 +1643,12 @@ impl ApplicationHandler for App {
 
                         editor.views[view_id].layout = Some(layout);
 
-                        let (cl, cc) = (
-                            editor.views[view_id].cursor_target_line,
-                            editor.views[view_id].cursor_target_col,
-                        );
-
                         if should_snap {
+                            let (cl, cc) = (
+                                editor.views[view_id].cursor_target_line,
+                                editor.views[view_id].cursor_target_col,
+                            );
+
                             editor.snap_cursor_to_target(view_id, cl, cc, rect);
                         }
                     }
@@ -1661,10 +1668,10 @@ impl ApplicationHandler for App {
                         gpu, layout,
                         &editor.buffers[buf_id],
                         &editor.views[view_id],
+                        editor.active_view_id(),
                         editor.scale,
                         show_cursor,
                         &mut editor.scratch_paren,
-                        &mut editor.scratch_line,
                     );
                     editor.render_us += t1.elapsed().as_micros() as f32;
                 }
@@ -1675,11 +1682,13 @@ impl ApplicationHandler for App {
                 }
 
                 let mut perf = SmallString::<[u8; 128]>::new();
-                _ = writeln!(&mut perf, "{:.0} fps  build:{}us  render:{}us", editor.fps, editor.build_us, editor.render_us);
-                gpu::draw_text(gpu, &perf, gpu.win_w - 312.0, 14.0, 12.0, Color::rgba(120, 120, 120, 255));
-
+                _ = writeln!(&mut perf, "{:.0} fps  build:{:.2}us  relex:{:.2}us  render:{:.2}us", editor.fps, editor.build_us, editor.relex_us, editor.render_us);
+                gpu::draw_text(gpu, &perf, gpu.win_w - 456.0, 14.0, 12.0, Color::rgba(120, 120, 120, 255));
                 gpu::submit_frame(gpu).unwrap();
-                win.request_redraw();
+
+                if should_request_redraw {
+                    win.request_redraw();
+                }
             }
 
             _ => {}
@@ -1688,7 +1697,13 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    let _client = tracy_client::Client::start();
+
     let el = EventLoop::new().unwrap();
     el.set_control_flow(ControlFlow::Wait);
-    el.run_app(&mut App::default()).unwrap();
+
+    let command_table = CommandTable::from_inventory();
+    let keymap = Keymap::default_keymap();
+    let mut app = App { command_table, keymap, ..Default::default() };
+    _ = el.run_app(&mut app);
 }

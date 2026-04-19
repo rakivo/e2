@@ -1,5 +1,7 @@
+#![allow(unused, dead_code)]
+
 use crate::color::{GpuColor, Color};
-use crate::palette;
+use crate::{palette, tracy};
 use crate::util::px;
 
 use std::ops::Range;
@@ -13,8 +15,8 @@ const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
 
 const VTX_BUF_CAP: u64 = 64 * 1024;
 
-#[derive(Default, Clone, Copy)]
-pub struct Glyph {
+#[derive(Default, Debug, Clone, Copy)]
+pub struct GpuGlyph {
     pub uv_x: f32,      pub uv_y: f32,
     pub uv_w: f32,      pub uv_h: f32,
     pub w: u32,         pub h: u32,
@@ -63,7 +65,7 @@ pub struct Gpu {
     pub atlas_cur_x:    u32,
     pub atlas_cur_y:    u32,
     pub atlas_row_h:    u32,
-    pub glyphs:         HashMap<(char, u32), Glyph>, // (char, (font size * 10.0) as u32) -> Glyph
+    pub glyphs:         HashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
     pub font:           fontdue::Font,
 
     pub vtx_buf_cap:    u64,
@@ -236,7 +238,7 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 // Glyph rasterization
 //
 
-pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<Glyph> {
+pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
     let size = (size * 2.0).round() / 2.0; // snap to 0.5px increments
     let key = (c, (size * 2.0) as u32);
     if let Some(g) = gpu.glyphs.get(&key) {
@@ -246,7 +248,7 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<Glyph> {
     let (metrics, bitmap) = gpu.font.rasterize(c, size);
     if metrics.width == 0 || metrics.height == 0 {
         // Cache the miss so we don't re-rasterize
-        let g = Glyph { advance: metrics.advance_width, ..Default::default() };
+        let g = GpuGlyph { advance: metrics.advance_width, ..Default::default() };
         gpu.glyphs.insert(key, g);
         return Some(g);
     }
@@ -281,7 +283,7 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<Glyph> {
         wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
     );
 
-    let g = Glyph {
+    let g = GpuGlyph {
         uv_x: gpu.atlas_cur_x as f32 / ATLAS_SIZE as f32,
         uv_y: gpu.atlas_cur_y as f32 / ATLAS_SIZE as f32,
         uv_w: w as f32 / ATLAS_SIZE as f32,
@@ -339,9 +341,17 @@ pub fn pop_clip(gpu: &mut Gpu) {
 
     gpu.batch_count += 1;
 }
+
 //
 // Draw primitives
 //
+
+pub fn draw_rect_outline(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, thickness: f32, color: Color) {
+    draw_rect(gpu, x,           y,           w,         thickness, color); // top
+    draw_rect(gpu, x,           y + h,       w,         thickness, color); // bottom
+    draw_rect(gpu, x,           y,           thickness, h,         color); // left
+    draw_rect(gpu, x + w,       y,           thickness, h,         color); // right
+}
 
 pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
     let (sw, sh) = (gpu.win_w, gpu.win_h);
@@ -404,8 +414,61 @@ pub fn draw_text_colored(
 
 // Flat color convenience wrapper
 #[inline]
-pub fn draw_text(gpu: &mut Gpu, text: &str, x: f32, y: f32, font_size: f32, color: Color) {
+pub fn draw_text(
+    gpu: &mut Gpu,
+    text: &str,
+    x: f32, y: f32,
+    font_size: f32,
+    color: Color,
+) {
     draw_text_colored(gpu, text, x, y, font_size, |_| color);
+}
+
+pub fn draw_text_colored_with_precomputed_glyphs(
+    gpu: &mut Gpu,
+    glyphs: &[crate::Glyph],
+    mut x: f32,
+    y: f32,
+    color_callback: impl Fn(usize) -> Color // Glyph index -> Color
+) {
+    let (sw, sh) = (gpu.win_w, gpu.win_h);
+
+    for (i, g) in glyphs.iter().enumerate() {
+        let g = g.gpu_glyph;
+
+        if g.w > 0 && g.h > 0 {
+            let gx = (x + g.bearing_x as f32).round();
+            let gy = (y - g.bearing_y as f32 - g.h as f32).round();
+
+            let [x0, y0] = px(gx,              gy,              sw, sh);
+            let [x1, y1] = px(gx + g.w as f32, gy + g.h as f32, sw, sh);
+
+            let (u0, v0) = (g.uv_x,            g.uv_y);
+            let (u1, v1) = (g.uv_x + g.uv_w,   g.uv_y + g.uv_h);
+
+            let color: GpuColor = color_callback(i).into();
+            gpu.verts_mut().extend_from_slice(&[
+                Vert { pos:[x0, y0], uv:[u0, v0], color },
+                Vert { pos:[x1, y0], uv:[u1, v0], color },
+                Vert { pos:[x0, y1], uv:[u0, v1], color },
+                Vert { pos:[x1, y0], uv:[u1, v0], color },
+                Vert { pos:[x1, y1], uv:[u1, v1], color },
+                Vert { pos:[x0, y1], uv:[u0, v1], color },
+            ]);
+        }
+
+        x += g.advance;
+    }
+}
+
+#[inline]
+pub fn draw_text_with_precomputed_glyphs(
+    gpu: &mut Gpu,
+    glyphs: &[crate::Glyph],
+    x: f32, y: f32,
+    color: Color,
+) {
+    draw_text_colored_with_precomputed_glyphs(gpu, glyphs, x, y, |_| color);
 }
 
 pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
@@ -413,6 +476,8 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
         range: Range<u32>,
         clip: [f32; 4],
     }
+
+    let _tracy = tracy::span!("submit_frame");
 
     //
     // Build draw list and upload verts directly from each batch to the GPU buffer

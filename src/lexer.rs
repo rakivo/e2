@@ -18,8 +18,8 @@ pub enum TokenKind {
 pub struct Token {
     pub start: u32,
     /// High byte = TokenKind (as u8), low 3 bytes = length.
-    /// Max token length: 16,777,215 bytes. Fine.
-    kind_len: u32,
+    /// Max token length: 16,777,215 bytes.
+    pub kind_len: u32,
 }
 
 impl Token {
@@ -72,38 +72,62 @@ pub fn token_color(kind: TokenKind) -> Color {
     }
 }
 
+// @Note: Alphabetical order is required for binary_search in lex_from
 static KEYWORDS: &[&str] = &[
-    "as", "break", "const", "continue", "crate", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
-    "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
-    "super", "trait", "true", "type", "unsafe", "use", "where", "while",
-    "async", "await", "dyn",
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn",
+    "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
+    "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "Self", "self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
 ];
 
-static TYPES: &[&str] = &[
-    "bool", "char", "f32", "f64",
-    "i8",  "i16", "i32", "i64", "i128", "isize",
-    "u8",  "u16", "u32", "u64", "u128", "usize",
-    "str", "String", "Option", "Result", "Vec", "Box", "Arc", "Rc",
-    "Some", "None", "Ok", "Err",
-];
-
-pub fn lex(src: &str, out: &mut Vec<Token>) {
-    out.clear();
-    lex_from(src, 0, out);
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LexState {
+    #[default]
+    Normal,
+    InBlockComment,
 }
 
-pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
-    out.clear();
-
+/// Returns the lexer state at end of input (for incremental relex).
+/// `byte_offset` shifts all emitted token start positions.
+/// Tokens are APPENDED to `out` (caller decides whether to clear).
+pub fn lex_from(
+    src: &str,
+    byte_offset: usize,
+    state: LexState,
+    out: &mut Vec<Token>,
+) -> LexState {
     let bytes = src.as_bytes();
     let len   = bytes.len();
     let mut i = 0usize;
+    let mut cur_state = state;
 
     macro_rules! push {
         ($kind:expr, $start:expr, $end:expr) => {
             if $end > $start {
-                out.push(Token::new($kind, ($start + byte_offset) as _, ($end - $start) as _));
+                out.push(Token::new($kind, $start + byte_offset, $end - $start));
+            }
+        };
+    }
+
+    // If we're resuming mid-block-comment, scan until we close it
+    if cur_state == LexState::InBlockComment {
+        let start = 0;
+        while i < len {
+            if let Some(next_star) = memchr::memchr(b'*', &bytes[i..]) {
+                i += next_star;
+                if i + 1 < len && bytes[i + 1] == b'/' {
+                    i += 2;
+                    cur_state = LexState::Normal;
+                    push!(TokenKind::Comment, start, i);
+                    break;
+                }
+                i += 1;
+            } else {
+                i = len;
+                // Still in block comment at end of src
+                push!(TokenKind::Comment, start, i);
+                return LexState::InBlockComment;
             }
         }
     }
@@ -114,19 +138,34 @@ pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
 
         // Line comment
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            while i < len && bytes[i] != b'\n' { i += 1; }
+            i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |pos| i + pos);
             push!(TokenKind::Comment, start, i);
             continue;
         }
 
-        // Block comment (not nested for now)
+        // Block comment
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
+            let mut closed = false;
+            while i < len {
+                if let Some(next_star) = memchr::memchr(b'*', &bytes[i..]) {
+                    i += next_star;
+                    if i + 1 < len && bytes[i + 1] == b'/' {
+                        i += 2;
+                        push!(TokenKind::Comment, start, i);
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                } else {
+                    i = len;
+                    break;
+                }
             }
-            if i + 1 < len { i += 2; }
-            push!(TokenKind::Comment, start, i);
+            if !closed {
+                push!(TokenKind::Comment, start, i);
+                return LexState::InBlockComment;
+            }
             continue;
         }
 
@@ -134,14 +173,26 @@ pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
         if b == b'"' {
             i += 1;
             while i < len {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                    if i < len { i += 1; }
-                    continue;
+                // Jump to the next quote or backslash
+                if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
+                    i += hit;
+
+                    if bytes[i] == b'\\' {
+                        // Skip the backslash and the escaped char
+                        i += 2;
+                        if i + 1 < len { i += 1; }
+
+                        continue;
+                    } else {
+                        i += 1; // Found the closing quote
+                        break;
+                    }
+                } else {
+                    i = len; // Unclosed string
+                    break;
                 }
-                if bytes[i] == b'"'  { i += 1; break; }
-                i += 1;
             }
+
             push!(TokenKind::String, start, i);
             continue;
         }
@@ -164,7 +215,6 @@ pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
             };
 
             if is_lifetime {
-                // Scan the lifetime identifier
                 i += 1;
                 while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
@@ -175,36 +225,46 @@ pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
 
             i += 1;
             while i < len {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                    if i < len { i += 1; }
-                    continue;
+                if let Some(hit) = memchr::memchr2(b'\'', b'\\', &bytes[i..]) {
+                    i += hit;
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i = len;
+                    break;
                 }
-                if bytes[i] == b'\'' { i += 1; break; }
-                i += 1;
             }
             push!(TokenKind::String, start, i);
             continue;
         }
 
-        // Number (including hex 0x, floats, suffixes)
+        // Number
         if b.is_ascii_digit() || (b == b'-' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
             if b == b'-' { i += 1; }
-            // hex
             if i + 1 < len && bytes[i] == b'0' && bytes[i + 1] == b'x' {
                 i += 2;
-                while i < len && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'_') { i += 1; }
+
+                while i < len && (bytes[i].is_ascii_hexdigit()  || bytes[i] == b'_') { i += 1 }
             } else {
-                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') { i += 1; }
+                while i < len && (bytes[i].is_ascii_digit()     || bytes[i] == b'_') { i += 1 }
+
                 if i < len && bytes[i] == b'.' && i + 1 < len && bytes[i+1].is_ascii_digit() {
                     i += 1;
-                    while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') { i += 1; }
+
+                    while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') { i += 1 }
                 }
             }
-            // optional type suffix: u32, f64, etc.
+
+            // Optional suffixes
             if i < len && bytes[i].is_ascii_alphabetic() {
                 while i < len && bytes[i].is_ascii_alphanumeric() { i += 1; }
             }
+
             push!(TokenKind::Number, start, i);
             continue;
         }
@@ -212,21 +272,22 @@ pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
         // Identifier, keyword, type, or macro
         if b.is_ascii_alphabetic() || b == b'_' {
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
-            // Macro: identifier immediately followed by '!'
             if i < len && bytes[i] == b'!' {
                 i += 1;
                 push!(TokenKind::Macro, start, i);
                 continue;
             }
+
             let word = &src[start..i];
-            let kind = if KEYWORDS.contains(&word) {
+
+            let kind = if KEYWORDS.binary_search(&word).is_ok() {
                 TokenKind::Keyword
-            } else if TYPES.contains(&word) || (b.is_ascii_uppercase() && word.len() > 1) {
-                // PascalCase = type/variant heuristic
+            } else if b.is_ascii_uppercase() && word.len() > 1 {
                 TokenKind::Type
             } else {
                 TokenKind::Default
             };
+
             push!(kind, start, i);
             continue;
         }
@@ -241,4 +302,6 @@ pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
         i += 1;
         push!(TokenKind::Punct, start, i);
     }
+
+    cur_state
 }
