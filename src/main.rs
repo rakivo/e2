@@ -1,5 +1,3 @@
-#![allow(unused, unused_imports, dead_code)]
-
 #[cfg(feature = "dhat")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -12,14 +10,18 @@ mod command;
 mod lexer;
 
 use std::sync::Arc;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use buffer::{Buffer, Cursor};
 use color::Color;
 use command::EditorCommand;
+use cranelift_entity::{EntityRef, PrimaryMap};
 use gpu::{Gpu, reset_atlas};
 use lexer::token_color;
 
+use smallstr::SmallString;
+use smallvec::SmallVec;
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
@@ -27,21 +29,23 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 pub struct Palette {
-    pub bg:          Color,
-    pub selection:   Color,
+    pub bg:           Color,
+    pub selection:    Color,
     pub current_line: Color,
-    pub cursor:      Color,
-    pub cursor_text: Color,
+    pub cursor:       Color,
+    pub cursor_text:  Color,
+    pub paren_match:  Color
 }
 
 #[inline]
 pub const fn palette() -> Palette {
     Palette {
-        bg:          Color::hex(0x0f0b05),
-        selection:   Color::hex(0x112c4f),
-        cursor:      Color::hex(0xc3a983),
+        bg:           Color::hex(0x0f0b05),
+        selection:    Color::hex(0x112c4f),
+        cursor:       Color::hex(0xc3a983),
         current_line: Color::hex(0x231b0e),
-        cursor_text: Color::rgba(13, 13, 13, 255),
+        cursor_text:  Color::rgba(13, 13, 13, 255),
+        paren_match:  Color::rgba(190, 128, 133, 200)
     }
 }
 
@@ -82,15 +86,15 @@ fn cursor_visible(epoch: &Instant) -> bool {
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
+    pub x: f32, pub y: f32,
+    pub w: f32, pub h: f32,
 }
 
 impl Rect {
     #[inline]
-    pub fn full(win_w: f32, win_h: f32) -> Self { Self { x: 0.0, y: 0.0, w: win_w, h: win_h } }
+    pub fn full(win_w: f32, win_h: f32) -> Self {
+        Self { x: 0.0, y: 0.0, w: win_w, h: win_h }
+    }
 
     #[inline] pub fn x1(&self) -> f32 { self.x + self.w }
     #[inline] pub fn y1(&self) -> f32 { self.y + self.h }
@@ -121,96 +125,493 @@ impl Rect {
     }
 }
 
-//
-// TextLayout  -  one per visible panel per frame
-//
-// Stores per-character color for the visible region so that
-// syntax highlighting writes here once and the render loop
-// just reads it, rather than recomputing colors every frame.
-//
+#[derive(Clone, Copy, Debug)]
+pub struct Glyph {
+    /// X offset from the line's left content edge (rect.x + PADDING_LEFT)
+    pub x:         f32,
+
+    pub width:     f32,
+    pub color:     Color,
+    pub char:      char,
+
+    /// Byte offset within the buffer line's bytes
+    pub line_byte: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct LineLayout {
+    pub buffer_line:     u32,
+    pub wrap_index:      u8,       // Always 0 until word-wrap is added
+    pub glyph_start:     u32,      // index into TextLayout::glyphs
+    pub glyph_count:     u32,
+    pub y:               f32,      // screen Y of the line top
+    pub width:           f32,      // total advance (all glyphs)
+    pub line_byte_start: usize,    // rope byte offset where this line begins
+}
+
+impl LineLayout {
+    #[inline]
+    pub fn glyphs<'a>(&self, all: &'a [Glyph]) -> &'a [Glyph] {
+        &all[self.glyph_start as usize..self.glyph_start as usize + self.glyph_count as usize]
+    }
+
+    /// Screen X of the left edge of column `col`.
+    /// col == glyphs.len()  ->  right edge of the last glyph (end-of-line cursor).
+    #[inline]
+    pub fn x_for_col(&self, origin_x: f32, col: u32, all_glyphs: &[Glyph]) -> f32 {
+        let col = col as usize;
+
+        let glyphs = self.glyphs(all_glyphs);
+
+        if glyphs.is_empty() {
+            return origin_x;
+        }
+
+        if col >= glyphs.len() {
+            let g = &glyphs[glyphs.len() - 1];
+            return origin_x + g.x + g.width;
+        }
+
+        origin_x + glyphs[col].x
+    }
+
+    /// Width of the glyph at `col`; `fallback` when at/past end-of-line.
+    #[inline]
+    pub fn glyph_width_at_col(&self, col: u32, fallback: f32, all_glyphs: &[Glyph]) -> f32 {
+        let col = col as usize;
+
+        let glyphs = self.glyphs(all_glyphs);
+
+        if glyphs.is_empty() {
+            return fallback; // Caller should pass space width, not cursor_w
+        }
+
+        if col >= glyphs.len() {
+            // At or past EOL - use last glyph's width to mirror Emacs
+            return glyphs.last().map(|g| g.width).unwrap_or(fallback);
+        }
+
+        glyphs[col].width.max(fallback)
+    }
+
+    /// Hit-test a screen X coordinate to a column index (mid-point snap).
+    #[inline]
+    pub fn col_for_screen_x(&self, origin_x: f32, screen_x: f32, all_glyphs: &[Glyph]) -> u32 {
+        let glyphs = self.glyphs(all_glyphs);
+
+        let local = screen_x - origin_x;
+        let mut col = glyphs.len();
+        for (i, g) in glyphs.iter().enumerate() {
+            if local <= g.x + g.width * 0.5 {
+                col = i;
+                break;
+            }
+        }
+
+        col as _
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct TextLayout {
-    pub buffer_id:   BufferId,
-    pub rect:        Rect,
-    pub first_visible_line: usize,
-    pub visible_line_count: usize,
-    pub font_size:   f32,
-    pub line_h:      f32,
-    pub view_scroll: f32,
-
-    // One Color per visible *char* across all visible lines,
-    // in top-to-bottom, left-to-right order.
-    // Index with `char_color_index`.
-    pub char_colors:  Vec<Color>,
-
-    // [x0,y0,x1,y1] per visible char - used for click hit-testing.
-    pub char_rects:   Vec<[f32; 4]>,
-
-    // Line start indices into char_colors/char_rects.
-    // line_offsets[i] = index of first char of visible line i.
-    pub line_offsets: Vec<usize>,
+    pub buffer_id:         BufferId,
+    pub rect:              Rect,
+    pub view_scroll:       f32,    // scroll_anim at build time - dirty check
+    pub line_h:            f32,
+    pub font_size:         f32,
+    pub first_buffer_line: u32,
+    pub lines:             Vec<LineLayout>,
+    pub glyphs:            Vec<Glyph>
 }
 
 impl TextLayout {
-    pub fn new(buffer_id: BufferId, rect: Rect, first_visible_line: usize, visible_line_count: usize,
-               font_size: f32, line_h: f32, view_scroll: f32) -> Self {
-        Self {
-            buffer_id, rect, first_visible_line, visible_line_count, font_size, line_h, view_scroll,
-            char_colors:  Vec::new(),
-            char_rects:   Vec::new(),
-            line_offsets: Vec::new(),
-        }
+    /// The buffer line of the first visible visual line.
+    #[inline]
+    pub fn first_visible_buffer_line(&self) -> u32 {
+        self.first_buffer_line
     }
 
-    /// Map (line_idx, col) relative to first_visible_line -> flat index.
+    /// Find the LineLayout for a buffer line, if visible.
     #[inline]
-    pub fn flat_index(&self, vis_line: usize, col: usize) -> Option<usize> {
-        let base = *self.line_offsets.get(vis_line)?;
-        let end  = self.line_offsets.get(vis_line + 1)
-            .copied()
-            .unwrap_or(self.char_colors.len());
-
-        let idx = base + col;
-        if idx < end { Some(idx) } else { None }
+    pub fn line_for_buffer_line(&self, buffer_line: u32) -> Option<&LineLayout> {
+        let offset = buffer_line.checked_sub(self.first_buffer_line)?;
+        let ll = self.lines.get(offset as usize)?;
+        // Fast path: 1:1 mapping (no word-wrap yet)
+        if ll.buffer_line == buffer_line && ll.wrap_index == 0 {
+            return Some(ll);
+        }
+        // Slow path for future word-wrap
+        self.lines.iter().find(|ll| ll.buffer_line == buffer_line && ll.wrap_index == 0)
     }
 
-    /// Screen X of the left edge of (line, col).
-    /// Returns None if outside the visible range.
+    /// Screen X of the cursor at (buffer_line, col).  Kept for animate_views compat.
     #[inline]
-    pub fn cursor_x(&self, abs_line: usize, col: usize) -> Option<f32> {
-        let vis_line = abs_line.checked_sub(self.first_visible_line)?;
+    pub fn cursor_x(&self, buffer_line: u32, col: u32) -> Option<f32> {
+        let ll = self.line_for_buffer_line(buffer_line)?;
+        Some(ll.x_for_col(self.rect.x + PADDING_LEFT, col, &self.glyphs))
+    }
 
-        let base = *self.line_offsets.get(vis_line)?;
-        let end  = self.line_offsets.get(vis_line + 1)
-            .copied()
-            .unwrap_or(self.char_rects.len());
+    /// Full glyph screen rect at (buffer_line, col): [x0, y0, x1, y1].
+    #[inline]
+    pub fn glyph_rect(&self, buffer_line: u32, col: u32, fallback_w: f32) -> Option<[f32; 4]> {
+        let ll = self.line_for_buffer_line(buffer_line)?;
+        let x0 = ll.x_for_col(self.rect.x + PADDING_LEFT, col, &self.glyphs);
+        let x1 = x0 + ll.glyph_width_at_col(col, fallback_w, &self.glyphs);
+        Some([x0, ll.y, x1, ll.y + self.line_h])
+    }
 
-        let line_char_count = end - base;
-
-        if line_char_count == 0 {
-            // Empty line - x is just the left edge
-            return Some(self.rect.x + PADDING_LEFT);
+    /// Hit-test (mx, my) -> (buffer_line, col).
+    #[inline]
+    pub fn hit_test(&self, mx: f32, my: f32) -> (u32, u32) {
+        if self.lines.is_empty() {
+            return (self.first_buffer_line, 0);
         }
 
-        if col >= line_char_count {
-            // Past end of line - right edge of last char
-            return Some(self.char_rects[end - 1][2]);
-        }
+        // my - rect.y gives offset from top of viewport.
+        // lines[0].y is the screen Y of the first visible line (may be negative
+        // if it's partially scrolled off the top).
+        // So the correct vis_index is derived from the line Y values directly.
+        let vis_index = self.lines
+            .partition_point(|ll| ll.y + self.line_h <= my)
+            .min(self.lines.len() - 1);
 
-        Some(self.char_rects[base + col][0])
+        let ll  = &self.lines[vis_index];
+        let col = ll.col_for_screen_x(self.rect.x + PADDING_LEFT, mx, &self.glyphs);
+        (ll.buffer_line, col)
+    }
+
+    /// Screen X of the left edge of column `col`.
+    /// col == glyphs.len()  ->  right edge of the last glyph (end-of-line cursor).
+    #[inline]
+    pub fn x_for_col(&self, origin_x: f32, col: u32, line_layout: &LineLayout) -> f32 {
+        line_layout.x_for_col(origin_x, col, &self.glyphs)
+    }
+
+    /// Width of the glyph at `col`; `fallback` when at/past end-of-line.
+    #[inline]
+    pub fn glyph_width_at_col(&self, col: u32, fallback: f32, line_layout: &LineLayout) -> f32 {
+        line_layout.glyph_width_at_col(col, fallback, &self.glyphs)
+    }
+
+    /// Hit-test a screen X coordinate to a column index (mid-point snap).
+    #[inline]
+    pub fn col_for_screen_x(&self, origin_x: f32, screen_x: f32, line_layout: &LineLayout) -> u32 {
+        line_layout.col_for_screen_x(origin_x, screen_x, &self.glyphs)
     }
 }
 
-//
-// Panel system
-//
+/// Build the TextLayout for a single leaf panel
+fn build_text_layout(
+    gpu:       &mut Gpu,
+    buffer:    &Buffer,
+    view:      &View,
+    rect:      Rect,
+    font_size: f32,
+    line_h:    f32,
+) -> TextLayout {
+    let first_line = (view.scroll / line_h) as u32;
+    let line_count = (rect.h / line_h) as u32 + 2;
 
-pub type PanelId   = usize;
-pub type BufferId  = usize;
-pub type ViewId    = usize;
+    let default_color = token_color(lexer::TokenKind::Default);
+    let tokens        = &buffer.tokens;
 
-pub const PANEL_NONE: PanelId = usize::MAX;
+    let first_visible_byte = buffer.text.line_to_byte(first_line as usize);
+
+    let mut current_token = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
+
+    let mut lines  = Vec::with_capacity(line_count as usize);
+
+    let mut glyphs = Vec::with_capacity(80);
+
+    for vis_i in 0..line_count {
+        let line_index = first_line + vis_i;
+        let Some(rope_line) = buffer.text.get_line(line_index as usize) else { break };
+
+        let has_nl   = rope_line.len_chars() > 0 && rope_line.char(rope_line.len_chars() - 1) == '\n';
+        let line_len = rope_line.len_bytes().saturating_sub(if has_nl { 1 } else { 0 });
+
+        let line_byte_start = buffer.text.line_to_byte(line_index as usize);
+
+        // Compute the Y of this visual line.
+        // Fractional scroll offset keeps the top line partially visible.
+        let screen_y = rect.y + vis_i as f32 * line_h - (view.scroll % line_h);
+
+        let mut ll = LineLayout {
+            buffer_line:     line_index,
+            wrap_index:      0,
+            y:               screen_y,
+            width:           0.0,
+            glyph_count:     0,
+            glyph_start:     0,
+            line_byte_start,
+        };
+
+        if line_len > 0 {
+            let mut local_x  = 0.0f32;
+            let mut byte_off = 0usize;
+
+            let glyph_start = glyphs.len() as u32;
+
+            for ch in rope_line.chars() {
+                if ch == '\n' { break; }
+
+                // Advance token cursor past tokens that end before this byte
+                while current_token < tokens.len() {
+                    let t = &tokens[current_token];
+                    if (t.start + t.len()) as usize <= line_byte_start + byte_off {
+                        current_token += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Color is from current token if it covers this byte, else default
+                let abs_byte = line_byte_start + byte_off;
+                let color = if current_token < tokens.len() {
+                    let t = &tokens[current_token];
+                    if abs_byte >= t.start as usize && abs_byte < (t.start + t.len()) as usize {
+                        token_color(t.kind())
+                    } else {
+                        default_color
+                    }
+                } else {
+                    default_color
+                };
+
+                let advance = gpu::get_glyph(gpu, ch, font_size)
+                    .map(|g| g.advance)
+                    .unwrap_or(8.0);
+
+                glyphs.push(Glyph {
+                    x:         local_x,
+                    width:     advance,
+                    color,
+                    char: ch,
+                    line_byte: byte_off as u32,
+                });
+
+                local_x  += advance;
+                byte_off += ch.len_utf8();
+            }
+
+            ll.glyph_start = glyph_start;
+            ll.glyph_count = glyphs.len() as u32 - glyph_start;
+            ll.width = local_x;
+        }
+
+        lines.push(ll);
+    }
+
+    TextLayout {
+        buffer_id:         view.buffer_id,
+        rect,
+        view_scroll:       view.scroll_anim,
+        line_h,
+        font_size,
+        first_buffer_line: first_line,
+        glyphs,
+        lines,
+    }
+}
+
+fn render_text_layout(
+    gpu:         &mut Gpu,
+    layout:      &TextLayout,
+    buffer:      &Buffer,
+    view:        &View,
+    scale:       f32,
+    show_cursor: bool,
+    scratch_paren: &mut Vec<char>,
+    scratch_line:  &mut String,
+) {
+    let rect         = layout.rect;
+    let line_h       = layout.line_h;
+    let font_size    = layout.font_size;
+    let min_cursor_w = scale_base_cursor_width(scale);
+    let cursor_h     = scale_base_cursor_height(scale);
+    let origin_x     = rect.x + PADDING_LEFT;
+
+    let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
+
+    let vis_start = layout.first_buffer_line;
+    let vis_end   = vis_start + layout.lines.len() as u32;
+
+    let space_width = gpu::get_glyph(gpu, ' ', font_size)
+        .map(|g| g.advance)
+        .unwrap_or(min_cursor_w * 4.0);
+
+    let min_cursor_w = min_cursor_w.max(space_width);
+
+    //
+    //
+    // Selection
+    //
+    //
+    if let Some(anchor) = view.cursor.anchor_char_index {
+        let c = view.cursor.char_index;
+        let (start_index, end_index) = if anchor <= c { (anchor, c) } else { (c, anchor) };
+
+        if start_index != end_index {
+            let (start_line, start_col) = buffer.char_to_line_col(start_index);
+            let (end_line,   end_col)   = buffer.char_to_line_col(end_index);
+
+            let draw_start = start_line.max(vis_start);
+            let draw_end   = end_line.min(vis_end.saturating_sub(1));
+
+            for line_index in draw_start..=draw_end {
+                let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
+                let y = ll.y + cursor_h;
+
+                let (x0, x1) = if start_line == end_line {
+                    (layout.x_for_col(origin_x, start_col, ll), layout.x_for_col(origin_x, end_col, ll))
+                } else if line_index == start_line {
+                    (layout.x_for_col(origin_x, start_col, ll), rect.x + rect.w)
+                } else if line_index == end_line {
+                    (rect.x, layout.x_for_col(origin_x, end_col, ll))
+                } else {
+                    (rect.x, rect.x + rect.w)
+                };
+
+                if x1 > x0 {
+                    gpu::draw_rect(gpu, x0, y, x1 - x0, line_h, palette().selection);
+                } else {
+                    gpu::draw_rect(gpu, rect.x, y, 8.0, line_h, palette().selection);
+                }
+            }
+        }
+    }
+
+    //
+    //
+    // Current-line highlight
+    //
+    //
+    if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
+        let y = ll.y + cursor_h;
+
+        let has_selection = view.cursor.anchor_char_index
+            .map(|a| a != view.cursor.char_index)
+            .unwrap_or(false);
+
+        if has_selection {
+            let (start_index, end_index) = {
+                let a = view.cursor.anchor_char_index.unwrap();
+                let c = view.cursor.char_index;
+                if a <= c { (a, c) } else { (c, a) }
+            };
+            let (start_line, start_col) = buffer.char_to_line_col(start_index);
+            let (end_line,   end_col)   = buffer.char_to_line_col(end_index);
+
+            if start_line == cursor_line && end_line == cursor_line {
+                let x0 = layout.x_for_col(origin_x, start_col, ll);
+                let x1 = layout.x_for_col(origin_x, end_col, ll);
+                if x0 > rect.x {
+                    gpu::draw_rect(gpu, rect.x, y, x0 - rect.x, line_h, palette().current_line);
+                }
+                if x1 < rect.x + rect.w {
+                    gpu::draw_rect(gpu, x1, y, (rect.x + rect.w) - x1, line_h, palette().current_line);
+                }
+            } else if start_line < cursor_line && end_line > cursor_line {
+                // fully covered by selection - no current-line bg
+            } else if end_line == cursor_line {
+                let x1 = layout.x_for_col(origin_x, end_col, ll);
+                gpu::draw_rect(gpu, x1, y, (rect.x + rect.w) - x1, line_h, palette().current_line);
+            } else if start_line == cursor_line {
+                let x0 = layout.x_for_col(origin_x, start_col, ll);
+                if x0 > rect.x {
+                    gpu::draw_rect(gpu, rect.x, y, x0 - rect.x, line_h, palette().current_line);
+                }
+            } else {
+                gpu::draw_rect(gpu, rect.x, y, rect.w, line_h, palette().current_line);
+            }
+        } else {
+            gpu::draw_rect(gpu, rect.x, y, rect.w, line_h, palette().current_line);
+        }
+    }
+
+    //
+    //
+    // Matching paren
+    //
+    //
+    if let Some((m_line, m_col)) = find_matching_paren(buffer, cursor_line, cursor_col, scratch_paren) {
+        // Cursor paren
+        if cursor_line >= vis_start && cursor_line < vis_end {
+            if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
+                let x = layout.x_for_col(origin_x, cursor_col, ll);
+                let w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll);
+                gpu::draw_rect(gpu, x, ll.y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+            }
+        }
+        // Matching paren
+        if m_line >= vis_start && m_line < vis_end {
+            if let Some(ll) = layout.line_for_buffer_line(m_line) {
+                let x = layout.x_for_col(origin_x, m_col, ll);
+                let w = layout.glyph_width_at_col(m_col, min_cursor_w, ll);
+                gpu::draw_rect(gpu, x, ll.y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+            }
+        }
+    }
+
+    //
+    //
+    // Cursor
+    //
+    //
+    if show_cursor {
+        if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
+            let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
+            gpu::draw_rect(
+                gpu,
+                view.cursor_anim_x,
+                view.cursor_anim_y + cursor_h,
+                cursor_glyph_w,
+                line_h + cursor_h,
+                palette().cursor,
+            );
+        }
+    }
+
+    //
+    //
+    // Text
+    //
+    //
+    let default_color = token_color(lexer::TokenKind::Default);
+
+    for ll in &layout.lines {
+        if ll.glyphs(&layout.glyphs).is_empty() { continue; }
+
+        scratch_line.clear();
+        scratch_line.extend(ll.glyphs(&layout.glyphs).iter().map(|g| g.char));
+
+        let y = ll.y + line_h;
+        let is_cursor_line = ll.buffer_line == cursor_line;
+
+        gpu::draw_text_colored(gpu, &scratch_line, origin_x, y, font_size, |char_index| {
+            if is_cursor_line && char_index as u32 == cursor_col && show_cursor {
+                palette().cursor_text
+            } else {
+                ll.glyphs(&layout.glyphs).get(char_index).map(|g| g.color).unwrap_or(default_color)
+            }
+        });
+    }
+}
+
+#[derive(Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
+pub struct PanelId(pub u32);
+cranelift_entity::entity_impl!(PanelId);
+
+#[derive(Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
+pub struct BufferId(pub u32);
+cranelift_entity::entity_impl!(BufferId);
+
+#[derive(Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
+pub struct ViewId(pub u32);
+cranelift_entity::entity_impl!(ViewId);
+
+pub const PANEL_NONE: PanelId = PanelId(u32::MAX-1);
+pub const  VIEW_MAIN: ViewId  = ViewId(0);
 
 #[derive(Clone, Copy, Debug)]
 pub struct PanelSplit {
@@ -244,8 +645,8 @@ pub struct View {
     pub cursor_anim_x: f32,  // animated cursor screen position
     pub cursor_anim_y: f32,  // animated cursor screen position
 
-    pub cursor_target_line: usize,
-    pub cursor_target_col:  usize,
+    pub cursor_target_line: u32,
+    pub cursor_target_col:  u32,
 
     pub cursor:      Cursor,
     pub layout:      Option<TextLayout>
@@ -257,7 +658,7 @@ impl View {
             id, buffer_id, scroll, cursor: Cursor::new(), layout: None,
             cursor_anim_x: 0.0, cursor_anim_y: 0.0, scroll_anim: 0.0,
             cursor_target_line: 0,
-            cursor_target_col: 0
+            cursor_target_col: 0,
         }
     }
 
@@ -266,7 +667,7 @@ impl View {
     }
 
     #[inline]
-    pub fn scroll_to_cursor(&mut self, line: usize, line_h: f32, rect: Rect) {
+    pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top    = line as f32 * line_h;
         let cursor_bottom = cursor_top + line_h;
         let margin        = line_h * 3.0;
@@ -298,7 +699,7 @@ impl View {
     }
 
     #[inline]
-    pub fn line_to_screen_y(&self, line: usize, rect: Rect, line_h: f32) -> f32 {
+    pub fn line_to_screen_y(&self, line: u32, rect: Rect, line_h: f32) -> f32 {
         rect.y + line as f32 * line_h - self.scroll_anim
     }
 }
@@ -309,9 +710,9 @@ impl View {
 
 pub struct EditorState {
     // Storage
-    pub buffers:      Vec<Buffer>,
-    pub views:        Vec<View>,
-    pub panels:       Vec<Panel>,
+    pub buffers:      PrimaryMap<BufferId, Buffer>,
+    pub views:        PrimaryMap<ViewId,   View>,
+    pub panels:       PrimaryMap<PanelId,  Panel>,
 
     // Which panel is active (receives keyboard input)
     pub active_panel: PanelId,
@@ -329,35 +730,40 @@ pub struct EditorState {
     pub mouse_pos:            (f32, f32),
     pub mouse_left_pressed:   bool,
 
-    scratch_byte_color: Vec<Color>,
     scratch_line:       String,
+    scratch_paren:      Vec<char>,
 
-    pub frame_count:    u32,
-    pub last_fps_time:  Instant,
+    pub frame_count:     u32,
+    pub last_fps_time:   Instant,
     pub last_frame_time: Instant,
-    pub fps:            f32,
+    pub fps:             f32,
+
+    pub build_us_acc:    f32,
+    pub render_us_acc:   f32,
+    pub build_us:        f32,
+    pub render_us:       f32,
 }
 
 impl EditorState {
     pub fn new(buffer: Buffer) -> Self {
-        let buf_id  = 0;
-        let view_id = 0;
-        let panel_id = 0;
+        let mut buffers = PrimaryMap::default();
+        let mut views   = PrimaryMap::default();
+        let mut panels  = PrimaryMap::default();
 
-        let buffers = vec![buffer];
-        let views   = vec![View::new(view_id, buf_id)];
-        let panels  = vec![Panel {
+        let buf_id   = buffers.push(buffer);
+        let view_id  = ViewId::new(0);  views.push(View::new(view_id, buf_id));
+        let panel_id = PanelId::new(0); panels.push(Panel {
             id:   panel_id,
             rect: Rect::default(),  // Set on first resize / resumed
             kind: PanelKind::Leaf { view_id },
-        }];
+        });
 
         Self {
             buffers,
             views,
             panels,
-            scratch_byte_color: Vec::new(),
-            scratch_line: String::new(),
+            scratch_paren: Default::default(),
+            scratch_line: Default::default(),
             active_panel: panel_id,
             root_panel:   panel_id,
             scale:        1.0,
@@ -368,6 +774,10 @@ impl EditorState {
             frame_count:   0,
             last_fps_time: Instant::now(),
             fps:           0.0,
+            build_us_acc:  0.0,
+            build_us:  0.0,
+            render_us_acc:  0.0,
+            render_us:  0.0,
         }
     }
 
@@ -383,19 +793,17 @@ impl EditorState {
         self.view_and_buffer_mut(view_id)
     }
 
-    // ---- panel helpers ----
-
-    pub fn panel(&self, id: PanelId) -> &Panel        { &self.panels[id] }
+    pub fn panel(&self, id: PanelId) -> &Panel { &self.panels[id] }
     pub fn panel_mut(&mut self, id: PanelId) -> &mut Panel { &mut self.panels[id] }
 
     pub fn active_view_id(&self) -> ViewId {
         match self.panels[self.active_panel].kind {
             PanelKind::Leaf { view_id } => view_id,
-            _ => 0,
+            _ => VIEW_MAIN,
         }
     }
 
-    pub fn active_view(&self) -> &View             { &self.views[self.active_view_id()] }
+    pub fn active_view(&self) -> &View { &self.views[self.active_view_id()] }
     pub fn active_view_mut(&mut self) -> &mut View { let id = self.active_view_id(); &mut self.views[id] }
 
     pub fn active_buffer(&self) -> &Buffer {
@@ -406,8 +814,6 @@ impl EditorState {
         let buf_id = self.active_view().buffer_id;
         &mut self.buffers[buf_id]
     }
-
-    // ---- layout ----
 
     /// Re-layout the panel tree from the root given the window rect.
     /// For now: root can either be a Leaf (single view) or a Split
@@ -449,15 +855,15 @@ impl EditorState {
         //
         // New view for the right/bottom child with the same buffer AND scroll
         //
-        let new_view_id = self.views.len();
+        let new_view_id = ViewId::new(self.views.len());
         self.views.push(View {
             id: new_view_id,
             ..old_view
         });
 
         // Two new leaf panels
-        let left_id  = self.panels.len();
-        let right_id = left_id + 1;
+        let left_id  = PanelId::new(self.panels.len());
+        let right_id = PanelId::new(left_id.0 as usize + 1);
 
         self.panels.push(Panel { id: left_id,  kind: PanelKind::Leaf { view_id: old_view_id }, rect: Rect::default() });
         self.panels.push(Panel { id: right_id, kind: PanelKind::Leaf { view_id: new_view_id }, rect: Rect::default() });
@@ -470,6 +876,10 @@ impl EditorState {
             right_id,
         });
 
+        // Reset layouts
+        self.views[new_view_id].layout = None;
+        self.views[old_view_id].layout = None;
+
         // Active panel becomes the left child
         self.active_panel = left_id;
     }
@@ -477,7 +887,7 @@ impl EditorState {
     pub fn close_active(&mut self) {
         let active_id = self.active_panel;
 
-        let parent_and_child = self.panels.iter().find_map(|p| {
+        let parent_and_child = self.panels.values().find_map(|p| {
             Some(if let PanelKind::Split(s) = p.kind {
                 if s.left_id == active_id {
                     (p.id, s.right_id)
@@ -508,7 +918,7 @@ impl EditorState {
     pub fn toggle_active_panel(&mut self) {
         let active_id = self.active_panel;
 
-        let parent_and_child = self.panels.iter().find_map(|p| {
+        let parent_and_child = self.panels.values().find_map(|p| {
             Some(if let PanelKind::Split(s) = p.kind {
                 if s.left_id == active_id {
                     (p.id, s.right_id)
@@ -540,7 +950,7 @@ impl EditorState {
         active_view.cursor_anim_y = from_y;
     }
 
-    pub fn snap_cursor_to_target(&mut self, view_id: ViewId, target_line: usize, target_col: usize, panel_rect: Rect) {
+    pub fn snap_cursor_to_target(&mut self, view_id: ViewId, target_line: u32, target_col: u32, panel_rect: Rect) {
         if let Some(layout) = &self.views[view_id].layout {
             if let Some(x) = layout.cursor_x(target_line, target_col) {
                 let line_h = self.line_h();
@@ -551,19 +961,13 @@ impl EditorState {
         }
     }
 
-    // ---- scale ----
-
     pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
     pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
     pub fn cursor_w(&self) -> f32 { scale_base_cursor_width(self.scale) }
     pub fn cursor_h(&self) -> f32 { scale_base_cursor_height(self.scale) }
 
-    // ---- blink ----
-
     pub fn cursor_visible(&self) -> bool { cursor_visible(&self.blink_epoch) }
     pub fn reset_blink(&mut self) { self.blink_epoch = Instant::now(); }
-
-    // ---- hit-test: which leaf panel contains a screen point? ----
 
     pub fn panel_at(&self, px: f32, py: f32) -> Option<PanelId> {
         self.panel_at_recursive(self.root_panel, px, py)
@@ -587,9 +991,8 @@ fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
     let mut animating = false;
 
     let line_h    = editor.line_h();
-    let font_size = editor.font_size();
 
-    for view in &mut editor.views {
+    for view in editor.views.values_mut() {
         //
         // Scroll
         //
@@ -606,12 +1009,12 @@ fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
         //
         let Some(layout) = &view.layout else { continue };
 
-        let (cursor_line, cursor_col) = {
-            (view.cursor_target_line, view.cursor_target_col)
-        };
+        let (cursor_line, cursor_col) = (view.cursor_target_line, view.cursor_target_col);
 
         if let Some(target_x) = layout.cursor_x(cursor_line, cursor_col) {
-            let target_y = view.line_to_screen_y(cursor_line, layout.rect, line_h);
+            let target_y = layout.line_for_buffer_line(cursor_line)
+                .map(|ll| ll.y)
+                .unwrap_or_else(|| view.line_to_screen_y(cursor_line, layout.rect, line_h));
 
             let dx = target_x - view.cursor_anim_x;
             let dy = target_y - view.cursor_anim_y;
@@ -635,341 +1038,83 @@ fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
     animating
 }
 
-/// Build the TextLayout for a single leaf panel.
-/// Called once per frame per visible panel when the buffer has changed,
-/// or fully every frame (cheap - it's just color assignment).
-fn build_text_layout(
-    gpu:    &mut Gpu,
+fn find_matching_paren(
     buffer: &Buffer,
-    view:   &View,
-    rect:   Rect,
-    font_size: f32,
-    line_h:    f32,
-    scratch_byte_color: &mut Vec<Color>,
-) -> TextLayout {
-    let buf_id     = view.buffer_id;
-    let first_line = view.first_visible_line(line_h);
-    let line_count = view.visible_line_count(rect, line_h);
+    start_line: u32, start_col: u32,
+    scratch_paren: &mut Vec<char>,
+) -> Option<(u32, u32)> {
+    let (open, close, dir) = {
+        let ch = char_at_line_col(buffer, start_line, start_col)?;
 
-    let mut layout = TextLayout::new(buf_id, rect, first_line, line_count, font_size, line_h, view.scroll_anim);
-
-    let default_color = token_color(lexer::TokenKind::Default);
-    let tokens        = &buffer.tokens;
-
-    let mut flat_idx = 0usize;
-
-    // Cache the first token touching the visible region
-    let first_visible_byte = buffer.text.line_to_byte(first_line);
-    let mut tok_i = tokens.partition_point(|t| (t.start + t.len) as usize <= first_visible_byte);
-
-    for vis_i in 0..line_count {
-        let line_idx = first_line + vis_i;
-        let Some(line) = buffer.text.get_line(line_idx) else { break };
-
-        // len_bytes includes the \n, subtract it
-        let line_len = line.len_bytes()
-            .saturating_sub(if line.len_chars() > 0 && line.char(line.len_chars()-1) == '\n' { 1 } else { 0 });
-
-        layout.line_offsets.push(flat_idx);
-
-        if line_len == 0 { continue; }
-
-        let line_byte_start = buffer.text.line_to_byte(line_idx);
-
-        //
-        // Build byte -> color map for this line
-        //
-
-        scratch_byte_color.clear();
-        scratch_byte_color.resize(line_len, default_color);
-
-        // tok_i is already positioned - don't binary search again
-        // save tok_i at line start so next line continues from here
-        let mut t = tok_i;
-        while t < tokens.len() {
-            let tok       = &tokens[t];
-            let tok_start = tok.start as usize;
-            let tok_end   = tok_start + tok.len as usize;
-            if tok_start >= line_byte_start + line_len { break; }
-
-            let color = token_color(tok.kind);
-            let lo    = tok_start.saturating_sub(line_byte_start).min(line_len);
-            let hi    = tok_end.saturating_sub(line_byte_start).min(line_len);
-            for b in lo..hi { scratch_byte_color[b] = color; }
-
-            t += 1;
+        match ch {
+            '(' => ('(', ')',  1),
+            '[' => ('[', ']',  1),
+            '{' => ('{', '}',  1),
+            ')' => ('(', ')', -1),
+            ']' => ('[', ']', -1),
+            '}' => ('{', '}', -1),
+            _ => return None,
         }
-        // Advance tok_i to first token that starts on or after next line
-        // (tokens can span lines so we only skip tokens fully behind us)
-        while tok_i < tokens.len() {
-            let tok_end = (tokens[tok_i].start + tokens[tok_i].len) as usize;
-            if tok_end <= line_byte_start + line_len { tok_i += 1; }
-            else { break; }
-        }
+    };
 
-        // Walk chars: emit color + rect
-        let screen_y = view.line_to_screen_y(layout.first_visible_line + vis_i, rect, line_h);
-        let mut x    = rect.x + PADDING_LEFT;
+    let mut depth = 0;
 
-        let mut byte_off = 0usize;
-        for ch in line.chars() {
-            if ch == '\n' { break }
+    const MAX_SCAN_LINES: u32 = 2000;
 
-            let char_width = gpu::get_glyph(gpu, ch, font_size)
-                .map(|g| g.advance)
-                .unwrap_or(8.0);
+    if dir > 0 {
+        let mut line = start_line;
 
-            let color = scratch_byte_color.get(byte_off).copied().unwrap_or(default_color);
-            layout.char_colors.push(color);
+        while line < buffer.text.len_lines() as u32 && line < start_line + MAX_SCAN_LINES {
+            let text = buffer.text.line(line as usize);
 
-            layout.char_rects.push([x, screen_y, x + char_width, screen_y + line_h]);
+            let start_col_in_line = if line == start_line { start_col } else { 0 };
 
-            x        += char_width;
-            flat_idx += 1;
-            byte_off += ch.len_utf8();
-        }
-    }
-
-    layout
-}
-
-//
-// Render a single TextLayout  -  selection, cursor, text
-//
-
-fn render_text_layout(
-    gpu:    &mut Gpu,
-    layout: &TextLayout,
-    buffer: &Buffer,
-    view:   &View,
-    line_scratch: &mut String,
-    scale: f32,
-    show_cursor: bool,
-) {
-    let rect      = layout.rect;
-    let line_h    = layout.line_h;
-    let font_size = layout.font_size;
-
-    let cursor_w = scale_base_cursor_width(scale);
-    let cursor_h = scale_base_cursor_height(scale);
-
-    // -- Selection --
-    if let Some(anchor) = view.cursor.anchor_char_idx {
-        let cursor = view.cursor.char_idx;
-        let (start_idx, end_idx) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
-
-        if start_idx != end_idx {
-            let (start_line, start_col) = buffer.char_to_line_col(start_idx);
-            let (end_line,   end_col)   = buffer.char_to_line_col(end_idx);
-
-            let draw_start = start_line.max(layout.first_visible_line);
-            let draw_end   = end_line.min(layout.first_visible_line + layout.visible_line_count - 1);
-
-            for line_idx in draw_start..=draw_end {
-                let y = view.line_to_screen_y(line_idx, rect, line_h) + cursor_h;
-
-                // x0: left edge, x1: right edge for this line's highlight
-                let (x0, x1) = if start_line == end_line {
-                    // single line selection
-                    let x0 = layout.cursor_x(line_idx, start_col).unwrap_or(rect.x + PADDING_LEFT);
-                    let x1 = layout.cursor_x(line_idx, end_col  ).unwrap_or(x0);
-                    (x0, x1)
-                } else if line_idx == start_line {
-                    // first line: from start_col to end of line
-                    let x0 = layout.cursor_x(line_idx, start_col).unwrap_or(rect.x + PADDING_LEFT);
-                    let x1 = rect.x + rect.w;
-                    (x0, x1)
-                } else if line_idx == end_line {
-                    // last line: from left edge to end_col
-                    let x0 = rect.x;
-                    let x1 = layout.cursor_x(line_idx, end_col).unwrap_or(rect.x + PADDING_LEFT);
-                    (x0, x1)
-                } else {
-                    // middle lines: full width
-                    (rect.x, rect.x + rect.w)
-                };
-
-                if x1 > x0 {
-                    gpu::draw_rect(gpu, x0, y, x1 - x0, line_h, palette().selection);
-                } else {
-                    // empty line or zero-width: draw a thin placeholder so the
-                    // selection gap is visible
-                    gpu::draw_rect(gpu, rect.x, y, 8.0, line_h, palette().selection);
+            for (col, ch) in text.chars().enumerate().skip(start_col_in_line as usize) {
+                if ch == open {
+                    depth += 1;
+                } else if ch == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((line, col as u32));
+                    }
                 }
             }
-        }
-    }
 
-    // -- Cursor line --
-    let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
-
-    let cursor_x = view.cursor_anim_x;
-    let cursor_y = view.cursor_anim_y;
-
-    let cursor_target_y = view.line_to_screen_y(cursor_line, rect, line_h);
-
-    let has_selection = view.cursor.anchor_char_idx
-        .map(|a| a != view.cursor.char_idx)
-        .unwrap_or(false);
-
-    if has_selection {
-        let (start_idx, end_idx) = {
-            let a = view.cursor.anchor_char_idx.unwrap();
-            let c = view.cursor.char_idx;
-            if a <= c { (a, c) } else { (c, a) }
-        };
-        let (start_line, start_col) = buffer.char_to_line_col(start_idx);
-        let (end_line,   end_col)   = buffer.char_to_line_col(end_idx);
-
-        if start_line == cursor_line && end_line == cursor_line {
-            // selection on same line: draw left strip and right strip
-            let sel_x0 = layout.cursor_x(cursor_line, start_col).unwrap_or(rect.x + PADDING_LEFT);
-            let sel_x1 = layout.cursor_x(cursor_line, end_col  ).unwrap_or(sel_x0);
-            // left of selection
-            if sel_x0 > rect.x {
-                gpu::draw_rect(gpu, rect.x, cursor_target_y + cursor_h, sel_x0 - rect.x, line_h, palette().current_line);
-            }
-            // right of selection
-            if sel_x1 < rect.x + rect.w {
-                gpu::draw_rect(gpu, sel_x1, cursor_target_y + cursor_h, (rect.x + rect.w) - sel_x1, line_h, palette().current_line);
-            }
-        } else if start_line < cursor_line && end_line > cursor_line {
-            // cursor line fully inside selection, no bg
-        } else if end_line == cursor_line {
-            // selection ends here: right strip only
-            let sel_x1 = layout.cursor_x(cursor_line, end_col).unwrap_or(rect.x);
-            gpu::draw_rect(gpu, sel_x1, cursor_target_y + cursor_h, (rect.x + rect.w) - sel_x1, line_h, palette().current_line);
-        } else if start_line == cursor_line {
-            // selection starts on cursor line and extends down
-            // left of selection start gets cursor line bg
-            let sel_x0 = layout.cursor_x(cursor_line, start_col).unwrap_or(rect.x + PADDING_LEFT);
-            if sel_x0 > rect.x {
-                gpu::draw_rect(gpu, rect.x, cursor_target_y + cursor_h, sel_x0 - rect.x, line_h, palette().current_line);
-            }
-        } else {
-            // selection entirely above or below: full line bg
-            gpu::draw_rect(gpu, rect.x, cursor_target_y + cursor_h, rect.w, line_h, palette().current_line);
+            line += 1;
         }
     } else {
-        gpu::draw_rect(gpu, rect.x, cursor_target_y + cursor_h, rect.w, line_h, palette().current_line);
-    }
+        let mut line = start_line;
+        loop {
+            let text = buffer.text.line(line as usize);
+            let end_col = if line == start_line { start_col + 1 } else { text.chars().count() as u32 };
 
-    // -- Cursor --
-    if show_cursor {
-        if cursor_line >= layout.first_visible_line
-        && cursor_line <  layout.first_visible_line + layout.visible_line_count
-        {
-            gpu::draw_rect(gpu, cursor_x, cursor_y+cursor_h, cursor_w, line_h+cursor_h, palette().cursor);
+            scratch_paren.clear();
+            scratch_paren.extend(text.chars().take(end_col as usize));
+
+            for col in (0..scratch_paren.len()).rev() {
+                let ch = scratch_paren[col];
+                if ch == close      { depth += 1; }
+                else if ch == open  { depth -= 1; if depth == 0 { return Some((line, col as u32)); } }
+            }
+
+            if line == 0 { break; }
+            line -= 1;
+
+            if start_line - line > MAX_SCAN_LINES { break; }
         }
     }
 
-    // -- Text --
-    let default_color = token_color(lexer::TokenKind::Default);
-
-    for (vis_i, &line_base) in layout.line_offsets.iter().enumerate() {
-        let line_idx = layout.first_visible_line + vis_i;
-
-        line_scratch.clear();
-        for ch in buffer.text.line(line_idx).chars() {
-            if ch == '\n' { break; }
-            line_scratch.push(ch);
-        }
-
-        let line_str = line_scratch.trim_end_matches('\n');
-        if line_str.is_empty() { continue; }
-
-        let line_end = layout.line_offsets.get(vis_i + 1).copied()
-            .unwrap_or(layout.char_colors.len());
-
-        let char_colors_slice = &layout.char_colors[line_base..line_end];
-
-        let y = view.line_to_screen_y(line_idx, rect, line_h) + line_h;
-        let x = rect.x + PADDING_LEFT;
-
-        gpu::draw_text_colored(gpu, line_str, x, y, font_size, |char_idx| {
-            char_colors_slice.get(char_idx).copied().unwrap_or(default_color)
-        });
-    }
+    None
 }
 
-//
-// Click -> (line, col)  -  shared by MouseInput and CursorMoved
-//
-
-fn screen_pos_to_line_col(
-    gpu:    &mut Gpu,
-    buffer: &Buffer,
-    view:   &View,
-    rect:   Rect,
-    mx: f32, my: f32,
-    font_size: f32,
-    line_h:    f32,
-    line_scratch: &mut String,
-) -> (usize, usize) {
-    let line_idx = (((my - rect.y) + view.scroll) / line_h) as usize;
-    let line_idx = line_idx.min(buffer.text.len_lines().saturating_sub(1));
-
-    line_scratch.clear();
-    for ch in buffer.text.line(line_idx).chars() {
-        if ch == '\n' { break; }
-        line_scratch.push(ch);
-    }
-    let line_str = line_scratch.trim_end_matches('\n');
-
-    let click_x = mx - rect.x - PADDING_LEFT;
-    let mut col = 0usize;
-    let mut x   = 0.0f32;
-
-    for (i, c) in line_str.chars().enumerate() {
-        let advance = gpu::get_glyph(gpu, c, font_size)
-            .map(|g| g.advance)
-            .unwrap_or(8.0);
-        if click_x < x + advance * 0.5 {
-            col = i;
-            break;
-        }
-        x   += advance;
-        col  = i + 1;
-    }
-
-    (line_idx, col)
+fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
+    let line_text = buffer.text.line(line as usize);
+    line_text.chars().nth(col as usize)
 }
 
-fn screen_pos_to_line_col_fast(layout: &TextLayout, view_scroll: f32, mx: f32, my: f32) -> (usize, usize) {
-    let n        = layout.line_offsets.len();
-    if n == 0 { return (layout.first_visible_line, 0); }
-
-    let scroll_offset = layout.view_scroll % layout.line_h;
-    let vis_line = n.min(((my - layout.rect.y + scroll_offset) / layout.line_h) as usize);
-    let vis_line = vis_line.min(n - 1);
-    let abs_line = layout.first_visible_line + vis_line;
-
-    let base = layout.line_offsets[vis_line];
-    let end  = layout.line_offsets.get(vis_line + 1)
-        .copied()
-        .unwrap_or(layout.char_rects.len());
-
-    if base == end {
-        return (abs_line, 0);
-    }
-
-    // Scan chars on this line, snap to nearest boundary
-    let mut col = end - base; // default: end of line
-    for i in base..end {
-        let r = layout.char_rects[i];
-        let mid = (r[0] + r[2]) * 0.5;
-        if mx <= mid {
-            col = i - base;
-            break;
-        }
-    }
-
-    (abs_line, col)
-}
-
-fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut Vec<(PanelId, ViewId, Rect)>) {
-    match panels[id].kind {
-        PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id].rect)),
+fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
+    match panels[id.index()].kind {
+        PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id.index()].rect)),
         PanelKind::Split(s) => {
             collect_leaves(panels, s.left_id,  out);
             collect_leaves(panels, s.right_id, out);
@@ -977,14 +1122,14 @@ fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut Vec<(PanelId, ViewId,
     }
 }
 
-fn apply_scale(editor: &mut EditorState, gpu: &Gpu, new_scale: f32, anchor_my: Option<f32>) {
+fn apply_scale(editor: &mut EditorState, _gpu: &Gpu, new_scale: f32, anchor_my: Option<f32>) {
     let old_line_h = editor.line_h();
     editor.scale = new_scale.clamp(MIN_SCALE, MAX_SCALE);
     let new_line_h = editor.line_h();
 
     // For each view, preserve the line that was at the anchor screen Y.
     // If no anchor (keyboard zoom), preserve the line at the top of the view.
-    for view in &mut editor.views {
+    for view in editor.views.values_mut() {
         let anchor_y = anchor_my.unwrap_or(0.0);
         // Which line was at anchor_y before the scale change?
         let line_at_anchor = (view.scroll + anchor_y) / old_line_h;
@@ -995,32 +1140,36 @@ fn apply_scale(editor: &mut EditorState, gpu: &Gpu, new_scale: f32, anchor_my: O
     }
 }
 
-fn scroll_page(editor: &mut EditorState, gpu: &Gpu, direction: i32) {
+fn scroll_page(editor: &mut EditorState, _gpu: &Gpu, direction: i32) {
     let line_h   = editor.line_h();
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
     let rect     = editor.panels[panel_id].rect;
     let buf_id   = editor.views[view_id].buffer_id;
 
-    // How many lines fit on screen (minus a little overlap like emacs)
     let page_lines = ((rect.h / line_h) as isize - 2).max(1);
     let delta      = direction as isize * page_lines;
+    let total      = editor.buffers[buf_id].text.len_lines();
 
-    // Move scroll first
-    let total     = editor.buffers[buf_id].text.len_lines();
-    let old_scroll = editor.views[view_id].scroll;
-    let new_scroll = (old_scroll + delta as f32 * line_h).max(0.0);
+    let (cur_line, cur_col) = editor.buffers[buf_id]
+        .cursor_line_col(&editor.views[view_id].cursor);
+
+    let new_line = ((cur_line as isize + delta).max(0) as usize)
+        .min(total.saturating_sub(1)) as u32;
+
     let max_scroll = ((total as f32 * line_h) - rect.h).max(0.0);
-    editor.views[view_id].scroll = new_scroll.min(max_scroll);
+    let new_scroll = (editor.views[view_id].scroll + delta as f32 * line_h)
+        .clamp(0.0, max_scroll);
 
-    // Drag cursor by the same number of lines
-    let (cur_line, cur_col) = editor.buffers[buf_id].cursor_line_col(&editor.views[view_id].cursor);
-    let new_line = ((cur_line as isize + delta).max(0) as usize).min(total.saturating_sub(1));
+    editor.views[view_id].scroll = new_scroll;
 
-    let mut cursor = &mut editor.views[view_id].cursor;
-    editor.buffers[buf_id].set_cursor_line_col(new_line, cur_col, cursor);
+    editor.buffers[buf_id].set_cursor_line_col(
+        new_line, cur_col, &mut editor.views[view_id].cursor
+    );
     editor.views[view_id].cursor_target_line = new_line;
     editor.views[view_id].cursor_target_col  = cur_col;
+
+    editor.reset_blink();
 }
 
 //
@@ -1049,6 +1198,7 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu::init(Arc::clone(&win)));
 
         let path   = std::env::args().nth(1).expect("usage: naysayer <file>");
+
         let buffer = Buffer::from_file(std::path::Path::new(&path)).expect("failed to open file");
 
         let mut editor = EditorState::new(buffer);
@@ -1059,7 +1209,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(editor) = &self.editor else { return };
-        let Some(win)    = &self.window else { return };
+        let Some(_win)   = &self.window else { return };
 
         // Schedule next wakeup for cursor blink
         let elapsed = editor.blink_epoch.elapsed().as_millis();
@@ -1094,7 +1244,6 @@ impl ApplicationHandler for App {
 
             WindowEvent::ModifiersChanged(m) => self.mods = m,
 
-            // ---- Keyboard ----
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed { return; }
 
@@ -1147,7 +1296,7 @@ impl ApplicationHandler for App {
                         editor.close_active();
                         editor.layout_panels(win_rect);
                         // Invalidate layouts
-                        for view in &mut editor.views {
+                        for view in editor.views.values_mut() {
                             view.layout = None;
                         }
                         win.request_redraw();
@@ -1162,7 +1311,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                let view_id  = editor.active_view_id();
+                let view_id = editor.active_view_id();
                 let (view, buf) = editor.active_view_and_buffer_mut();
 
                 let cmd = match &event.logical_key {
@@ -1225,7 +1374,7 @@ impl ApplicationHandler for App {
                 };
 
                 if let Some(cmd) = cmd {
-                    let is_cmd_insert     = cmd.is_insert();
+                    let _is_cmd_insert    = cmd.is_insert();
                     let is_cmd_big_scroll = cmd.is_big_scroll();
 
                     buf.apply(cmd, &mut view.cursor);
@@ -1240,7 +1389,7 @@ impl ApplicationHandler for App {
                     editor.views[view_id].cursor_target_col  = col;
                     editor.views[view_id].cursor_target_line = line;
 
-                    if is_cmd_insert || is_cmd_big_scroll {
+                    if is_cmd_big_scroll {
                         editor.snap_cursor_to_target(view_id, line, col, rect);
                     }
 
@@ -1250,7 +1399,6 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // ---- Mouse wheel ----
             WindowEvent::MouseWheel { delta, .. } => {
                 if ctrl {
                     let dy = match delta {
@@ -1291,15 +1439,15 @@ impl ApplicationHandler for App {
                     .cursor_line_col(&editor.views[view_id].cursor);
 
                 let scroll     = editor.views[view_id].scroll;
-                let first_vis  = (scroll / line_h) as usize;
+                let first_vis  = (scroll / line_h) as u32;
                 let last_vis = (((scroll + rect.h) / line_h) as usize)
                     .saturating_sub(1)
-                    .min(total.saturating_sub(1));
+                    .min(total.saturating_sub(1)) as u32;
 
                 let new_line = if cur_line < first_vis {
                     first_vis
                 } else if cur_line > last_vis {
-                    last_vis.min(total.saturating_sub(1))
+                    last_vis.min(total.saturating_sub(1) as u32) as u32
                 } else {
                     cur_line // still visible, don't move
                 };
@@ -1318,7 +1466,6 @@ impl ApplicationHandler for App {
                 win.request_redraw();
             }
 
-            // ---- Mouse buttons ----
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 editor.mouse_left_pressed = false;
             }
@@ -1332,18 +1479,16 @@ impl ApplicationHandler for App {
                 }
 
                 if let PanelKind::Leaf { view_id } = editor.panels[editor.active_panel].kind {
-                    let font_size = editor.font_size();
-                    let line_h    = editor.line_h();
                     let rect      = editor.panels[editor.active_panel].rect;
                     let buf_id    = editor.views[view_id].buffer_id;
 
                     let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
-                        screen_pos_to_line_col_fast(layout, editor.views[view_id].scroll, mx, my)
-                    } else {
-                        screen_pos_to_line_col(
-                            gpu, &editor.buffers[buf_id], &editor.views[view_id],
-                            rect, mx, my, font_size, line_h, &mut editor.scratch_line
-                        )
+                        layout.hit_test(mx, my)
+                    } else { // @Robustness
+                        let line_h = editor.line_h();
+                        let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
+                        let line = line.min(editor.buffers[buf_id].text.len_lines().saturating_sub(1));
+                        (line as u32, 0)  // col 0 - no glyph metrics without layout
                     };
 
                     let view = &mut editor.views[view_id];
@@ -1360,7 +1505,6 @@ impl ApplicationHandler for App {
                 editor.mouse_left_pressed = true;
             }
 
-            // ---- Cursor moved ----
             WindowEvent::CursorMoved { position, .. } => {
                 editor.mouse_pos = (position.x as f32, position.y as f32);
 
@@ -1369,18 +1513,16 @@ impl ApplicationHandler for App {
                     let pid = editor.panel_at(mx, my).unwrap_or(editor.active_panel);
 
                     if let PanelKind::Leaf { view_id } = editor.panels[pid].kind {
-                        let font_size = editor.font_size();
-                        let line_h    = editor.line_h();
                         let rect      = editor.panels[pid].rect;
                         let buf_id    = editor.views[view_id].buffer_id;
 
                         let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
-                            screen_pos_to_line_col_fast(layout, editor.views[view_id].scroll, mx, my)
-                        } else {
-                            screen_pos_to_line_col(
-                                gpu, &editor.buffers[buf_id], &editor.views[view_id],
-                                rect, mx, my, font_size, line_h, &mut editor.scratch_line
-                            )
+                            layout.hit_test(mx, my)
+                        } else { // @Robustness
+                            let line_h = editor.line_h();
+                            let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
+                            let line = line.min(editor.buffers[buf_id].text.len_lines().saturating_sub(1));
+                            (line as u32, 0)  // col 0 - no glyph metrics without layout
                         };
 
                         let view = &mut editor.views[view_id];
@@ -1399,7 +1541,6 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // ---- Resize ----
             WindowEvent::Resized(sz) => {
                 if sz.width > 0 && sz.height > 0 {
                     gpu.win_w = sz.width  as f32;
@@ -1413,7 +1554,6 @@ impl ApplicationHandler for App {
                 }
             }
 
-            // ---- Redraw ----
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
@@ -1422,9 +1562,14 @@ impl ApplicationHandler for App {
 
                 let elapsed = editor.last_fps_time.elapsed().as_secs_f32();
                 if elapsed >= 0.5 {
-                    editor.fps = editor.frame_count as f32 / elapsed;
-                    editor.frame_count   = 0;
-                    editor.last_fps_time = Instant::now();
+                    editor.fps       = editor.frame_count as f32 / elapsed;
+                    editor.build_us  = editor.build_us_acc  / editor.frame_count as f32;
+                    editor.render_us = editor.render_us_acc / editor.frame_count as f32;
+
+                    editor.frame_count    = 0;
+                    editor.last_fps_time  = Instant::now();
+                    editor.build_us_acc   = 0.0;
+                    editor.render_us_acc  = 0.0;
                 }
 
                 //
@@ -1445,45 +1590,60 @@ impl ApplicationHandler for App {
                     ));
                 }
 
-                let still_animating = animate_views(editor, dt);
+                let _still_animating = animate_views(editor, dt);
 
                 let font_size    = editor.font_size();
                 let line_h       = editor.line_h();
                 let show_cursor  = editor.cursor_visible();
                 let active_panel = editor.active_panel;
 
-                let mut leaf_panels = Vec::new();
-                collect_leaves(&editor.panels, editor.root_panel, &mut leaf_panels);
+                let mut leaf_panels = Default::default();
+                collect_leaves(editor.panels.as_values_slice(), editor.root_panel, &mut leaf_panels);
 
                 for (panel_id, view_id, rect) in leaf_panels {
                     let buf_id  = editor.views[view_id].buffer_id;
+
                     let dirty = editor.buffers[buf_id].dirty
                         || editor.views[view_id].layout.is_none()
                         || editor.views[view_id].layout.as_ref().map(|l| {
-                            l.first_visible_line != editor.views[view_id].first_visible_line(line_h)
-                                || l.view_scroll != editor.views[view_id].scroll_anim
-                                || l.rect.w != rect.w
-                                || l.rect.h != rect.h
+                            let current_first = (editor.views[view_id].scroll / line_h) as usize;
+                            let layout_first  = l.first_buffer_line as usize;
+                            // Rebuild when the target scroll would show different lines,
+                            // or when rect changes, or font changes.
+                            // NOT when scroll_anim changes - that's just animation.
+                            current_first != layout_first
+                                || (l.rect.w - rect.w).abs() > 0.5
+                                || (l.rect.h - rect.h).abs() > 0.5
+                                || (l.font_size - font_size).abs() > 0.01
                         }).unwrap_or(true);
 
                     if dirty {
+                        let should_snap = editor.views[view_id].layout.as_ref()
+                            .map(|l| {
+                                (l.rect.w - rect.w).abs() > 0.5
+                                    || (l.rect.h - rect.h).abs() > 0.5
+                            })
+                            .unwrap_or(true);
+
+                        let t0 = Instant::now();
                         let layout = build_text_layout(
                             gpu,
                             &editor.buffers[buf_id],
                             &editor.views[view_id],
                             rect, font_size, line_h,
-                            &mut editor.scratch_byte_color
                         );
-
-                        // Initialize anim position if this is the first layout
-                        if editor.views[view_id].layout.is_none() {
-                            let (cl, cc) = (editor.views[view_id].cursor_target_line,
-                                            editor.views[view_id].cursor_target_col);
-
-                            editor.snap_cursor_to_target(view_id, cl, cc, rect);
-                        }
+                        editor.build_us_acc = t0.elapsed().as_micros() as f32;
 
                         editor.views[view_id].layout = Some(layout);
+
+                        let (cl, cc) = (
+                            editor.views[view_id].cursor_target_line,
+                            editor.views[view_id].cursor_target_col,
+                        );
+
+                        if should_snap {
+                            editor.snap_cursor_to_target(view_id, cl, cc, rect);
+                        }
                     }
 
                     let show_cursor = if panel_id == active_panel {
@@ -1496,23 +1656,27 @@ impl ApplicationHandler for App {
                     };
 
                     let layout = editor.views[view_id].layout.as_ref().unwrap();
+                    let t1 = Instant::now();
                     render_text_layout(
                         gpu, layout,
                         &editor.buffers[buf_id],
                         &editor.views[view_id],
-                        &mut editor.scratch_line,
                         editor.scale,
-                        show_cursor
+                        show_cursor,
+                        &mut editor.scratch_paren,
+                        &mut editor.scratch_line,
                     );
+                    editor.render_us += t1.elapsed().as_micros() as f32;
                 }
 
                 // Clear dirty after all views have rebuilt their layouts
-                for buf in &mut editor.buffers {
+                for buf in editor.buffers.values_mut() {
                     buf.dirty = false;
                 }
 
-                let fps_str = format!("{:.0} fps", editor.fps);
-                gpu::draw_text(gpu, &fps_str, gpu.win_w - 64.0, 14.0, 12.0, Color::rgba(120, 120, 120, 255));
+                let mut perf = SmallString::<[u8; 128]>::new();
+                _ = writeln!(&mut perf, "{:.0} fps  build:{}us  render:{}us", editor.fps, editor.build_us, editor.render_us);
+                gpu::draw_text(gpu, &perf, gpu.win_w - 312.0, 14.0, 12.0, Color::rgba(120, 120, 120, 255));
 
                 gpu::submit_frame(gpu).unwrap();
                 win.request_redraw();

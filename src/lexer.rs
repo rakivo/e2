@@ -13,11 +13,33 @@ pub enum TokenKind {
     Macro,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct Token {
-    pub kind:  TokenKind,
     pub start: u32,
-    pub len:   u32,
+    /// High byte = TokenKind (as u8), low 3 bytes = length.
+    /// Max token length: 16,777,215 bytes. Fine.
+    kind_len: u32,
+}
+
+impl Token {
+    #[inline(always)]
+    pub fn new(kind: TokenKind, start: usize, len: usize) -> Self {
+        Self {
+            start: start as u32,
+            kind_len: ((kind as u32) << 24) | (len as u32 & 0x00FF_FFFF),
+        }
+    }
+
+    #[inline(always)]
+    pub fn kind(self) -> TokenKind {
+        unsafe { std::mem::transmute((self.kind_len >> 24) as u8) }
+    }
+
+    #[inline(always)]
+    pub fn len(self) -> u32 {
+        self.kind_len & 0x00FF_FFFF
+    }
 }
 
 // base16-charcoal-dark
@@ -68,6 +90,11 @@ static TYPES: &[&str] = &[
 
 pub fn lex(src: &str, out: &mut Vec<Token>) {
     out.clear();
+    lex_from(src, 0, out);
+}
+
+pub fn lex_from(src: &str, byte_offset: usize, out: &mut Vec<Token>) {
+    out.clear();
 
     let bytes = src.as_bytes();
     let len   = bytes.len();
@@ -76,11 +103,7 @@ pub fn lex(src: &str, out: &mut Vec<Token>) {
     macro_rules! push {
         ($kind:expr, $start:expr, $end:expr) => {
             if $end > $start {
-                out.push(Token {
-                    kind:  $kind,
-                    start: $start as u32,
-                    len:   ($end - $start) as u32,
-                });
+                out.push(Token::new($kind, ($start + byte_offset) as _, ($end - $start) as _));
             }
         }
     }
@@ -111,7 +134,11 @@ pub fn lex(src: &str, out: &mut Vec<Token>) {
         if b == b'"' {
             i += 1;
             while i < len {
-                if bytes[i] == b'\\' { i += 2; continue; }
+                if bytes[i] == b'\\' {
+                    i += 1;
+                    if i < len { i += 1; }
+                    continue;
+                }
                 if bytes[i] == b'"'  { i += 1; break; }
                 i += 1;
             }
@@ -121,9 +148,38 @@ pub fn lex(src: &str, out: &mut Vec<Token>) {
 
         // Char literal
         if b == b'\'' {
+            // Rust lifetimes: 'a, 'static, 'lifetime_name
+            // A lifetime is ' followed by a letter/underscore and then
+            // an identifier character or end-of-token (space, comma, >, etc.)
+            // A char literal is ' followed by any char and then a closing '
+            // (or a backslash escape and then closing ')
+            //
+            // Heuristic: if the byte after ' is alphabetic/underscore AND
+            // there is no closing ' within 4 bytes, treat it as a lifetime.
+            let is_lifetime = {
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                let after_next = bytes.get(i + 2).copied().unwrap_or(0);
+                (next.is_ascii_alphabetic() || next == b'_')
+                    && after_next != b'\''  // 'x' is a char literal, 'ab... is a lifetime
+            };
+
+            if is_lifetime {
+                // Scan the lifetime identifier
+                i += 1;
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                push!(TokenKind::Default, start, i);
+                continue;
+            }
+
             i += 1;
             while i < len {
-                if bytes[i] == b'\\' { i += 2; continue; }
+                if bytes[i] == b'\\' {
+                    i += 1;
+                    if i < len { i += 1; }
+                    continue;
+                }
                 if bytes[i] == b'\'' { i += 1; break; }
                 i += 1;
             }
