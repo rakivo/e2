@@ -2,9 +2,10 @@
 
 use std::{collections::HashMap, ops::Deref};
 
+use cranelift_entity::EntityRef;
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{EditorState, Rect, SCALE_STEP, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
+use crate::{EditorState, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, buffer::Buffer, collect_leaves, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut EditorState,
@@ -198,14 +199,12 @@ command!(tab |cx| {
 
 command!(split_vertically |cx| {
     let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
-    cx.editor.split_active(true, 0.5);
-    cx.editor.layout_panels(win_rect);
+    cx.editor.split_active(true, 0.5, win_rect);
 });
 
 command!(split_horizontally |cx| {
     let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
-    cx.editor.split_active(false, 0.5);
-    cx.editor.layout_panels(win_rect);
+    cx.editor.split_active(false, 0.5, win_rect);
 });
 
 command!(close_focused_split |cx| {
@@ -228,6 +227,29 @@ command!(scale_up |cx| {
 
 command!(scale_reset |cx| {
     rescale(cx.editor, cx.gpu, 1.0);
+});
+
+command!(open_new_buffer |cx| {
+    let buffer  = Buffer::default();
+    let buf_id  = cx.editor.buffers.push(buffer);
+    let view_id = ViewId::new(cx.editor.views.len());
+    cx.editor.views.push(View::new(view_id, buf_id));
+
+    let active_id = cx.editor.active_panel;
+
+    let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
+    cx.editor.split_active(true, 0.5, win_rect);
+
+    if let PanelKind::Split(split) = cx.editor.panel(active_id).kind {
+        // Open in the unfocused side
+        let unfocused_id = if cx.editor.active_panel == split.left_id {
+            split.right_id
+        } else {
+            split.left_id
+        };
+
+        cx.editor.panel_mut(unfocused_id).kind = PanelKind::Leaf { view_id };
+    }
 });
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -304,16 +326,19 @@ impl Keymap {
         km.bind(KeyCombo::ctrl('g'), "unset_anchor");
         km.bind(KeyCombo::alt('v'),  "move_page_up");
 
-        // splits - physical keys so they're layout-independent
+        // Splits - physical keys so they're layout-independent
         km.bind(KeyCombo::ctrl('3'), "split_vertically");
         km.bind(KeyCombo::ctrl('2'), "split_horizontally");
         km.bind(KeyCombo::alt('0'),  "close_focused_split");
         km.bind(KeyCombo::alt('2'),  "toggle_focused_split");
 
-        // scale
+        // Scale
         km.bind(KeyCombo::ctrl('='), "scale_up");
         km.bind(KeyCombo::ctrl('-'), "scale_down");
         km.bind(KeyCombo::ctrl('0'), "scale_reset");
+
+        // Buffers
+        km.bind(KeyCombo::ctrl(';'), "open_new_buffer");
 
         km
     }

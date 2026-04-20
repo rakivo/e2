@@ -319,7 +319,6 @@ impl TextLayout {
 }
 
 /// Build the TextLayout for a single leaf panel
-
 fn build_text_layout(
     gpu:       &mut Gpu,
     buffer:    &Buffer,
@@ -678,7 +677,7 @@ pub enum PanelKind {
     Split(PanelSplit),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct Panel {
     pub id:     PanelId,
     pub rect:   Rect,
@@ -909,7 +908,14 @@ impl EditorState {
 
     /// Split the active panel.  Creates two new panels + one new view
     /// (the new panel gets a new view into the same buffer).
-    pub fn split_active(&mut self, vertical: bool, ratio: f32) {
+    pub fn split_active(&mut self, vertical: bool, ratio: f32, win_rect: Rect) {
+        self.split_active_no_layout(vertical, ratio);
+        self.layout_panels(win_rect);
+    }
+
+    /// Split the active panel.  Creates two new panels + one new view
+    /// (the new panel gets a new view into the same buffer).
+    pub fn split_active_no_layout(&mut self, vertical: bool, ratio: f32) {
         let active_id   = self.active_panel;
         let old_view_id = match self.panels[active_id].kind {
             PanelKind::Leaf { view_id } => view_id,
@@ -1176,12 +1182,12 @@ fn find_matching_paren(
     None
 }
 
-fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
+pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
     let line_text = buffer.text.line(line as usize);
     line_text.chars().nth(col as usize)
 }
 
-fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
+pub fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
     match panels[id.index()].kind {
         PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id.index()].rect)),
         PanelKind::Split(s) => {
