@@ -5,7 +5,7 @@ use std::{collections::HashMap, ops::Deref};
 use cranelift_entity::EntityRef;
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{EditorState, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, buffer::Buffer, collect_leaves, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
+use crate::{BufferId, EditorState, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, buffer::Buffer, collect_leaves, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut EditorState,
@@ -47,36 +47,6 @@ impl CommandEntry {
 }
 
 inventory::collect!(CommandEntry);
-
-#[derive(Debug, Default)]
-pub struct CommandTable {
-    cmds: HashMap<&'static str, &'static CommandEntry>,
-}
-
-impl Deref for CommandTable {
-    type Target = HashMap<&'static str, &'static CommandEntry>;
-    fn deref(&self) -> &Self::Target {
-        &self.cmds
-    }
-}
-
-impl CommandTable {
-    /// Harvest every `inventory::submit!` from all linked crates.
-    pub fn from_inventory() -> Self {
-        let mut cmds = HashMap::new();
-        for entry in inventory::iter::<CommandEntry> {
-            cmds.insert(entry.name, entry);
-        }
-        Self { cmds }
-    }
-
-    pub fn exec(&self, name: &str, context: &mut CommandContext) {
-        match self.cmds.get(name) {
-            Some(command) => (command.func)(context),
-            None    => eprintln!("unknown command: {name}"),
-        }
-    }
-}
 
 macro_rules! command {
     ($name:ident |$cx:ident| $body:block) => {
@@ -234,14 +204,22 @@ command!(open_new_buffer |cx| {
     let buf_id  = cx.editor.buffers.push(buffer);
     let view_id = ViewId::new(cx.editor.views.len());
     cx.editor.views.push(View::new(view_id, buf_id));
+    cx.editor.mru_register_new_buffer(buf_id);
 
     let active_id = cx.editor.active_panel;
-
+    let root_id   = cx.editor.root_panel;
     let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
-    cx.editor.split_active(true, 0.5, win_rect);
 
-    if let PanelKind::Split(split) = cx.editor.panel(active_id).kind {
-        // Open in the unfocused side
+    if matches!(&cx.editor.panel(root_id).kind, PanelKind::Leaf { .. }) {
+        //
+        // Ensure root is a split
+        //
+
+        cx.editor.active_panel = root_id;
+        cx.editor.split_active(true, 0.5, win_rect);
+    }
+
+    if let PanelKind::Split(split) = cx.editor.panel(root_id).kind {
         let unfocused_id = if cx.editor.active_panel == split.left_id {
             split.right_id
         } else {
@@ -249,8 +227,64 @@ command!(open_new_buffer |cx| {
         };
 
         cx.editor.panel_mut(unfocused_id).kind = PanelKind::Leaf { view_id };
+        cx.editor.toggle_active_panel();
     }
 });
+
+command!(cycle_buffers_left |cx| {
+    let buf_id = cx.editor.previous_buffer();
+    cx.editor.active_view_mut().switch_buffer(buf_id);
+});
+
+command!(cycle_buffers_right |cx| {
+    let buf_id = cx.editor.next_buffer();
+    cx.editor.active_view_mut().switch_buffer(buf_id);
+});
+
+#[derive(Hash, Copy, Clone, Debug)]
+pub struct CommandAtom(pub &'static str);
+
+impl Into<CommandAtom> for &'static str {
+    fn into(self) -> CommandAtom { CommandAtom(self) }
+}
+
+impl Eq for CommandAtom {}
+impl PartialEq for CommandAtom {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.0, other.0)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CommandTable {
+    cmds: HashMap<CommandAtom, &'static CommandEntry>,
+}
+
+impl Deref for CommandTable {
+    type Target = HashMap<CommandAtom, &'static CommandEntry>;
+    fn deref(&self) -> &Self::Target {
+        &self.cmds
+    }
+}
+
+impl CommandTable {
+    /// Harvest every `inventory::submit!` from all linked crates.
+    pub fn from_inventory() -> Self {
+        let mut cmds = HashMap::new();
+        for entry in inventory::iter::<CommandEntry> {
+            cmds.insert(entry.name.into(), entry);
+        }
+        Self { cmds }
+    }
+
+    pub fn exec(&self, name: impl Into<CommandAtom>, context: &mut CommandContext) {
+        let name = name.into();
+        match self.cmds.get(&name) {
+            Some(command) => (command.func)(context),
+            None    => eprintln!("unknown command: {}", name.0),
+        }
+    }
+}
 
 #[derive(Hash, PartialEq, Eq, Clone)]
 pub enum KeyCombo {
@@ -267,12 +301,12 @@ pub struct Mods {
 }
 
 impl Mods {
-    pub fn ctrl()  -> Self { Self { ctrl: true,  ..Default::default() } }
-    pub fn alt()   -> Self { Self { alt:  true,  ..Default::default() } }
+    pub fn ctrl()  -> Self { Self { ctrl:  true, ..Default::default() } }
+    pub fn alt()   -> Self { Self { alt:   true, ..Default::default() } }
     pub fn shift() -> Self { Self { shift: true, ..Default::default() } }
 }
 
-// convenience constructors
+// Convenience constructors
 impl KeyCombo {
     pub fn named(k: NamedKey) -> Self { Self::Named(k, Mods::default()) }
     pub fn named_mods(k: NamedKey, mods: Mods) -> Self { Self::Named(k, mods) }
@@ -284,7 +318,7 @@ impl KeyCombo {
 
 #[derive(Default)]
 pub struct Keymap {
-    bindings: HashMap<KeyCombo, &'static str>,
+    bindings: HashMap<KeyCombo, CommandAtom>,
 }
 
 impl Keymap {
@@ -339,22 +373,24 @@ impl Keymap {
 
         // Buffers
         km.bind(KeyCombo::ctrl(';'), "open_new_buffer");
+        km.bind(KeyCombo::alt ('1'), "cycle_buffers_left");
+        km.bind(KeyCombo::alt ('3'), "cycle_buffers_right");
 
         km
     }
 }
 
 impl Keymap {
-    pub fn bind(&mut self, key: KeyCombo, cmd: &'static str) {
-        self.bindings.insert(key, cmd);
+    pub fn bind(&mut self, key: KeyCombo, cmd: impl Into<CommandAtom>) {
+        self.bindings.insert(key, cmd.into());
     }
 
-    pub fn lookup(&self, event: &KeyEvent, mods: Mods) -> Option<&'static str> {
+    pub fn lookup(&self, event: &KeyEvent, mods: Mods) -> Option<CommandAtom> {
         // bare character insert
         if !mods.ctrl && !mods.alt {
             match &event.logical_key {
-                Key::Character(_) =>           return Some("basic_character"),
-                Key::Named(NamedKey::Space) => return Some("basic_character"),
+                Key::Character(_) =>           return Some("basic_character".into()),
+                Key::Named(NamedKey::Space) => return Some("basic_character".into()),
                 _ => {}
             }
         }

@@ -11,18 +11,20 @@ mod tracy;
 mod lexer;
 
 use std::sync::Arc;
+use std::time::Instant;
 use std::fmt::Write as _;
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
 use buffer::{Buffer, Cursor};
 use color::Color;
-use command::{CommandContext, CommandTable, Keymap, Mods};
+use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::{EntityRef, PrimaryMap};
 use gpu::{Gpu, GpuGlyph, reset_atlas};
 use lexer::token_color;
 
 use smallstr::SmallString;
 use smallvec::SmallVec;
+use wgpu::naga::FastHashMap;
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -80,7 +82,23 @@ define_base_and_scale! {
 const BLINK_ON_MS:  u128 = 530;
 const BLINK_OFF_MS: u128 = 370;
 
-fn cursor_visible(epoch: &Instant) -> bool {
+const BLINK_START_DELAY_MS: u128 = 500;  // Start blinking after 500ms idle
+const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop blinking after 5s idle
+
+fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
+    let since_input = last_input.elapsed().as_millis();
+
+    // Typing: show solid cursor
+    if since_input < BLINK_START_DELAY_MS {
+        return true;
+    }
+
+    // Idle too long: show solid cursor
+    if since_input > BLINK_STOP_IDLE_MS {
+        return true;
+    }
+
+    // In between: blink
     let elapsed = epoch.elapsed().as_millis() % (BLINK_ON_MS + BLINK_OFF_MS);
     elapsed < BLINK_ON_MS
 }
@@ -438,6 +456,7 @@ fn render_text_layout(
     active_view_id: ViewId,
     scale:       f32,
     show_cursor: bool,
+    is_our_window_focused: bool,
     scratch_paren: &mut Vec<char>,
 ) {
     let _tracy = tracy::span!("render_text_layout");
@@ -465,7 +484,7 @@ fn render_text_layout(
 
     let min_cursor_w = min_cursor_w.max(space_width);
 
-    let is_this_view_focused = active_view_id == view.id;
+    let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
 
     //
     //
@@ -648,15 +667,15 @@ fn render_text_layout(
     }
 }
 
-#[derive(Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[derive(Hash, Ord, Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct PanelId(pub u32);
 cranelift_entity::entity_impl!(PanelId);
 
-#[derive(Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[derive(Hash, Ord, Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct BufferId(pub u32);
 cranelift_entity::entity_impl!(BufferId);
 
-#[derive(Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
+#[derive(Hash, Ord, Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct ViewId(pub u32);
 cranelift_entity::entity_impl!(ViewId);
 
@@ -684,10 +703,16 @@ pub struct Panel {
     pub kind:   PanelKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ViewState {
+    pub cursor: Cursor,
+    pub scroll: f32
+}
+
 #[derive(Clone, Debug)]
 pub struct View {
-    pub id:          ViewId,
-    pub buffer_id:   BufferId,
+    pub id:        ViewId,
+    pub buffer_id: BufferId,
 
     pub scroll:        f32,  // target scroll (set instantly on any scroll event)
     pub scroll_anim:   f32,  // animated scroll (what actually gets rendered)
@@ -699,7 +724,9 @@ pub struct View {
     pub cursor_target_col:  u32,
 
     pub cursor:      Cursor,
-    pub layout:      Option<TextLayout>
+    pub layout:      Option<TextLayout>,
+
+    pub per_buffer:  FastHashMap<BufferId, ViewState>,
 }
 
 impl View {
@@ -709,11 +736,36 @@ impl View {
             cursor_anim_x: 0.0, cursor_anim_y: 0.0, scroll_anim: 0.0,
             cursor_target_line: 0,
             cursor_target_col: 0,
+            per_buffer: Default::default()
         }
     }
 
     pub fn new(id: ViewId, buffer_id: BufferId) -> Self {
         Self::new_with_scroll(id, buffer_id, 0.0)
+    }
+
+    #[inline]
+    pub fn switch_buffer(&mut self, new: BufferId) {
+        let old = self.buffer_id;
+
+        // Save old state
+        self.per_buffer.insert(old, ViewState {
+            cursor: self.cursor,
+            scroll: self.scroll
+        });
+
+        // Switch
+        self.buffer_id = new;
+        self.layout    = None;
+
+        // Restore if exists
+        if let Some(state) = self.per_buffer.get(&new) {
+            self.cursor = state.cursor;
+            self.scroll = state.scroll;
+        } else {
+            self.cursor = Cursor::new();
+            self.scroll = 0.0;
+        }
     }
 
     #[inline]
@@ -770,17 +822,23 @@ pub struct EditorState {
     // Root panel id - its rect always equals the window
     pub root_panel:      PanelId,
 
+    pub most_recently_used_buffers: VecDeque<BufferId>,
+    pub buffer_cycle_index: Option<usize>,
+
     // Scale for font/line-height
     pub scale:           f32,
 
     // Cursor blink
     pub blink_epoch:     Instant,
+    pub last_cursor_visible: bool,
 
     // Mouse
     pub mouse_pos:          (f32, f32),
     pub mouse_left_pressed: bool,
 
     scratch_paren:       Vec<char>,
+
+    pub last_input_time: Instant,
 
     pub frame_count:     u32,
     pub last_fps_time:   Instant,
@@ -810,10 +868,13 @@ impl EditorState {
             kind: PanelKind::Leaf { view_id },
         });
 
-        Self {
+        let mut editor = Self {
             buffers,
             views,
             panels,
+            last_input_time: Instant::now(),
+            last_cursor_visible: false,
+            buffer_cycle_index: None,
             scratch_paren: Default::default(),
             active_panel: panel_id,
             root_panel:   panel_id,
@@ -831,7 +892,11 @@ impl EditorState {
             build_us:  0.0,
             render_us_acc:  0.0,
             render_us:  0.0,
-        }
+            most_recently_used_buffers: Default::default()
+        };
+
+        editor.mru_register_new_buffer(buf_id);
+        editor
     }
 
     pub fn view_and_buffer(&mut self, view_id: ViewId) -> (&View, &Buffer) {
@@ -953,7 +1018,7 @@ impl EditorState {
         self.views[old_view_id].layout = None;
 
         // Active panel becomes the left child
-        self.active_panel = left_id;
+        self.set_active_panel(left_id);
     }
 
     pub fn close_active(&mut self) {
@@ -984,42 +1049,72 @@ impl EditorState {
         let to_keep_kind = self.panels[to_keep].kind;
         self.panels[parent].kind = to_keep_kind;
 
-        self.active_panel = parent;
+        self.set_active_panel(parent);
     }
 
     pub fn toggle_active_panel(&mut self) {
-        let active_id = self.active_panel;
+        let mut leaves = Default::default();
+        collect_leaves(self.panels.as_values_slice(), self.root_panel, &mut leaves);
 
-        let parent_and_child = self.panels.values().find_map(|p| {
-            Some(if let PanelKind::Split(s) = p.kind {
-                if s.left_id == active_id {
-                    (p.id, s.right_id)
-                } else if s.right_id == active_id {
-                    (p.id, s.left_id)
-                } else {
-                    return None
-                }
-            } else {
-                return None
-            })
-        });
-
-        let Some((parent, to_switch_to)) = parent_and_child else {
+        if leaves.len() <= 1 {
             return;
-        };
+        }
 
-        let PanelKind::Split(_split) = self.panels[parent].kind else { return };
+        let current_pos = leaves.iter().position(|(id, _, _)| *id == self.active_panel).unwrap_or(0);
+        let next = (current_pos + 1) % leaves.len();
+        let (to_switch_to, _, _) = leaves[next];
 
         let (from_x, from_y) = {
             let view = self.active_view();
             (view.cursor_anim_x, view.cursor_anim_y)
         };
 
-        self.active_panel = to_switch_to;
+        self.set_active_panel(to_switch_to);
 
         let active_view = self.active_view_mut();
         active_view.cursor_anim_x = from_x;
         active_view.cursor_anim_y = from_y;
+    }
+
+    pub fn next_buffer(&mut self) -> BufferId {
+        let len = self.most_recently_used_buffers.len();
+        if len <= 1 { return self.active_view().buffer_id; }
+
+        let idx = self.buffer_cycle_index.get_or_insert(0);
+        *idx = (*idx + 1) % len;
+
+        self.most_recently_used_buffers[*idx]
+    }
+
+    pub fn previous_buffer(&mut self) -> BufferId {
+        let len = self.most_recently_used_buffers.len();
+        if len <= 1 { return self.active_view().buffer_id; }
+
+        let idx = self.buffer_cycle_index.get_or_insert(0);
+        *idx = if *idx == 0 { len - 1 } else { *idx - 1 };
+
+        self.most_recently_used_buffers[*idx]
+    }
+
+    pub fn commit_buffer_cycle(&mut self) {
+        let Some(idx) = self.buffer_cycle_index.take() else { return };
+
+        let buf = self.most_recently_used_buffers[idx];
+        self.most_recently_used_buffers.retain(|&b| b != buf);
+        self.most_recently_used_buffers.insert(0, buf);
+    }
+
+    // @Refactor
+    pub fn mru_register_new_buffer(&mut self, buffer_id: BufferId) {
+        if let Some(pos) = self.most_recently_used_buffers.iter().position(|&b| b == buffer_id) {
+            self.most_recently_used_buffers.remove(pos);
+        }
+
+        self.most_recently_used_buffers.insert(0, buffer_id);
+    }
+
+    pub fn set_active_panel(&mut self, panel_id: PanelId) {
+        self.active_panel = panel_id;
     }
 
     pub fn snap_cursor_to_target(&mut self, view_id: ViewId, target_line: u32, target_col: u32, panel_rect: Rect) {
@@ -1038,8 +1133,14 @@ impl EditorState {
     pub fn cursor_w(&self) -> f32 { scale_base_cursor_width(self.scale) }
     pub fn cursor_h(&self) -> f32 { scale_base_cursor_height(self.scale) }
 
-    pub fn cursor_visible(&self) -> bool { cursor_visible(&self.blink_epoch) }
-    pub fn reset_blink(&mut self) { self.blink_epoch = Instant::now(); }
+    pub fn cursor_visible(&self) -> bool {
+        cursor_visible(&self.blink_epoch, &self.last_input_time)
+    }
+
+    pub fn reset_blink(&mut self) {
+        self.blink_epoch     = Instant::now();
+        self.last_input_time = Instant::now();
+    }
 
     pub fn panel_at(&self, px: f32, py: f32) -> Option<PanelId> {
         self.panel_at_recursive(self.root_panel, px, py)
@@ -1188,11 +1289,16 @@ pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
 }
 
 pub fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
-    match panels[id.index()].kind {
-        PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id.index()].rect)),
-        PanelKind::Split(s) => {
-            collect_leaves(panels, s.left_id,  out);
-            collect_leaves(panels, s.right_id, out);
+    let mut s = SmallVec::<[_; 32]>::default();
+    s.push(id);
+
+    while let Some(id) = s.pop() {
+        match panels[id.index()].kind {
+            PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id.index()].rect)),
+            PanelKind::Split(split) => {
+                s.push(split.right_id);
+                s.push(split.left_id);
+            }
         }
     }
 }
@@ -1262,6 +1368,41 @@ fn scroll_page(editor: &mut EditorState, _gpu: &Gpu, direction: i32) {
     editor.reset_blink();
 }
 
+fn handle_left_mouse_click(editor: &mut EditorState) -> bool {
+    let (mx, my) = editor.mouse_pos;
+    let pid = editor.panel_at(mx, my).unwrap_or(editor.active_panel);
+
+    let PanelKind::Leaf { view_id } = editor.panels[pid].kind else {
+        return false;
+    };
+
+    let rect        = editor.panels[pid].rect;
+    let buf_id      = editor.views[view_id].buffer_id;
+    let scroll_anim = editor.views[view_id].scroll_anim;
+
+    let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
+        layout.hit_test(mx, my, scroll_anim)
+    } else { // @Robustness
+        let line_h = editor.line_h();
+        let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
+        let line = line.min(editor.buffers[buf_id].text.len_lines().saturating_sub(1));
+        (line as u32, 0)  // col 0 - no glyph metrics without layout
+    };
+
+    let view = &mut editor.views[view_id];
+    editor.buffers[buf_id].set_cursor_line_col(line, col, &mut view.cursor);
+    view.cursor_target_line = line;
+    view.cursor_target_col  = col;
+
+    if !view.cursor.is_anchor_set() {
+        view.cursor.set_anchor();
+    }
+
+    editor.reset_blink();
+
+    true
+}
+
 pub fn snap_cursor_to_target_point_in_active_view(editor: &mut EditorState) {
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
@@ -1294,8 +1435,11 @@ struct App {
     editor: Option<EditorState>,
     window: Option<Arc<Window>>,
     mods:   winit::event::Modifiers,
+
+    is_our_window_focused: bool,
+
     command_table: CommandTable,
-    keymap: Keymap
+    keymap: Keymap,
 }
 
 impl ApplicationHandler for App {
@@ -1322,21 +1466,34 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(editor) = &self.editor else { return };
-        let Some(_win)   = &self.window else { return };
+        let Some(win)    = &self.window else { return };
 
-        // Schedule next wakeup for cursor blink
-        let elapsed = editor.blink_epoch.elapsed().as_millis();
-        let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
-        let phase   = elapsed % cycle;
-        let ms_until = if phase < BLINK_ON_MS {
-            BLINK_ON_MS - phase
+        let since_input = editor.last_input_time.elapsed().as_millis();
+
+        if since_input < BLINK_START_DELAY_MS {
+            // Waiting to start blinking - wake up when delay expires
+            let ms_until = BLINK_START_DELAY_MS - since_input;
+            el.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(ms_until as u64)
+            ));
+        } else if since_input > BLINK_STOP_IDLE_MS {
+            // Idle too long - just wait for input
+            el.set_control_flow(ControlFlow::Wait);
         } else {
-            cycle - phase
-        };
-
-        el.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + std::time::Duration::from_millis(ms_until as u64)
-        ));
+            // Actively blinking - wake up at next blink transition
+            let elapsed = editor.blink_epoch.elapsed().as_millis();
+            let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
+            let phase   = elapsed % cycle;
+            let ms_until = if phase < BLINK_ON_MS {
+                BLINK_ON_MS - phase
+            } else {
+                cycle - phase
+            };
+            el.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + std::time::Duration::from_millis(ms_until as u64)
+            ));
+            win.request_redraw();
+        }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -1368,13 +1525,20 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m,
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed { return; }
+                if event.state != ElementState::Pressed {
+                    return;
+                }
 
                 let mods = Mods { alt, ctrl, shift };
                 if let Some(command_name) = self.keymap.lookup(&event, mods) {
-                    let Some(command) = self.command_table.get(command_name) else {
+                    let Some(command) = self.command_table.get(&command_name) else {
                         return;
                     };
+
+                    // Commit cycle if switching to a non-cycle command
+                    if !matches!(command_name, CommandAtom("cycle_buffers_left") | CommandAtom("cycle_buffers_right")) {
+                        editor.commit_buffer_cycle();
+                    }
 
                     let mut cx = make_command_context!(&event);
                     cx.last_executed_command = Some(command);
@@ -1451,35 +1615,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                let (mx, my) = editor.mouse_pos;
-
-                // Switch active panel on click
-                if let Some(pid) = editor.panel_at(mx, my) {
-                    editor.active_panel = pid;
-                }
-
-                if let PanelKind::Leaf { view_id } = editor.panels[editor.active_panel].kind {
-                    let rect      = editor.panels[editor.active_panel].rect;
-                    let buf_id    = editor.views[view_id].buffer_id;
-                    let scroll_anim = editor.views[view_id].scroll_anim;
-
-                    let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
-                        layout.hit_test(mx, my, scroll_anim)
-                    } else { // @Robustness
-                        let line_h = editor.line_h();
-                        let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
-                        let line = line.min(editor.buffers[buf_id].text.len_lines().saturating_sub(1));
-                        (line as u32, 0)  // col 0 - no glyph metrics without layout
-                    };
-
-                    let view = &mut editor.views[view_id];
-                    editor.buffers[buf_id].set_cursor_line_col(line, col, &mut view.cursor);
-                    view.cursor_target_line = line;
-                    view.cursor_target_col  = col;
-
-                    view.cursor.unset_anchor();
-                    editor.reset_blink();
-
+                if handle_left_mouse_click(editor) {
                     win.request_redraw();
                 }
 
@@ -1490,34 +1626,7 @@ impl ApplicationHandler for App {
                 editor.mouse_pos = (position.x as f32, position.y as f32);
 
                 if editor.mouse_left_pressed {
-                    let (mx, my) = editor.mouse_pos;
-                    let pid = editor.panel_at(mx, my).unwrap_or(editor.active_panel);
-
-                    if let PanelKind::Leaf { view_id } = editor.panels[pid].kind {
-                        let rect      = editor.panels[pid].rect;
-                        let buf_id    = editor.views[view_id].buffer_id;
-                        let scroll_anim = editor.views[view_id].scroll_anim;
-
-                        let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
-                            layout.hit_test(mx, my, scroll_anim)
-                        } else { // @Robustness
-                            let line_h = editor.line_h();
-                            let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
-                            let line = line.min(editor.buffers[buf_id].text.len_lines().saturating_sub(1));
-                            (line as u32, 0)  // col 0 - no glyph metrics without layout
-                        };
-
-                        let view = &mut editor.views[view_id];
-                        editor.buffers[buf_id].set_cursor_line_col(line, col, &mut view.cursor);
-                        view.cursor_target_line = line;
-                        view.cursor_target_col  = col;
-
-                        if !view.cursor.is_anchor_set() {
-                            view.cursor.set_anchor();
-                        }
-
-                        editor.reset_blink();
-
+                    if handle_left_mouse_click(editor) {
                         win.request_redraw();
                     }
                 }
@@ -1558,24 +1667,6 @@ impl ApplicationHandler for App {
                     editor.render_us_acc  = 0.0;
                 }
 
-                //
-                // Schedule next wakeup for blink
-                //
-                {
-                    let elapsed = editor.blink_epoch.elapsed().as_millis();
-                    let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
-                    let phase   = elapsed % cycle;
-                    let ms_until_transition = if phase < BLINK_ON_MS {
-                        BLINK_ON_MS - phase
-                    } else {
-                        cycle - phase
-                    };
-
-                    el.set_control_flow(ControlFlow::WaitUntil(
-                        Instant::now() + Duration::from_millis(ms_until_transition as u64)
-                    ));
-                }
-
                 let still_animating = animate_views(editor, dt);
 
                 let font_size    = editor.font_size();
@@ -1587,7 +1678,6 @@ impl ApplicationHandler for App {
                 collect_leaves(editor.panels.as_values_slice(), editor.root_panel, &mut leaf_panels);
 
                 let mut should_request_redraw = false;
-
                 should_request_redraw |= still_animating;
 
                 for (panel_id, view_id, rect) in leaf_panels {
@@ -1598,7 +1688,10 @@ impl ApplicationHandler for App {
                     let is_dirty = editor.buffers[buf_id].dirty
                         || editor.views[view_id].layout.as_ref().map(|l| {
                             anim_first < l.first_buffer_line
-                                || anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
+                                || (
+                                    anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
+                                        && screen_lines < l.lines.len() as u32
+                                )
                                 || (l.rect.w - rect.w).abs() > 0.5
                                 || (l.rect.h - rect.h).abs() > 0.5
                                 || (l.font_size - font_size).abs() > 0.01
@@ -1669,6 +1762,7 @@ impl ApplicationHandler for App {
                     };
 
                     let layout = editor.views[view_id].layout.as_ref().unwrap();
+                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                     let t1 = Instant::now();
                     render_text_layout(
                         gpu, layout,
@@ -1677,9 +1771,11 @@ impl ApplicationHandler for App {
                         editor.active_view_id(),
                         editor.scale,
                         show_cursor,
+                        self.is_our_window_focused,
                         &mut editor.scratch_paren,
                     );
                     editor.render_us += t1.elapsed().as_micros() as f32;
+                    gpu::pop_clip(gpu);
                 }
 
                 // Clear dirty after all views have rebuilt their layouts
@@ -1692,9 +1788,21 @@ impl ApplicationHandler for App {
                 gpu::draw_text(gpu, &perf, gpu.win_w - 456.0, 14.0, 12.0, Color::rgba(120, 120, 120, 255));
                 gpu::submit_frame(gpu).unwrap();
 
+                let new_cursor_visible = editor.cursor_visible();
+                let blink_changed = new_cursor_visible != editor.last_cursor_visible;
+                editor.last_cursor_visible = new_cursor_visible;
+
+                should_request_redraw |= blink_changed;
+
                 if should_request_redraw {
                     win.request_redraw();
+                } else {
+                    self.about_to_wait(el);
                 }
+            }
+
+            WindowEvent::Focused(is_focused) => {
+                self.is_our_window_focused = is_focused;
             }
 
             _ => {}

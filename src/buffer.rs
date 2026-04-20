@@ -5,7 +5,7 @@ use std::path::Path;
 use ropey::Rope;
 use smallstr::SmallString;
 
-#[derive(Clone, Debug)]
+#[derive(Default, Copy, Clone, Debug)]
 pub struct Cursor {
     pub char_index:        usize,
     pub anchor_char_index: Option<usize>,
@@ -14,7 +14,7 @@ pub struct Cursor {
 
 impl Cursor {
     pub fn new() -> Self {
-        Self { char_index: 0, preferred_col: None, anchor_char_index: None, }
+        Self::default()
     }
 
     pub fn set_anchor(&mut self) {
