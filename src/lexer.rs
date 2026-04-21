@@ -59,7 +59,7 @@ impl Token {
 // base0E #a88c62  keywords, storage
 // base0F #876e48  deprecated, punctuation
 
-pub fn token_color(kind: TokenKind) -> Color {
+pub const fn token_color(kind: TokenKind) -> Color {
     match kind {
         TokenKind::Default => Color::hex(0xc3a983), // base05
         TokenKind::Comment => Color::hex(0x8f7550), // base03

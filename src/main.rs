@@ -19,16 +19,17 @@ use buffer::{Buffer, Cursor};
 use color::Color;
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::{EntityRef, PrimaryMap};
-use gpu::{Gpu, GpuGlyph, reset_atlas};
+use gpu::{Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, reset_atlas};
 use lexer::token_color;
 
 use smallstr::SmallString;
 use smallvec::SmallVec;
 use wgpu::naga::FastHashMap;
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 
 pub struct Palette {
     pub bg:           Color,
@@ -230,7 +231,7 @@ impl LineLayout {
         let local = screen_x - origin_x;
         let mut col = glyphs.len();
         for (i, g) in glyphs.iter().enumerate() {
-            if local <= g.x + g.advance() * 0.5 {
+            if local <= g.x + g.advance() {
                 col = i;
                 break;
             }
@@ -250,6 +251,8 @@ pub struct TextLayout {
     pub first_buffer_line: u32,
 
     pub rect:              Rect,
+
+    pub visible_glyph_count: usize,
 
     // @Memory @Speed: Reuse these allocations.
     // Because currently they're being reallocated each frame.
@@ -355,6 +358,8 @@ fn build_text_layout(
 
     let first_visible_byte = buffer.text.line_to_byte(first_line as usize);
 
+    let mut visible_glyph_count = 0;
+
     let mut current_token = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
 
     // @Memory
@@ -431,6 +436,7 @@ fn build_text_layout(
             ll.glyph_start = glyph_start;
             ll.glyph_count = glyphs.len() as u32 - glyph_start;
             ll.width = local_x;
+            visible_glyph_count += ll.glyph_count as usize;
         }
 
         lines.push(ll);
@@ -445,6 +451,7 @@ fn build_text_layout(
         first_buffer_line: first_line,
         glyphs,
         lines,
+        visible_glyph_count
     }
 }
 
@@ -485,6 +492,8 @@ fn render_text_layout(
     let min_cursor_w = min_cursor_w.max(space_width);
 
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
+
+    let default_color = token_color(lexer::TokenKind::Default);
 
     //
     //
@@ -583,6 +592,8 @@ fn render_text_layout(
     //
     //
     if let Some((m_line, m_col)) = find_matching_paren(buffer, cursor_line, cursor_col, scratch_paren) {
+        let _tracy = tracy::span!("render_text_layout::matching_paren_render");
+
         // Cursor paren
         if cursor_line >= vis_start && cursor_line < vis_end {
             if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
@@ -612,6 +623,8 @@ fn render_text_layout(
     if show_cursor && is_this_view_focused
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
+        let _tracy = tracy::span!("render_text_layout::cursor(focused)");
+
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         gpu::draw_rect(
             gpu,
@@ -628,22 +641,29 @@ fn render_text_layout(
     // Text
     //
     //
-    let default_color = token_color(lexer::TokenKind::Default);
+    {
+        let _tracy = tracy::span!("render_text_layout::text");
 
-    for ll in &layout.lines {
-        let glyphs = ll.glyphs(&layout.glyphs);
-        if glyphs.is_empty() { continue; }
+        let cursor_color = palette().cursor_text;
 
-        let y = line_y(ll.buffer_line) + line_h;
-        let is_cursor_line = ll.buffer_line == cursor_line;
+        for ll in &layout.lines {
+            let glyphs = ll.glyphs(&layout.glyphs);
+            if glyphs.is_empty() { continue; }
 
-        gpu::draw_text_colored_with_precomputed_glyphs(gpu, glyphs, origin_x, y, |char_index| {
-            if is_this_view_focused && show_cursor && is_cursor_line && char_index as u32 == cursor_col {
-                palette().cursor_text
-            } else {
-                glyphs.get(char_index).map(|g| g.color).unwrap_or(default_color)
-            }
-        });
+            let y = line_y(ll.buffer_line) + line_h;
+            let is_cursor_line = ll.buffer_line == cursor_line;
+
+            draw_text_for_editor(
+                gpu,
+                glyphs,
+                origin_x,
+                y,
+                is_cursor_line && is_this_view_focused && show_cursor,
+                cursor_col,
+                cursor_color,
+                default_color,
+            );
+        }
     }
 
     //
@@ -654,6 +674,8 @@ fn render_text_layout(
     if show_cursor && !is_this_view_focused
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
+        let _tracy = tracy::span!("render_text_layout::cursor(unfocused)");
+
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         gpu::draw_rect_outline(
             gpu,
@@ -1143,19 +1165,16 @@ impl EditorState {
     }
 
     pub fn panel_at(&self, px: f32, py: f32) -> Option<PanelId> {
-        self.panel_at_recursive(self.root_panel, px, py)
-    }
+        let mut leaves = Default::default();
+        collect_leaves(self.panels.as_values_slice(), self.root_panel, &mut leaves);
 
-    fn panel_at_recursive(&self, id: PanelId, px: f32, py: f32) -> Option<PanelId> {
-        match self.panels[id].kind {
-            PanelKind::Leaf { .. } => {
-                if self.panels[id].rect.contains(px, py) { Some(id) } else { None }
-            }
-            PanelKind::Split(s) => {
-                self.panel_at_recursive(s.left_id,  px, py)
-                    .or_else(|| self.panel_at_recursive(s.right_id, px, py))
+        for (panel_id, ..) in leaves {
+            if self.panels[panel_id].rect.contains(px, py) {
+                return Some(panel_id)
             }
         }
+
+        None
     }
 }
 
@@ -1289,7 +1308,7 @@ pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
 }
 
 pub fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
-    let mut s = SmallVec::<[_; 32]>::default();
+    let mut s = SmallVec::<[_; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
     s.push(id);
 
     while let Some(id) = s.pop() {
@@ -1394,10 +1413,15 @@ fn handle_left_mouse_click(editor: &mut EditorState) -> bool {
     view.cursor_target_line = line;
     view.cursor_target_col  = col;
 
-    if !view.cursor.is_anchor_set() {
-        view.cursor.set_anchor();
+    if editor.mouse_left_pressed {
+        if !view.cursor.is_anchor_set() {
+            view.cursor.set_anchor();
+        }
+    } else {
+        view.cursor.unset_anchor();
     }
 
+    editor.set_active_panel(pid);
     editor.reset_blink();
 
     true
@@ -1453,13 +1477,17 @@ impl ApplicationHandler for App {
         let size = win.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
-        self.gpu = Some(gpu::init(Arc::clone(&win)));
-
         let path   = std::env::args().nth(1).expect("usage: naysayer <file>");
         let buffer = Buffer::from_file(path.as_ref()).expect("failed to open file");
 
         let mut editor = EditorState::new(buffer);
         editor.layout_panels(Rect::full(w as f32, h as f32));
+
+        let mut gpu = gpu::init(Arc::clone(&win));
+        gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
+        _ = gpu::get_glyph(&mut gpu, ' ', editor.font_size()); // For space_width in render_text_layout
+
+        self.gpu = Some(gpu);
         self.editor = Some(editor);
         self.window = Some(win);
     }
@@ -1667,6 +1695,37 @@ impl ApplicationHandler for App {
                     editor.render_us_acc  = 0.0;
                 }
 
+                //
+                // Ensure vertex buffer has reserved capacity
+                //
+                {
+                    let verts = gpu.verts_mut();
+                    verts.clear();
+
+                    let estimated = editor.views
+                        .values()
+                        .filter_map(|v| v.layout.as_ref())
+                        .map(|l| l.visible_glyph_count)
+                        .sum::<usize>();
+
+                    let reserve = estimated * 6 + 4096;
+
+                    let _old_capacity = verts.capacity();
+                    verts.reserve(reserve);
+
+                    #[cfg(debug_assertions)] {
+                        let _new_capacity = verts.capacity();
+                        if _old_capacity != _new_capacity {
+                            eprintln!(
+                                "[vertex buffer grew {} -> {} new_capacity: {}]",
+                                util::format_bytes(_old_capacity*size_of::<gpu::Vert>()),
+                                util::format_bytes(_new_capacity*size_of::<gpu::Vert>()),
+                                _new_capacity
+                            );
+                        }
+                    }
+                }
+
                 let still_animating = animate_views(editor, dt);
 
                 let font_size    = editor.font_size();
@@ -1774,7 +1833,7 @@ impl ApplicationHandler for App {
                         self.is_our_window_focused,
                         &mut editor.scratch_paren,
                     );
-                    editor.render_us += t1.elapsed().as_micros() as f32;
+                    editor.render_us_acc = t1.elapsed().as_micros() as f32;
                     gpu::pop_clip(gpu);
                 }
 

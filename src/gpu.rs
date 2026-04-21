@@ -8,12 +8,13 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::collections::HashMap;
 
+use wgpu::naga::FastHashMap;
 use winit::window::Window;
 
 const ATLAS_SIZE: u32 = 1024; // 1MB
 const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
 
-const VTX_BUF_CAP: u64 = 64 * 1024;
+pub const INITIAL_VERTEX_BUFFER_CAPACITY: u64 = 8 * 1024 * 1024;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct GpuGlyph {
@@ -65,10 +66,10 @@ pub struct Gpu {
     pub atlas_cur_x:    u32,
     pub atlas_cur_y:    u32,
     pub atlas_row_h:    u32,
-    pub glyphs:         HashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
+    pub glyphs:         FastHashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
     pub font:           fontdue::Font,
 
-    pub vtx_buf_cap:    u64,
+    pub current_vertex_buffer_capacity: u64,
     pub batch_pool:     Vec<Batch>,
     pub batch_count:    usize,
 }
@@ -193,7 +194,8 @@ async fn init_async(window: Arc<Window>) -> Gpu {
             module: &shader, entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                // blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: Default::default(),
@@ -206,8 +208,8 @@ async fn init_async(window: Arc<Window>) -> Gpu {
         cache:          None,
     });
 
-    let vtx_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None, size: VTX_BUF_CAP,
+    let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None, size: INITIAL_VERTEX_BUFFER_CAPACITY,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -222,12 +224,12 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
         win_w: w as f32, win_h: h as f32,
 
-        pipeline, bind_group, vtx_buf,
+        pipeline, bind_group, vtx_buf: vertex_buffer,
 
         atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
 
         glyphs: Default::default(),
-        vtx_buf_cap: VTX_BUF_CAP,
+        current_vertex_buffer_capacity: INITIAL_VERTEX_BUFFER_CAPACITY,
 
         batch_pool:  vec![Batch::full_window(w as _, h as _)],
         batch_count: 1
@@ -370,6 +372,12 @@ pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
     ]);
 }
 
+pub fn measure_str(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
+    s.chars().map(|c| {
+        get_glyph(gpu, c, font_size).map(|g| g.advance).unwrap_or(8.0)
+    }).sum()
+}
+
 // Draw text with a per-character color - pass a closure that maps char index -> color
 pub fn draw_text_colored(
     gpu: &mut Gpu,
@@ -380,6 +388,8 @@ pub fn draw_text_colored(
     color_callback: impl Fn(usize) -> Color // Glyph index -> Color
 ) {
     let (sw, sh) = (gpu.win_w, gpu.win_h);
+
+    let verts = &mut gpu.batch_pool[gpu.batch_count - 1].verts as *mut Vec<Vert>; // @Hack
 
     for (i, c) in text.chars().enumerate() {
         let Some(g) = get_glyph(gpu, c, font_size) else {
@@ -398,14 +408,14 @@ pub fn draw_text_colored(
             let (u1, v1) = (g.uv_x + g.uv_w,   g.uv_y + g.uv_h);
 
             let color: GpuColor = color_callback(i).into();
-            gpu.verts_mut().extend_from_slice(&[
-                Vert { pos:[x0, y0], uv:[u0, v0], color },
-                Vert { pos:[x1, y0], uv:[u1, v0], color },
-                Vert { pos:[x0, y1], uv:[u0, v1], color },
-                Vert { pos:[x1, y0], uv:[u1, v0], color },
-                Vert { pos:[x1, y1], uv:[u1, v1], color },
-                Vert { pos:[x0, y1], uv:[u0, v1], color },
-            ]);
+
+            let verts = unsafe { &mut *verts };                           // @Hack
+            verts.push(Vert { pos: [x0, y0], uv: [u0, v0], color });
+            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
+            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            verts.push(Vert { pos: [x1, y1], uv: [u1, v1], color });
+            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
         }
 
         x += g.advance;
@@ -424,51 +434,60 @@ pub fn draw_text(
     draw_text_colored(gpu, text, x, y, font_size, |_| color);
 }
 
-pub fn draw_text_colored_with_precomputed_glyphs(
+#[inline]
+pub fn draw_text_for_editor(
     gpu: &mut Gpu,
     glyphs: &[crate::Glyph],
     mut x: f32,
     y: f32,
-    color_callback: impl Fn(usize) -> Color // Glyph index -> Color
+
+    is_cursor_line: bool,
+    cursor_col: u32,
+    cursor_color: Color,
+    default_color: Color,
 ) {
     let (sw, sh) = (gpu.win_w, gpu.win_h);
 
+    let verts = gpu.verts_mut();
+
     for (i, g) in glyphs.iter().enumerate() {
-        let g = g.gpu_glyph;
+        let gg = g.gpu_glyph;
+        let gg = g.gpu_glyph;
 
-        if g.w > 0 && g.h > 0 {
-            let gx = (x + g.bearing_x as f32).round();
-            let gy = (y - g.bearing_y as f32 - g.h as f32).round();
+        if gg.w != 0 && gg.h != 0 {
+            let bearing_x = gg.bearing_x as f32;
+            let bearing_y = gg.bearing_y as f32;
+            let gw = gg.w as f32;
+            let gh = gg.h as f32;
 
-            let [x0, y0] = px(gx,              gy,              sw, sh);
-            let [x1, y1] = px(gx + g.w as f32, gy + g.h as f32, sw, sh);
+            let gx = (x + gg.bearing_x as f32).round();
+            let gy = (y - gg.bearing_y as f32 - gg.h as f32).round();
 
-            let (u0, v0) = (g.uv_x,            g.uv_y);
-            let (u1, v1) = (g.uv_x + g.uv_w,   g.uv_y + g.uv_h);
+            let x1p = gx + gw;
+            let y1p = gy + gh;
 
-            let color: GpuColor = color_callback(i).into();
-            gpu.verts_mut().extend_from_slice(&[
-                Vert { pos:[x0, y0], uv:[u0, v0], color },
-                Vert { pos:[x1, y0], uv:[u1, v0], color },
-                Vert { pos:[x0, y1], uv:[u0, v1], color },
-                Vert { pos:[x1, y0], uv:[u1, v0], color },
-                Vert { pos:[x1, y1], uv:[u1, v1], color },
-                Vert { pos:[x0, y1], uv:[u0, v1], color },
-            ]);
+            let [x0, y0] = px(gx,  gy,  sw, sh);
+            let [x1, y1] = px(x1p, y1p, sw, sh);
+
+            let (u0, v0) = (gg.uv_x,          gg.uv_y);
+            let (u1, v1) = (gg.uv_x + gg.uv_w, gg.uv_y + gg.uv_h);
+
+            let color: GpuColor = if is_cursor_line && i as u32 == cursor_col {
+                cursor_color.into()
+            } else {
+                g.color.into()
+            };
+
+            verts.push(Vert { pos: [x0, y0], uv: [u0, v0], color });
+            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
+            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            verts.push(Vert { pos: [x1, y1], uv: [u1, v1], color });
+            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
         }
 
-        x += g.advance;
+        x += g.advance();
     }
-}
-
-#[inline]
-pub fn draw_text_with_precomputed_glyphs(
-    gpu: &mut Gpu,
-    glyphs: &[crate::Glyph],
-    x: f32, y: f32,
-    color: Color,
-) {
-    draw_text_colored_with_precomputed_glyphs(gpu, glyphs, x, y, |_| color);
 }
 
 pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
@@ -489,15 +508,15 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
     let mut draws = Vec::new();
 
     if byte_size > 0 {
-        if byte_size > gpu.vtx_buf_cap {
+        if byte_size > gpu.current_vertex_buffer_capacity {
             // Grow if needed
-            let new_cap = (byte_size * 2).max(VTX_BUF_CAP);
+            let new_cap = (byte_size * 2).max(INITIAL_VERTEX_BUFFER_CAPACITY);
             gpu.vtx_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None, size: new_cap,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            gpu.vtx_buf_cap = new_cap;
+            gpu.current_vertex_buffer_capacity = new_cap;
         }
 
         let mut vert_offset = 0u32;
@@ -573,20 +592,39 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
 //
 
 const SHADER: &str = r#"
-struct V { @location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32> }
-struct F { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32> }
+struct V {
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>
+}
 
-@vertex fn vs_main(v: V) -> F {
-    return F(vec4<f32>(v.pos, 0.0, 1.0), v.uv, v.color);
+struct F {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>
+}
+
+@vertex
+fn vs_main(v: V) -> F {
+    return F(
+        vec4<f32>(v.pos, 0.0, 1.0),
+        v.uv,
+        v.color
+    );
 }
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 
-@fragment fn fs_main(f: F) -> @location(0) vec4<f32> {
-    if f.uv.x == 0.0 && f.uv.y == 0.0 { return f.color; }
-    // verts already premultiplied, just scale by glyph alpha
-    let a = textureSample(tex, smp, f.uv).r;
-    return f.color * a;
+@fragment
+fn fs_main(f: F) -> @location(0) vec4<f32> {
+    if f.uv.x == 0.0 && f.uv.y == 0.0 { return f.color; } // @Hack
+
+    let weight = 1.17; // 1.0 normal, <1 bold, >1 thin
+
+    let glyph_alpha = textureSample(tex, smp, f.uv).r;
+    let a = pow(glyph_alpha, weight) * 1.1;
+
+    return vec4<f32>(f.color.rgb, clamp(a, 0.0, 1.0));
 }
 "#;

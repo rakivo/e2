@@ -2,6 +2,25 @@
 
 use std::{borrow::Cow, fmt::Display};
 
+#[inline]
+pub fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let b = bytes as f64;
+
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 // pixel coords -> NDC (Y flipped: screen top = NDC +1)
 #[inline]
 pub fn px(x: f32, y: f32, sw: f32, sh: f32) -> [f32; 2] {
