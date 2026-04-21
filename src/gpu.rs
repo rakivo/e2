@@ -194,8 +194,7 @@ async fn init_async(window: Arc<Window>) -> Gpu {
             module: &shader, entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                // blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: Default::default(),
@@ -619,12 +618,7 @@ fn vs_main(v: V) -> F {
 @fragment
 fn fs_main(f: F) -> @location(0) vec4<f32> {
     if f.uv.x == 0.0 && f.uv.y == 0.0 { return f.color; } // @Hack
-
-    let weight = 1.17; // 1.0 normal, <1 bold, >1 thin
-
-    let glyph_alpha = textureSample(tex, smp, f.uv).r;
-    let a = pow(glyph_alpha, weight) * 1.1;
-
-    return vec4<f32>(f.color.rgb, clamp(a, 0.0, 1.0));
+    let a = textureSample(tex, smp, f.uv).r;
+    return f.color * a;
 }
 "#;
