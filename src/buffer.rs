@@ -3,7 +3,6 @@ use crate::lexer::{LexState, Token, lex_from};
 use std::path::Path;
 
 use ropey::Rope;
-use smallstr::SmallString;
 
 #[derive(Default, Copy, Clone, Debug)]
 pub struct Cursor {
@@ -34,9 +33,15 @@ impl Cursor {
 pub struct Buffer {
     pub text: Rope,
     pub path: Option<Box<Path>>,
-    pub dirty: bool,
+
+    pub is_dirty: bool,
+
+    pub last_insert: Option<(usize, u32)>, // (char_index, len)
+    pub last_delete: Option<(usize, u32)>, // (char_index, len)
+
     pub lex_scratch: String,
     pub visible_tokens: Vec<Token>,
+    pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
 }
 
 impl Buffer {
@@ -56,12 +61,9 @@ impl Buffer {
         cursor.char_index = line_start + col.min(line_len as u32) as usize;
     }
 
-    pub fn lex_visible(&mut self, top_line: usize, bottom_line: usize) {
-        let start_line = top_line.saturating_sub(10);
-        let end_line   = (bottom_line + 10).min(self.text.len_lines());
-
-        let start_byte = self.text.line_to_byte(start_line);
-        let end_byte   = self.text.line_to_byte(end_line);
+    pub fn lex_visible(&mut self, start_line: usize, end_line: usize) {
+        let start_byte = self.text.try_line_to_byte(start_line).unwrap_or(0);
+        let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes()-1);
 
         // Determine block comment state at start_line
         let restart_state = self.state_at_byte(start_byte);
@@ -80,25 +82,41 @@ impl Buffer {
         );
     }
 
-    fn state_at_byte(&self, end_byte: usize) -> LexState {
-        let char_end = self.text.byte_to_char(end_byte);
-        let mut s = SmallString::<[u8; 128]>::new();
-        for chunk in self.text.slice(..char_end).chunks() {
-            s.push_str(chunk);
-        }
+    fn invalidate_cache_from_char(&mut self, char_idx: usize) {
+        let byte = self.text.char_to_byte(char_idx);
+        let keep = self.comment_cache.partition_point(|(b, _)| *b < byte);
+        self.comment_cache.truncate(keep);
+    }
 
-        let b = s.as_bytes();
-        let mut i = b.len().saturating_sub(1);
-        while i > 0 {
-            // Scanning backwards, so the "first" char of a pair is at i-1
-            // /* in source = b[i-1]=='/' && b[i]=='*'  -> we're inside a comment
-            // */ in source = b[i-1]=='*' && b[i]=='/'  -> we closed a comment
-            if b[i-1] == b'/' && b[i] == b'*' { return LexState::InBlockComment; }
-            if b[i-1] == b'*' && b[i] == b'/' { return LexState::Normal; }
-            i -= 1;
-        }
+    fn extend_cache_to(&mut self, target_byte: usize) {
+        let (resume_byte, resume_state) = self.comment_cache
+            .last()
+            .copied()
+            .unwrap_or((0, LexState::Normal));
 
-        LexState::Normal
+        if resume_byte > target_byte { return; }
+
+        let char_start = self.text.byte_to_char(resume_byte);
+        let char_end   = self.text.byte_to_char(target_byte);
+        let mut state    = resume_state;
+        let mut byte_pos = resume_byte;
+        let mut tmp      = Vec::new();
+
+        for chunk in self.text.slice(char_start..char_end).chunks() {
+            self.comment_cache.push((byte_pos, state));
+            tmp.clear();
+            state = lex_from(chunk, byte_pos, state, &mut tmp);
+            byte_pos += chunk.len();
+        }
+        self.comment_cache.push((byte_pos, state));
+    }
+
+    fn state_at_byte(&mut self, target_byte: usize) -> LexState {
+        self.extend_cache_to(target_byte);
+        let idx = self.comment_cache
+            .partition_point(|(b, _)| *b <= target_byte)
+            .saturating_sub(1);
+        self.comment_cache[idx].1
     }
 
     pub fn cursor_line_col(&self, cursor: &Cursor) -> (u32, u32) {
@@ -116,22 +134,31 @@ impl Buffer {
         let idx = cursor.char_index.min(self.text.len_chars());
 
         self.text.insert_char(idx, c);
+        self.invalidate_cache_from_char(idx);
 
         cursor.char_index = idx + 1;
         cursor.preferred_col = None;
 
-        self.dirty = true;
+        self.is_dirty = true;
+        self.last_insert = Some((idx, 1));
     }
 
     pub fn insert_char_after(&mut self, c: char, cursor: &mut Cursor) {
         let idx = cursor.char_index.min(self.text.len_chars());
 
         self.text.insert_char(idx, c);
+        self.invalidate_cache_from_char(idx);
 
-        self.dirty = true;
+        self.is_dirty = true;
+        self.last_insert = Some((idx, 1));
     }
 
     pub fn insert_literal(&mut self, l: &str, cursor: &mut Cursor) {
+        let idx = cursor.char_index.min(self.text.len_chars());
+        self.invalidate_cache_from_char(idx);
+
+        let len = l.chars().count();
+
         for c in l.chars() {
             let idx = cursor.char_index.min(self.text.len_chars());
             self.text.insert_char(idx, c);
@@ -139,7 +166,8 @@ impl Buffer {
             cursor.preferred_col = None;
         }
 
-        self.dirty = true;
+        self.is_dirty = true;
+        self.last_insert = Some((idx, len as u32));
     }
 
     pub fn delete_backward(&mut self, cursor: &mut Cursor) {
@@ -148,11 +176,13 @@ impl Buffer {
         let idx = cursor.char_index - 1;
 
         self.text.remove(idx..cursor.char_index);
+        self.invalidate_cache_from_char(idx);
 
         cursor.char_index = idx;
         cursor.preferred_col = None;
 
-        self.dirty = true;
+        self.is_dirty = true;
+        self.last_delete = Some((idx, 1));
     }
 
     pub fn delete_forward(&mut self, cursor: &mut Cursor) {
@@ -160,11 +190,13 @@ impl Buffer {
         if cursor.char_index >= len { return; }
 
         self.text.remove(cursor.char_index..cursor.char_index + 1);
+        self.invalidate_cache_from_char(cursor.char_index);
 
         cursor.char_index = cursor.char_index.min(self.text.len_chars());
         cursor.preferred_col = None;
 
-        self.dirty = true;
+        self.is_dirty = true;
+        self.last_delete = Some((cursor.char_index, 1));
     }
 
     pub fn delete_forward_until_newline(&mut self, cursor: &mut Cursor) {
@@ -180,11 +212,13 @@ impl Buffer {
             .unwrap_or(len - cursor.char_index);
 
         self.text.remove(cursor.char_index..cursor.char_index + chars_to_delete);
+        self.invalidate_cache_from_char(cursor.char_index);
 
         cursor.char_index = cursor.char_index.min(self.text.len_chars());
         cursor.preferred_col = None;
 
-        self.dirty = true;
+        self.is_dirty = true;
+        self.last_delete = Some((cursor.char_index, chars_to_delete as u32));
     }
 
     pub fn delete_word_forward(&mut self, cursor: &mut Cursor) {
@@ -200,9 +234,13 @@ impl Buffer {
         if i == start { return; }
 
         self.text.remove(start..i);
+        self.invalidate_cache_from_char(start);
+
         cursor.char_index    = start.min(self.text.len_chars());
         cursor.preferred_col = None;
-        self.dirty = true;
+
+        self.is_dirty = true;
+        self.last_delete = Some((start, (i-start) as u32));
     }
 
     pub fn delete_word_backward(&mut self, cursor: &mut Cursor) {
@@ -218,9 +256,13 @@ impl Buffer {
         if i == end { return; }
 
         self.text.remove(i..end);
+        self.invalidate_cache_from_char(i);
+
         cursor.char_index    = i.min(self.text.len_chars());
         cursor.preferred_col = None;
-        self.dirty = true;
+
+        self.is_dirty = true;
+        self.last_delete = Some((i, (end-i) as u32));
     }
 
     pub fn delete_selection(&mut self, cursor: &mut Cursor) {
@@ -234,10 +276,12 @@ impl Buffer {
 
         if start != end {
             self.text.remove(start..end);
+            self.invalidate_cache_from_char(start);
 
             // Move cursor to the start of the deleted range
             cursor.char_index = start;
-            self.dirty = true;
+            self.is_dirty = true;
+            self.last_delete = Some((start, (end-start) as u32));
         }
 
         // Always clear selection state
@@ -246,8 +290,11 @@ impl Buffer {
     }
 
     pub fn clear(&mut self) {
-        self.dirty = true;
+        self.is_dirty = true;
         self.text = Rope::new();
+        self.comment_cache.clear();
+        self.last_delete = None;
+        self.last_insert = None;
     }
 
     pub fn move_left(&self, cursor: &mut Cursor) {

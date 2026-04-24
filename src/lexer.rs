@@ -220,6 +220,10 @@ pub fn lex_from(
                             Some(TokenKind::Keyword)
                         } else { None },
 
+                        8 => if matches!(word, "continue") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
                         _ => None,
                     };
 

@@ -2,6 +2,10 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod gpu;
 mod util;
 mod color;
@@ -36,6 +40,40 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 
 #[cfg(debug_assertions)]
+fn vec_element_size<T>(_: &Vec<T>) -> usize {
+    size_of::<T>()
+}
+
+#[cfg(debug_assertions)]
+macro_rules! checked_reserve {
+    ($vec:expr, $n:expr, $name:expr) => {
+        {
+            let _old_cap = $vec.capacity();
+            $vec.reserve($n);
+            let _new_cap = $vec.capacity();
+            if _new_cap != _old_cap {
+                let _elem = vec_element_size(&$vec);
+                eprintln!(
+                    "[{}] grew {} -> {} (len={})",
+                    $name,
+                    util::format_bytes(_old_cap * _elem),
+                    util::format_bytes(_new_cap * _elem),
+                    $vec.len()
+                );
+            }
+        }
+    };
+    ($vec:expr, $n:expr) => {
+        checked_reserve!($vec, $n, stringify!($vec))
+    };
+}
+#[cfg(not(debug_assertions))]
+macro_rules! checked_reserve {
+    ($vec:expr, $n:expr, $name:expr) => { $vec.reserve($n); };
+    ($vec:expr, $n:expr) => { $vec.reserve($n); };
+}
+
+#[cfg(debug_assertions)]
 macro_rules! checked_push {
     ($vec:expr, $val:expr, $name:expr) => {
         {
@@ -54,7 +92,6 @@ macro_rules! checked_push {
         checked_push!($vec, $val, stringify!($vec))
     };
 }
-
 #[cfg(not(debug_assertions))]
 macro_rules! checked_push {
     ($vec:expr, $val:expr, $name:expr) => { $vec.push($val); };
@@ -97,18 +134,15 @@ fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mu
     );
 }
 
-fn draw_metrics(editor: &Editor, gpu: &mut Gpu) {
-    const BUILD_GOOD: f32  = 200.0;
-    const BUILD_SLOW: f32  = 800.0;
+fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
+    const BUILD_GOOD:  f32 = 200.0;
+    const BUILD_SLOW:  f32 = 800.0;
 
     const RENDER_GOOD: f32 = 300.0;
     const RENDER_SLOW: f32 = 1500.0;
 
-    const RELEX_GOOD: f32  = 100.0;
-    const RELEX_SLOW: f32  = 500.0;
-
-    const FRAME_GOOD: f32  = 500.0;
-    const FRAME_SLOW: f32  = 2000.0;
+    const RELEX_GOOD:  f32 = 100.0;
+    const RELEX_SLOW:  f32 = 500.0;
 
     const HUD_Y: f32 = 14.0;
     const HUD_LINE_H: f32 = 14.0;
@@ -146,6 +180,10 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu) {
 
         Color::rgba(r, g, b, 255)
     }
+
+    let frame_budget_us = 1_000_000_000.0 / refresh_rate_millihertz as f32; // us per frame
+    let frame_good = frame_budget_us * 0.5;  // good = under 50% of the budget
+    let frame_slow = frame_budget_us * 0.8;  // slow = over  80% of the budget
 
     let fps    = editor.fps;
     let build  = editor.build_us;
@@ -209,7 +247,7 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu) {
         x_right,
         HUD_Y + 4.0 * HUD_LINE_H,
         12.0,
-        heat(frame, FRAME_GOOD, FRAME_SLOW),
+        heat(frame, frame_good, frame_slow),
     );
 }
 
@@ -529,51 +567,23 @@ fn rebuild_text_layout(
 
     rect: Rect, font_size: f32, line_h: f32,
 ) {
-    let view      = &editor.views[view_id];
-    let buffer_id = view.buffer_id;
+    let view = &editor.views[view_id];
 
-    //
-    // @Speed @Note:
-    //
-    // Currently we re-lex visible tokens on every dirty frame,
-    // thats fine for now, since those conditions inside is_dirty
-    // make sure that either the amount of lines we see has changed,
-    // OR we now see completely different lines that in the previous frame.
-    //
-    // BUT, in the future, we might wanna have a different flag for this re-lex step.
-    //
-    {
-        let t0 = Instant::now();
-
-        let total      = editor.buffers[buffer_id].text.len_lines();
-        let scroll     = editor.views[view_id].scroll;
-        let first_vis  = (scroll / line_h) as u32;
-        let last_vis = (((scroll + rect.h) / line_h) as usize)
-            .saturating_sub(1)
-            .min(total.saturating_sub(1)) as u32;
-
-        editor.buffers[buffer_id].lex_visible(first_vis as _, last_vis as _);
-
-        editor.relex_us_acc += t0.elapsed().as_micros() as f32;
-    }
-
-    let should_snap = editor.views[view_id].layout.as_ref()
-        .map(|l| {
-            (l.rect.w - rect.w).abs() > 0.5
-                || (l.rect.h - rect.h).abs() > 0.5
-        }).unwrap_or(true); // true = first build
+    let should_snap = view.layout.as_ref().map(|l| {
+        (l.rect.w - rect.w).abs() > 0.5
+            || (l.rect.h - rect.h).abs() > 0.5
+    }).unwrap_or(true); // true = first build
 
     let t0 = Instant::now();
     let layout = build_text_layout(
+        editor,
         gpu,
-        &editor.buffers[buffer_id],
-        &editor.views[view_id],
+        view_id,
         rect, font_size, line_h,
     );
     editor.build_us_acc += t0.elapsed().as_micros() as f32;
 
-    editor.views[view_id].layout    = Some(layout);
-    editor.buffers[buffer_id].dirty = false;
+    editor.views[view_id].layout = Some(layout);
 
     if should_snap {
         let (cl, cc) = (
@@ -587,14 +597,19 @@ fn rebuild_text_layout(
 
 /// Build the TextLayout for a single leaf panel
 fn build_text_layout(
-    gpu:       &mut Gpu,
+    editor: &mut Editor,
+    gpu:    &mut Gpu,
 
-    buffer:    &Buffer,
-    view:      &View,
+    view_id: ViewId,
 
     rect: Rect, font_size: f32, line_h: f32,
 ) -> TextLayout {
     let _tracy = tracy::span!("build_text_layout");
+
+    let old_layout = editor.views[view_id].layout.take();
+
+    let view      = &editor.views[view_id];
+    let buffer_id = view.buffer_id;
 
     //
     // Calculate the base visible range based on the animation (what we see now)
@@ -616,7 +631,7 @@ fn build_text_layout(
     if diff > 0.0 {
         // We are scrolling DOWN (target is below current anim)
         // Add 40 lines of lookahead to the bottom
-        last_line = last_line.saturating_add(40);
+        last_line  = last_line.saturating_add(40);
     } else if diff < 0.0 {
         // We are scrolling UP   (target is above current anim)
         // Add 40 lines of lookahead to the top
@@ -625,6 +640,25 @@ fn build_text_layout(
 
     let line_count = last_line - first_line;
 
+    //
+    // @Speed @Note:
+    //
+    // Currently we re-lex visible tokens on every dirty frame,
+    // thats fine for now, since those conditions inside is_dirty
+    // make sure that either the amount of lines we see has changed,
+    // OR we now see completely different lines that in the previous frame.
+    //
+    // BUT, in the future, we might wanna have a different flag for this re-lex step.
+    //
+    {
+        let t0 = Instant::now();
+        editor.buffers[buffer_id].lex_visible(first_line as _, last_line as _);
+        editor.relex_us_acc += t0.elapsed().as_micros() as f32;
+    }
+
+    let buffer = &editor.buffers[buffer_id];
+    let view   = &editor.views[view_id];
+
     let default_color = token_color(lexer::TokenKind::Default);
     let tokens        = &buffer.visible_tokens;
 
@@ -632,11 +666,28 @@ fn build_text_layout(
 
     let mut visible_glyph_count = 0u32;
 
+    let mut line_byte_start = buffer.text.line_to_byte(first_line as usize);
+
     let mut current_token = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
 
-    // @Memory @Speed: Reuse these allocations!!!!!!!
-    let mut lines  = Vec::with_capacity(line_count as usize);
-    let mut glyphs = Vec::with_capacity(line_count as usize * 80);
+    let (mut lines, mut glyphs) = if let Some(mut old) = old_layout {
+        old.lines.clear();
+        old.glyphs.clear();
+        (old.lines, old.glyphs)
+    } else {
+        (Default::default(), Default::default())
+    };
+
+    checked_reserve!(lines,  line_count as usize);
+    checked_reserve!(glyphs, line_count as usize * 80);
+
+    //
+    //
+    // @Speed: Instead of indirecting into the actual rope in this loop,
+    // we REALLY wanna reuse the lex_scratch from Buffer,
+    // since it's already pre-populated at this point because of the lex_visible call above.
+    //
+    //
 
     for vis_i in 0..line_count {
         let line_index = first_line + vis_i;
@@ -645,7 +696,7 @@ fn build_text_layout(
         let has_nl   = rope_line.len_chars() > 0 && rope_line.char(rope_line.len_chars() - 1) == '\n';
         let line_len = rope_line.len_bytes().saturating_sub(if has_nl { 1 } else { 0 });
 
-        let line_byte_start = buffer.text.line_to_byte(line_index as usize);
+        let next_byte_start = line_byte_start + rope_line.len_bytes();
 
         let mut ll = LineLayout {
             buffer_line:     line_index,
@@ -657,6 +708,7 @@ fn build_text_layout(
         };
 
         if line_len == 0 {
+            line_byte_start = next_byte_start;
             checked_push!(lines, ll);
             continue;
         }
@@ -712,7 +764,9 @@ fn build_text_layout(
         ll.glyph_start = glyph_start;
         ll.glyph_count = glyphs.len() as u32 - glyph_start;
         ll.width = local_x;
+
         visible_glyph_count += ll.glyph_count;
+        line_byte_start = next_byte_start;
 
         checked_push!(lines, ll);
 
@@ -720,15 +774,15 @@ fn build_text_layout(
     }
 
     TextLayout {
-        buffer_id:         view.buffer_id,
+        buffer_id,
         rect,
-        view_scroll:       view.scroll,
         line_h,
         font_size,
-        first_buffer_line: first_line,
         glyphs,
         lines,
-        visible_glyph_count
+        visible_glyph_count,
+        view_scroll: view.scroll,
+        first_buffer_line: first_line,
     }
 }
 
@@ -847,19 +901,24 @@ fn render_text_layout(
                 if x1 < rect.x + rect.w {
                     gpu::draw_rect(gpu, x1, y, (rect.x + rect.w) - x1, line_h, palette().current_line);
                 }
+
             } else if start_line < cursor_line && end_line > cursor_line {
-                // fully covered by selection - no current-line bg
+                // Fully covered by selection, no current-line bg
+
             } else if end_line == cursor_line {
                 let x1 = layout.x_for_col(origin_x, end_col, ll);
                 gpu::draw_rect(gpu, x1, y, (rect.x + rect.w) - x1, line_h, palette().current_line);
+
             } else if start_line == cursor_line {
                 let x0 = layout.x_for_col(origin_x, start_col, ll);
                 if x0 > rect.x {
                     gpu::draw_rect(gpu, rect.x, y, x0 - rect.x, line_h, palette().current_line);
                 }
+
             } else {
                 gpu::draw_rect(gpu, rect.x, y, rect.w, line_h, palette().current_line);
             }
+
         } else {
             gpu::draw_rect(gpu, rect.x, y, rect.w, line_h, palette().current_line);
         }
@@ -1056,33 +1115,29 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
     gpu::push_clip(gpu, px, list_y, pw, list_h);
 
     for slot in 0..visible {
-        let idx      = first + slot;
-        let Some(&item_idx) = editor.lister.filtered.get(idx) else { break };
-        let item     = &editor.lister.items[item_idx];
+        let index      = first + slot;
+        let Some(&item_index) = editor.lister.filtered.get(index) else { break };
+        let item     = &editor.lister.items[item_index as usize];
         let iy       = list_y + slot as f32 * item_h - frac;
 
-        let is_selected = idx == editor.lister.selected_index;
-        let is_hovered  = editor.lister.hovered_index == Some(idx);
+        let is_selected = index == editor.lister.selected_index as usize;
+        let is_hovered  = editor.lister.hovered_index == Some(index as u32);
 
         if iy > list_y + list_h { break; }
 
         // Alternating row tint  very subtle, just enough to separate rows
-        if idx % 2 == 0 {
-            gpu::draw_rect(gpu, px, iy, pw, item_h,
-                           Color::rgba(255, 200, 100, 8));
+        if index % 2 == 0 {
+            gpu::draw_rect(gpu, px, iy, pw, item_h, Color::rgba(255, 200, 100, 8));
         }
 
 
         if is_hovered && !is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h,
-                           Color::rgba(60, 45, 15, 120));
+            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(60, 45, 15, 120));
         }
 
         if is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h,
-                           Color::rgba(80, 55, 20, 180));
-            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h,
-                           Color::hex(0xc3a983));
+            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(80, 55, 20, 180));
+            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h, Color::hex(0xc3a983));
             gpu::draw_rect(gpu, px, iy, pw, sep, Color::rgba(180, 140, 80, 60));
             gpu::draw_rect(gpu, px, iy + item_h - sep, pw, sep, Color::rgba(180, 140, 80, 60));
         }
@@ -1095,18 +1150,22 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
 
         if !item.sublabel.is_empty() {
             let sub_w = gpu::measure_str(gpu, &item.sublabel, font_size * 0.82);
-            gpu::draw_text(gpu, &item.sublabel,
-                           px + pw - pad - sub_w,
-                           label_y,
-                           font_size * 0.82,
-                           if is_selected { Color::rgba(180, 140, 80, 200) }
-                           else        { Color::rgba(120, 100, 60, 120) });
+            gpu::draw_text(
+                gpu, &item.sublabel,
+                px + pw - pad - sub_w,
+                label_y,
+                font_size * 0.82,
+                if is_selected { Color::rgba(180, 140, 80, 200) }
+                else           { Color::rgba(120, 100, 60, 120) }
+            );
         }
     }
 
     gpu::pop_clip(gpu);
 
+    //
     // Scrollbar
+    //
     let total_items = editor.lister.filtered.len();
     if total_items > 0 {
         let total_h = total_items as f32 * item_h + item_h * LISTER_ITEMS_PADDING;
@@ -1115,12 +1174,10 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
         let bar_y    = list_y + bar_frac * (list_h - bar_h);
 
         // Scrollbar track - very faint
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h,
-                       Color::rgba(255, 200, 100, 15));
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, Color::rgba(255, 200, 100, 15));
 
         // Scrollbar thumb
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h,
-                       Color::rgba(180, 140, 80, 140));
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h, Color::rgba(180, 140, 80, 140));
     }
 }
 
@@ -1277,6 +1334,7 @@ pub enum ListerKeyDispatch {
     None
 }
 
+#[derive(Debug)]
 pub struct ListerItem {
     pub label:    SmallString<[u8; 32]>,
     pub sublabel: SmallString<[u8; 64]>,
@@ -1287,13 +1345,16 @@ pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> bool;
 pub type ListerSelectFn = fn(&mut CommandContext, u64);
 
 pub struct Lister {
-    pub is_open:       bool,
+    pub is_open:        bool,
     pub is_listing_file_entries: bool,
+    pub is_query_dirty: bool,
+
+    pub last_seen_cached_dir_generation: u64, // u64::MAX if we didnt see any generations
 
     pub query:         SmallString<[u8; 128]>,
 
-    pub selected_index: usize,
-    pub  hovered_index: Option<usize>,
+    pub selected_index: u32,
+    pub  hovered_index: Option<u32>,
 
     pub set_selected_index_to_1_instead_of_0: bool,
 
@@ -1307,12 +1368,13 @@ pub struct Lister {
     pub list_h:        f32,
 
     // Storage - cleared and refilled when lister opens
-    pub items:         Vec<ListerItem>,
+    pub items:           Vec<ListerItem>,
 
     // Scratch - rebuilt only when query changes (dirty flag)
-    pub filtered:      Vec<usize>,   // Indices into items
-    pub query_dirty:   bool,
-    pub scratch_str:   String,       // For formatting, reused
+    pub filtered:        Vec<u32>,        // Indices into items
+
+    pub scratch_str:     String,          // Reused for formatting
+    pub scoring_scratch: Vec<(u32, u32)>, // Reused rebuild_filtered
 }
 
 impl Lister {
@@ -1321,25 +1383,28 @@ impl Lister {
             is_open: false,
             query: SmallString::new(),
             filtered: Default::default(),
+            last_seen_cached_dir_generation: u64::MAX,
             items_update_frame_update_callback: Default::default(),
             hovered_index: None,
             is_listing_file_entries: false,
             items: Default::default(),
             on_confirm: Default::default(),
             pending_datas: Default::default(),
-            query_dirty: false,
+            is_query_dirty: false,
             scratch_str: String::with_capacity(512),
             scroll: 0.0,
             set_selected_index_to_1_instead_of_0: false,
             scroll_anim: 0.0,
             selected_index: 0,
+            scoring_scratch: Vec::with_capacity(256),
             list_h: 0.0,
             item_h: 0.0
         }
     }
 
     pub fn rebuild_filtered(&mut self) {
-        if !self.query_dirty { return; }
+        if !self.is_query_dirty { return; }
+
         self.filtered.clear();
 
         let filter_str = if self.is_listing_file_entries {
@@ -1363,14 +1428,15 @@ impl Lister {
         };
 
         if filter_str.is_empty() {
-            self.filtered.extend(0..self.items.len());
-            self.query_dirty = false;
+            self.filtered.extend(0..self.items.len() as u32);
+            self.is_query_dirty = false;
             return;
         }
 
         // Filter by subsequence
         // Then score by edit distance on matched items only for sorting
-        let mut scored: Vec<(usize, usize)> = self.items.iter()
+        self.scoring_scratch.clear();
+        self.scoring_scratch.extend(self.items.iter()
             .enumerate()
             .filter(|(_, item)| Self::fuzzy_match(&item.label, filter_str))
             .map(|(i, item)| {
@@ -1381,12 +1447,12 @@ impl Lister {
                     &item.label,
                     filter_str.len() * 3, // nocheckin
                 ).unwrap_or(usize::MAX);
-                (i, score)
-            }).collect();
+                (i as u32, score as u32)
+            }));
 
-        scored.sort_unstable_by_key(|&(_, score)| score);
-        self.filtered.extend(scored.iter().map(|&(i, _)| i));
-        self.query_dirty = false;
+        self.scoring_scratch.sort_unstable_by_key(|&(_, score)| score);
+        self.filtered.extend(self.scoring_scratch.iter().map(|&(i, _)| i));
+        self.is_query_dirty = false;
     }
 
     fn fuzzy_match(text: &str, query: &str) -> bool {
@@ -1415,7 +1481,7 @@ impl Lister {
             }
 
             Key::Named(NamedKey::ArrowDown) => {
-                if self.selected_index + 1 < self.filtered.len() {
+                if self.selected_index + 1 < self.filtered.len() as u32 {
                     self.selected_index += 1;
                     self.scroll_to_selected();
                 }
@@ -1432,7 +1498,7 @@ impl Lister {
 
             Key::Character(s) if ctrl => match s.chars().next() {
                 Some('n') => {
-                    if self.selected_index + 1 < self.filtered.len() {
+                    if self.selected_index + 1 < self.filtered.len() as u32 {
                         self.selected_index += 1;
                         self.scroll_to_selected();
                     }
@@ -1450,8 +1516,8 @@ impl Lister {
                 }
 
                 Some('v') => {
-                    let page = (self.list_h / self.item_h) as usize;
-                    self.selected_index = (self.selected_index + page).min(self.filtered.len().saturating_sub(1));
+                    let page = (self.list_h / self.item_h) as u32;
+                    self.selected_index = (self.selected_index + page).min(self.filtered.len().saturating_sub(1) as u32);
                     self.scroll_to_selected();
                     ListerKeyDispatch::Other
                 }
@@ -1463,7 +1529,7 @@ impl Lister {
 
             Key::Character(s) if alt => match s.chars().next() {
                 Some('v') => {
-                    let page = (self.list_h / self.item_h) as usize;
+                    let page = (self.list_h / self.item_h) as u32;
                     self.selected_index = self.selected_index.saturating_sub(page);
                     self.scroll_to_selected();
                     ListerKeyDispatch::Other
@@ -1645,7 +1711,7 @@ impl Editor {
     }
 
     pub fn is_lister_buffer_dirty(&self) -> bool {
-        self.buffers[self.lister_query_buffer].dirty
+        self.buffers[self.lister_query_buffer].is_dirty
     }
 
     pub fn open_lister(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn) {
@@ -1666,10 +1732,10 @@ impl Editor {
 
         self.lister.query.clear();
         self.lister.filtered.clear();
-        self.lister.query_dirty     = true;
+        self.lister.is_query_dirty     = true;
         self.canonicalized_last_scanned_directory = SmallString::new();
         self.lister.selected_index  = if self.lister.set_selected_index_to_1_instead_of_0 {
-            (items.len() > 1) as usize
+            (items.len() > 1) as u32
         } else {
             0
         };
@@ -2048,7 +2114,7 @@ fn find_matching_paren(
 
     let mut depth = 0;
 
-    const MAX_SCAN_LINES: u32 = 2000;
+    const MAX_SCAN_LINES: u32 = 128;
 
     if dir > 0 {
         let mut line = start_line;
@@ -2202,8 +2268,8 @@ const fn lister_rect(win_w: f32, win_h: f32) -> Rect {
 
 fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
     let index = cx.editor.lister.selected_index;
-    let index = cx.editor.lister.filtered[index];
-    let item_data = cx.editor.lister.items[index].data;
+    let index = cx.editor.lister.filtered[index as usize];
+    let item_data = cx.editor.lister.items[index as usize].data;
 
     let on_confirm = cx.editor.lister.on_confirm.pop().unwrap();
     cx.editor.lister.pending_datas.push(item_data);
@@ -2227,8 +2293,8 @@ fn handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &C
 
             if my >= list_y {
                 let local_y = my - list_y + editor.lister.scroll_anim;
-                let clicked = (local_y / item_h) as usize;
-                if clicked < editor.lister.filtered.len() {
+                let clicked = (local_y / item_h) as u32;
+                if clicked < editor.lister.filtered.len() as u32 {
                     editor.lister.selected_index = clicked;
                     editor.lister.is_open = false;
                     editor.lister.is_listing_file_entries = true;
@@ -2292,6 +2358,50 @@ fn handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &C
     true
 }
 
+pub fn adjust_cursors_after_mutation(editor: &mut Editor) {
+    //
+    // If user has two panels looking into the same buffer,
+    // and he mutated the buffer this frame, ensure that
+    // all cursors pointed into this buffer visually stay at the same place.
+    //
+
+    let _tracy = tracy::span!("adjust_cursors_after_mutation");
+
+    let active_view_id = editor.active_view_id();
+
+    for (buffer_id, buffer) in editor.buffers.iter_mut() {
+        if let Some((at, len)) = buffer.last_insert.take() {
+            for (vid, view) in editor.views.iter_mut() {
+                if view.buffer_id != buffer_id { continue }
+                if vid == active_view_id       { continue }
+
+                if view.cursor.char_index > at {
+                    view.cursor.char_index += len as usize;
+                }
+
+                if let Some(a) = view.cursor.anchor_char_index {
+                    if a > at { view.cursor.anchor_char_index = Some(a + len as usize); }
+                }
+            }
+        }
+
+        if let Some((at, len)) = buffer.last_delete.take() {
+            for (vid, view) in editor.views.iter_mut() {
+                if view.buffer_id != buffer_id { continue }
+                if vid == active_view_id       { continue }
+
+                if view.cursor.char_index > at {
+                    view.cursor.char_index = view.cursor.char_index.saturating_sub(len as usize).max(at);
+                }
+
+                if let Some(a) = view.cursor.anchor_char_index {
+                    if a > at { view.cursor.anchor_char_index = Some(a.saturating_sub(len as usize).max(at)); }
+                }
+            }
+        }
+    }
+}
+
 pub fn snap_cursor_to_target_point_in_active_view(editor: &mut Editor) {
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
@@ -2343,7 +2453,7 @@ pub fn does_panel_need_rebuild(
 ) -> bool {
     let screen_lines = (rect.h / line_h) as u32;
     let anim_first = (editor.views[view].scroll_anim / line_h) as u32;
-    editor.buffers[buffer].dirty || editor.views[view].layout.as_ref().map(|l| {
+    editor.buffers[buffer].is_dirty || editor.views[view].layout.as_ref().map(|l| {
         anim_first < l.first_buffer_line
             || (
                 anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
@@ -2363,6 +2473,7 @@ struct App {
     mods:   winit::event::Modifiers,
 
     is_our_window_focused: bool,
+    refresh_rate_millihertz: u32,
 
     command_table: CommandTable,
     keymap: Keymap,
@@ -2390,6 +2501,10 @@ impl ApplicationHandler for App {
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
 
         prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
+
+        self.refresh_rate_millihertz = win.current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .unwrap_or(60*1000);
 
         self.gpu    = Some(gpu);
         self.editor = Some(editor);
@@ -2521,12 +2636,13 @@ impl ApplicationHandler for App {
                         editor.lister.query.extend(query);
                         editor.lister.scroll = 0.0;
                         editor.lister.selected_index = if editor.lister.set_selected_index_to_1_instead_of_0 {
-                            (editor.lister.items.len() > 1) as usize
+                            (editor.lister.items.len() > 1) as u32
                         } else {
                             0
                         };
-                        editor.lister.query_dirty = true;
+                        editor.lister.is_query_dirty = true;
                         editor.lister.rebuild_filtered();
+                        editor.lister.is_query_dirty = true; // nocheckin
                     }
 
                     win.request_redraw();
@@ -2580,7 +2696,7 @@ impl ApplicationHandler for App {
                             let local_y = my - list_y + editor.lister.scroll;  // Use new scroll, not anim
                             let hovered = (local_y / editor.lister.item_h) as usize;
                             editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
-                                Some(hovered)
+                                Some(hovered as u32)
                             } else {
                                 None
                             };
@@ -2673,7 +2789,7 @@ impl ApplicationHandler for App {
                         let local_y = my - list_y + editor.lister.scroll_anim;
                         let hovered = (local_y / item_h) as usize;
                         editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
-                            Some(hovered)
+                            Some(hovered as u32)
                         } else {
                             None
                         };
@@ -2744,21 +2860,7 @@ impl ApplicationHandler for App {
                         .sum::<u32>();
 
                     let reserve = estimated * 6 + 4096;
-
-                    let _old_capacity = verts.capacity();
-                    verts.reserve(reserve as usize);
-
-                    #[cfg(debug_assertions)] {
-                        let _new_capacity = verts.capacity();
-                        if _old_capacity != _new_capacity {
-                            eprintln!(
-                                "[vertex buffer grew {} -> {} new_capacity: {}]",
-                                util::format_bytes(_old_capacity*size_of::<gpu::Vert>()),
-                                util::format_bytes(_new_capacity*size_of::<gpu::Vert>()),
-                                _new_capacity
-                            );
-                        }
-                    }
+                    checked_reserve!(verts, reserve as usize, "vertex buffer");
                 }
 
                 let still_animating = animate(editor, dt);
@@ -2827,12 +2929,15 @@ impl ApplicationHandler for App {
                     // Prepare lister bg
                     //
 
-                    if active_panel == editor.lister_split_panel {
-                        let lister = lister_rect(gpu.win_w, gpu.win_h);
-                        render_lister_background_frosted(gpu, lister, editor.scale);
+                    let t1 = Instant::now();
+                    {
+                        if active_panel == editor.lister_split_panel {
+                            let lister = lister_rect(gpu.win_w, gpu.win_h);
+                            render_lister_background_frosted(gpu, lister, editor.scale);
+                        }
+                        render_lister_background(gpu, editor);
                     }
-
-                    render_lister_background(gpu, editor);
+                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
                 }
 
                 if editor.lister.is_open {
@@ -2882,9 +2987,19 @@ impl ApplicationHandler for App {
                     gpu::pop_clip(gpu);
                 }
 
-                render_lister_foreground(gpu, editor);
+                for buffer in editor.buffers.values_mut() {
+                    //
+                    // No buffer can be dirty now!
+                    //
+                    buffer.is_dirty = false;
+                }
 
-                draw_metrics(editor, gpu);
+                let t1 = Instant::now();
+                {
+                    render_lister_foreground(gpu, editor);
+                    draw_metrics(editor, gpu, self.refresh_rate_millihertz);
+                }
+                editor.render_us_acc += t1.elapsed().as_micros() as f32;
 
                 _ = gpu::submit_frame(gpu);
 

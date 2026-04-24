@@ -7,7 +7,7 @@ use smallstr::SmallString;
 use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{BufferId, Editor, ListerItem, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, buffer::Buffer, collect_leaves, director::EntryKind, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
+use crate::{BufferId, Editor, ListerItem, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, adjust_cursors_after_mutation, buffer::Buffer, collect_leaves, director::EntryKind, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut Editor,
@@ -20,6 +20,7 @@ pub struct CommandContext<'a> {
 
 impl<'a> CommandContext<'a> {
     pub fn finish(&mut self) {
+        adjust_cursors_after_mutation(self.editor);
         scroll_to_cursor(self.editor);
         self.editor.reset_blink();
     }
@@ -339,7 +340,7 @@ fn lister_item_list_from_buffer_list(cx: &CommandContext) -> Vec<ListerItem> {
 
 command!(open_lister_test |cx| {
     let items = lister_item_list_from_command_table(cx);
-    cx.editor.lister.query_dirty = true;
+    cx.editor.lister.is_query_dirty = true;
     cx.editor.lister.rebuild_filtered();
     cx.editor.open_lister(items, |cx, item_data| {
         (cx.command_table[item_data as usize].func)(cx);
@@ -383,10 +384,13 @@ command!(open_file |cx| {
     cx.editor.open_lister_with_frame_callback(
         items,
 
+        //
+        // Called on select!
+        //
         |cx, item_data| {
             let entry_kind: EntryKind = unsafe { core::mem::transmute(item_data as u8) };
 
-            let selected_item = &cx.editor.lister.items[cx.editor.lister.filtered[cx.editor.lister.selected_index]];
+            let selected_item = &cx.editor.lister.items[cx.editor.lister.filtered[cx.editor.lister.selected_index as usize] as usize];
             let path = &selected_item.sublabel;
 
             if entry_kind == EntryKind::Dir {
@@ -412,23 +416,52 @@ command!(open_file |cx| {
             cx.editor.mru_focus(new_buffer_id); // @Refactor
         },
 
+        //
+        // Called on every frame redraw!
+        //
         |cx| {
-            let query_path = PathBuf::from(display_to_path(cx.editor.lister.query.as_str())); // @Clone
-            let dir_to_scan = if query_path.is_dir() {
+            // Always poll for new scan results
+            let dir: &Path = cx.editor.canonicalized_last_scanned_directory.as_str().as_ref();
+            let has_new = cx.editor.director.entries.get(dir)                                  // @Speed
+                .map(|c| c.generation > cx.editor.lister.last_seen_cached_dir_generation || cx.editor.lister.last_seen_cached_dir_generation == u64::MAX)
+                .unwrap_or(false);
+
+            let is_this_first_scan_ever = cx.editor.canonicalized_last_scanned_directory.is_empty();
+            if !is_this_first_scan_ever && has_new {
+                // Pull new entries in, same as before
+                let entries = cx.editor.director.entries.get(dir).unwrap();
+                cx.editor.lister.last_seen_cached_dir_generation = entries.generation;
+                cx.editor.lister.items.clear();
+                for entry in entries.entries.iter() {
+                    cx.editor.lister.items.push(ListerItem {
+                        data:     entry.kind as u64,
+                        label:    entry.name.into(),
+                        sublabel: entry.path.into(),
+                    });
+                }
+                cx.editor.lister.is_query_dirty = true;
+                cx.editor.lister.rebuild_filtered();
+            }
+
+            if !cx.editor.lister.is_query_dirty { return false; } // Nothing changed, bail early
+            cx.editor.lister.is_query_dirty = false;
+
+            let query_path = display_to_path(cx.editor.lister.query.as_str()); // @Clone
+            let query_path: &Path = query_path.as_ref(); // @Clone
+            let dir_to_scan = if query_path.is_dir() && cx.editor.lister.query.chars().last() == Some('/') {
                 std::fs::canonicalize(&query_path) // @Clone
-                    .unwrap_or(query_path)
+                    .unwrap_or(query_path.into())
             } else {
                 query_path.parent()
                     .and_then(|p| std::fs::canonicalize(p).ok())
                     .unwrap_or_else(|| PathBuf::from(cx.editor.canonicalized_current_working_directory.as_str())) // @Clone
             };
 
-            // Kick a scan if needed
-            cx.editor.director.get(dir_to_scan.as_path());
-
             let last_scanned_dir_as_path: &Path = cx.editor.canonicalized_last_scanned_directory.as_str().as_ref();;
 
+            //
             // Only rebuild items if the directory actually changed
+            //
             if dir_to_scan != last_scanned_dir_as_path {
                 //
                 // Update cwd if it changed
@@ -438,11 +471,15 @@ command!(open_file |cx| {
                     cx.editor.canonicalized_current_working_directory = dir_to_scan.to_string_lossy().into(); // @Clone
                 }
 
+                cx.editor.canonicalized_last_scanned_directory = dir_to_scan.to_string_lossy().into(); // @Clone
+
                 let Some(entries) = cx.editor.director.get(dir_to_scan.as_path()) else {
+                    cx.editor.lister.last_seen_cached_dir_generation = u64::MAX;
                     return false;
                 };
 
-                cx.editor.canonicalized_last_scanned_directory = dir_to_scan.to_string_lossy().into(); // @Clone
+                cx.editor.lister.last_seen_cached_dir_generation = entries.generation;
+
                 cx.editor.lister.items.clear();
                 for entry in entries.iter() {
                     cx.editor.lister.items.push(ListerItem {
@@ -451,8 +488,11 @@ command!(open_file |cx| {
                         sublabel: entry.path.into(),
                     });
                 }
-                cx.editor.lister.query_dirty = true;
+                cx.editor.lister.is_query_dirty = true;
                 cx.editor.lister.rebuild_filtered();
+            } else {
+                // Kick a scan just in case..
+                cx.editor.director.get(dir_to_scan.as_path());
             }
 
             true
@@ -476,9 +516,9 @@ command!(open_file |cx| {
     // Sync the lister query string
     cx.editor.lister.query.clear();
     cx.editor.lister.query.push_str(&display_path);
-    cx.editor.lister.query_dirty = true;
-
+    cx.editor.lister.is_query_dirty = true;
     cx.editor.lister.is_listing_file_entries = true;
+    cx.editor.lister.last_seen_cached_dir_generation = u64::MAX;
 });
 
 #[derive(Copy, Clone, Debug)]

@@ -462,7 +462,6 @@ pub fn draw_text_for_editor(
 
     for (i, g) in glyphs.iter().enumerate() {
         let gg = g.gpu_glyph;
-        let gg = g.gpu_glyph;
 
         if gg.w != 0 && gg.h != 0 {
             let bearing_x = gg.bearing_x as f32;

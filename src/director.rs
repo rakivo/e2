@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -18,7 +19,14 @@ pub struct CachedDir {
     pub mtime:        SystemTime,    // Dir mtime at scan time
     pub inode:        u64,
     pub state:        ScanState,
-    pub generation:   u64,
+}
+
+impl Deref for CachedDir {
+    type Target = DirEntries;
+    fn deref(&self) -> &Self::Target { &self.entries }
+}
+impl DerefMut for CachedDir {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.entries }
 }
 
 #[derive(Debug, PartialEq)]
@@ -31,6 +39,8 @@ pub enum ScanState {
 // Flat storage same as before
 #[derive(Debug, Default)]
 pub struct DirEntries {
+    pub generation:   u64,
+
     pub blob:         String,
     pub name_starts:  Vec<u32>,
     pub name_lens:    Vec<u32>,
@@ -113,7 +123,7 @@ impl Director {
         };
 
         if needs_scan {
-            self.kick_scan(path.to_path_buf(), false);
+            self.kick_scan(path, false);
         }
 
         self.entries.get(path)
@@ -130,7 +140,14 @@ impl Director {
     }
 
     fn is_stale(&self, path: &Path, cached: &CachedDir) -> bool {
-        match std::fs::metadata(path) {
+        //
+        // Don't bother checking more than once per second
+        //
+        if cached.scanned_at.elapsed().unwrap_or_default().as_secs_f32() < 1.0 {
+            return false;
+        }
+
+        match std::fs::metadata(path) {  // @SlowFileSystem
             Err(_) => true, // Path removed
 
             Ok(meta) => {
@@ -151,12 +168,11 @@ impl Director {
     pub fn poll(&mut self) {
         while let Ok(result) = self.receiver.try_recv() {
             let entry = self.entries.entry(result.path.clone()).or_insert_with(|| CachedDir { // @Clone
-                entries:    DirEntries::default(),
+                entries:    DirEntries { generation: result.generation, ..Default::default() },
                 scanned_at: SystemTime::now(),
                 mtime:      result.mtime,
                 inode:      result.inode,
                 state:      ScanState::Ready,
-                generation: result.generation,
             });
 
             //
@@ -189,12 +205,11 @@ impl Director {
         // Mark as scanning so we don't kick again next frame
         //
         self.entries.entry(path.clone()).or_insert_with(|| CachedDir {
-            entries:    DirEntries::default(),
+            entries:    DirEntries { generation, ..Default::default() },
             scanned_at: SystemTime::UNIX_EPOCH,
             mtime:      SystemTime::UNIX_EPOCH,
             inode:      0,
             state:      ScanState::Scanning,
-            generation
         }).state = ScanState::Scanning;
 
         _ = self.sender.try_send(ScanRequest { path, generation, recursive });
