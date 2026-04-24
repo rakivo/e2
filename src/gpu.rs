@@ -2,7 +2,7 @@
 
 use crate::color::{GpuColor, Color};
 use crate::{palette, tracy};
-use crate::util::px;
+use crate::util::{format_bytes, px};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -11,17 +11,18 @@ use std::collections::HashMap;
 use wgpu::naga::FastHashMap;
 use winit::window::Window;
 
-const ATLAS_SIZE: u32 = 1024; // 1MB
-const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
+ // @Note: Must match ATLAS_SIZE in the shader
+pub const ATLAS_SIZE: u32 = 1024; // 1MB
+pub const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
 
 pub const INITIAL_VERTEX_BUFFER_CAPACITY: u64 = 8 * 1024 * 1024;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct GpuGlyph {
-    pub uv_x: f32,      pub uv_y: f32,
-    pub uv_w: f32,      pub uv_h: f32,
-    pub w: u32,         pub h: u32,
-    pub bearing_x: i32, pub bearing_y: i32,
+    pub uv_x: u16,      pub uv_y: u16,  // Divided by atlas size in shader
+    pub uv_w: u16,      pub uv_h: u16,
+    pub w: u16,         pub h: u16,
+    pub bearing_x: i16, pub bearing_y: i16,
     pub advance: f32,
 }
 
@@ -34,8 +35,8 @@ pub struct Vert {
 }
 
 pub struct Batch {
-    verts: Vec<Vert>,
-    clip:  [f32; 4],
+    pub verts: Vec<Vert>,
+    pub clip:  [f32; 4],
 }
 
 impl Batch {
@@ -60,12 +61,12 @@ pub struct Gpu {
 
     pub pipeline:       wgpu::RenderPipeline,
     pub bind_group:     wgpu::BindGroup,
-    pub vtx_buf:        wgpu::Buffer,
+    pub vertex_buffer:  wgpu::Buffer,
 
     pub atlas_tex:      wgpu::Texture,
-    pub atlas_cur_x:    u32,
-    pub atlas_cur_y:    u32,
-    pub atlas_row_h:    u32,
+    pub atlas_cur_x:    u16,
+    pub atlas_cur_y:    u16,
+    pub atlas_row_h:    u16,
     pub glyphs:         FastHashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
     pub font:           fontdue::Font,
 
@@ -223,11 +224,11 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
         win_w: w as f32, win_h: h as f32,
 
-        pipeline, bind_group, vtx_buf: vertex_buffer,
+        pipeline, bind_group, vertex_buffer,
 
         atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
 
-        glyphs: Default::default(),
+        glyphs: FastHashMap::with_capacity_and_hasher(2048, Default::default()),
         current_vertex_buffer_capacity: INITIAL_VERTEX_BUFFER_CAPACITY,
 
         batch_pool:  vec![Batch::full_window(w as _, h as _)],
@@ -238,6 +239,17 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 //
 // Glyph rasterization
 //
+
+pub fn prewarm_glyphs(gpu: &mut Gpu, font_size: f32) {
+    // ASCII printable
+    for c in ' '..='~' {
+        get_glyph(gpu, c, font_size);
+    }
+    // Box drawing
+    for c in '\u{2500}'..='\u{257F}' {
+        get_glyph(gpu, c, font_size);
+    }
+}
 
 pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
     let size = (size * 2.0).round() / 2.0; // snap to 0.5px increments
@@ -254,21 +266,21 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
         return Some(g);
     }
 
-    let (w, h) = (metrics.width as u32, metrics.height as u32);
+    let (w, h) = (metrics.width as u16, metrics.height as u16);
 
-    let atlas_used = gpu.atlas_cur_y * ATLAS_SIZE + gpu.atlas_cur_x;
+    let atlas_used = gpu.atlas_cur_y as u32 * ATLAS_SIZE + gpu.atlas_cur_x as u32;
     let atlas_total = ATLAS_SIZE * ATLAS_SIZE;
     if (atlas_used as f32 / atlas_total as f32) > ATLAS_RESET_RATIO {
         reset_atlas(gpu);
     }
 
-    if gpu.atlas_cur_x + w + 1 > ATLAS_SIZE {
+    if gpu.atlas_cur_x + w + 1 > ATLAS_SIZE as u16 {
         // Row wrap
         gpu.atlas_cur_y += gpu.atlas_row_h + 1;
         gpu.atlas_cur_x = 1;
         gpu.atlas_row_h = 0;
     }
-    if gpu.atlas_cur_y + h + 1 > ATLAS_SIZE {
+    if gpu.atlas_cur_y + h + 1 > ATLAS_SIZE as u16 {
         eprintln!("atlas full");
         return None; // Shouldn't really happen though!
     }
@@ -276,22 +288,22 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &gpu.atlas_tex, mip_level: 0,
-            origin: wgpu::Origin3d { x: gpu.atlas_cur_x, y: gpu.atlas_cur_y, z: 0 },
+            origin: wgpu::Origin3d { x: gpu.atlas_cur_x as u32, y: gpu.atlas_cur_y as u32, z: 0 },
             aspect: wgpu::TextureAspect::All,
         },
         &bitmap,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w as u32), rows_per_image: Some(h as u32) },
+        wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
     );
 
     let g = GpuGlyph {
-        uv_x: gpu.atlas_cur_x as f32 / ATLAS_SIZE as f32,
-        uv_y: gpu.atlas_cur_y as f32 / ATLAS_SIZE as f32,
-        uv_w: w as f32 / ATLAS_SIZE as f32,
-        uv_h: h as f32 / ATLAS_SIZE as f32,
+        uv_x: gpu.atlas_cur_x as u16,
+        uv_y: gpu.atlas_cur_y as u16,
+        uv_w: w as u16,
+        uv_h: h as u16,
         w, h,
-        bearing_x: metrics.xmin,
-        bearing_y: metrics.ymin,
+        bearing_x: metrics.xmin as i16,
+        bearing_y: metrics.ymin as i16,
         advance: metrics.advance_width,
     };
 
@@ -361,14 +373,13 @@ pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
     let [x1, y1] = px(x+w, y+h, sw, sh);
 
     let color = color.into();
-    gpu.verts_mut().extend_from_slice(&[
-        Vert { pos:[x0,y0], color, ..Default::default() },
-        Vert { pos:[x1,y0], color, ..Default::default() },
-        Vert { pos:[x0,y1], color, ..Default::default() },
-        Vert { pos:[x1,y0], color, ..Default::default() },
-        Vert { pos:[x1,y1], color, ..Default::default() },
-        Vert { pos:[x0,y1], color, ..Default::default() },
-    ]);
+    let verts = gpu.verts_mut();
+    verts.push(Vert { pos: [x0, y0], color, ..Default::default() });
+    verts.push(Vert { pos: [x1, y0], color, ..Default::default() });
+    verts.push(Vert { pos: [x0, y1], color, ..Default::default() });
+    verts.push(Vert { pos: [x1, y0], color, ..Default::default() });
+    verts.push(Vert { pos: [x1, y1], color, ..Default::default() });
+    verts.push(Vert { pos: [x0, y1], color, ..Default::default() });
 }
 
 pub fn measure_str(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
@@ -403,8 +414,8 @@ pub fn draw_text_colored(
             let [x0, y0] = px(gx,              gy,              sw, sh);
             let [x1, y1] = px(gx + g.w as f32, gy + g.h as f32, sw, sh);
 
-            let (u0, v0) = (g.uv_x,            g.uv_y);
-            let (u1, v1) = (g.uv_x + g.uv_w,   g.uv_y + g.uv_h);
+            let (u0, v0) = (g.uv_x            as f32,  g.uv_y           as f32);
+            let (u1, v1) = ((g.uv_x + g.uv_w) as f32, (g.uv_y + g.uv_h) as f32);
 
             let color: GpuColor = color_callback(i).into();
 
@@ -468,8 +479,8 @@ pub fn draw_text_for_editor(
             let [x0, y0] = px(gx,  gy,  sw, sh);
             let [x1, y1] = px(x1p, y1p, sw, sh);
 
-            let (u0, v0) = (gg.uv_x,          gg.uv_y);
-            let (u1, v1) = (gg.uv_x + gg.uv_w, gg.uv_y + gg.uv_h);
+            let (u0, v0) = (gg.uv_x             as f32,  gg.uv_y            as f32);
+            let (u1, v1) = ((gg.uv_x + gg.uv_w) as f32, (gg.uv_y + gg.uv_h) as f32);
 
             let color: GpuColor = if is_cursor_line && i as u32 == cursor_col {
                 cursor_color.into()
@@ -510,7 +521,7 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
         if byte_size > gpu.current_vertex_buffer_capacity {
             // Grow if needed
             let new_cap = (byte_size * 2).max(INITIAL_VERTEX_BUFFER_CAPACITY);
-            gpu.vtx_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            gpu.vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None, size: new_cap,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -523,7 +534,7 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
             if batch.verts.is_empty() { continue }
 
             let byte_offset = (vert_offset as usize * size_of::<Vert>()) as u64;
-            gpu.queue.write_buffer(&gpu.vtx_buf, byte_offset, bytemuck::cast_slice(&batch.verts));
+            gpu.queue.write_buffer(&gpu.vertex_buffer, byte_offset, bytemuck::cast_slice(&batch.verts));
 
             let end = vert_offset + batch.verts.len() as u32;
             draws.push(Draw { range: vert_offset..end, clip: batch.clip });
@@ -564,7 +575,7 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
         if !draws.is_empty() {
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &gpu.bind_group, &[]);
-            pass.set_vertex_buffer(0, gpu.vtx_buf.slice(..));
+            pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
 
             for Draw { range, clip } in &draws {
                 let cx = clip[0].max(0.0) as u32;
@@ -592,15 +603,15 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
 
 const SHADER: &str = r#"
 struct V {
-    @location(0) pos: vec2<f32>,
-    @location(1) uv: vec2<f32>,
+    @location(0) pos:   vec2<f32>,
+    @location(1) uv:    vec2<f32>,
     @location(2) color: vec4<f32>
 }
 
 struct F {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>
+    @builtin(position) pos:   vec4<f32>,
+    @location(0)       uv:    vec2<f32>,
+    @location(1)       color: vec4<f32>
 }
 
 @vertex
@@ -615,10 +626,15 @@ fn vs_main(v: V) -> F {
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 
+const ATLAS_SIZE: f32 = 1024.0; // @Note: Must match ATLAS_SIZE in gpu
+
 @fragment
 fn fs_main(f: F) -> @location(0) vec4<f32> {
     if f.uv.x == 0.0 && f.uv.y == 0.0 { return f.color; } // @Hack
-    let a = textureSample(tex, smp, f.uv).r;
+
+    let uv = f.uv / ATLAS_SIZE;
+    let a = textureSample(tex, smp, uv).r;
+
     return f.color * a;
 }
 "#;

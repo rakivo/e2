@@ -19,6 +19,7 @@ paste = "1.0.15"
 inventory = "0.3.24"
 tracy-client = { version = "0.17.3", default-features = false }
 memchr = "2.8.0"
+rustc-edit-distance = "0.1.0"
 
 [features]
 dhat = ["dep:dhat"]

@@ -1,22 +1,21 @@
 #![allow(unused, dead_code)]
 
-use std::{collections::HashMap, ops::Deref};
+use std::{collections::HashMap, hash::Hash, ops::Deref, path::{Path, PathBuf}};
 
 use cranelift_entity::EntityRef;
+use smallstr::SmallString;
+use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{BufferId, EditorState, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, buffer::Buffer, collect_leaves, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
+use crate::{BufferId, Editor, ListerItem, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, buffer::Buffer, collect_leaves, director::EntryKind, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
 
 pub struct CommandContext<'a> {
-    pub editor: &'a mut EditorState,
+    pub editor: &'a mut Editor,
     pub gpu:    &'a mut Gpu,
 
     pub command_table: &'a CommandTable,
 
-    pub event:  &'a KeyEvent,
-    pub mods:   winit::event::Modifiers,
-
-    pub last_executed_command: Option<&'static CommandEntry>,
+    pub event:  Option<&'a KeyEvent>,
 }
 
 impl<'a> CommandContext<'a> {
@@ -105,6 +104,28 @@ command!(move_file_end |cx| {
     buf.move_file_end(&mut view.cursor);
 });
 
+command!(move_word_forward |cx| {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.move_word_forward(&mut view.cursor);
+});
+
+command!(move_word_backward |cx| {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.move_word_backward(&mut view.cursor);
+});
+
+command!(delete_word_forward |cx| {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    view.cursor.unset_anchor();
+    buf.delete_word_forward(&mut view.cursor);
+});
+
+command!(delete_word_backward |cx| {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    view.cursor.unset_anchor();
+    buf.delete_word_backward(&mut view.cursor);
+});
+
 command!(delete_forward |cx| {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
@@ -112,8 +133,46 @@ command!(delete_forward |cx| {
 });
 
 command!(delete_backward |cx| {
+    // Identify if we are in a path query
+    let is_lister_buffer = cx.editor.active_view().buffer_id == cx.editor.lister_query_buffer;
+
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
-    view.cursor.unset_anchor();
+
+    // If there's a selection, always just delete the selection
+    if view.cursor.anchor_char_index.is_some() {
+        buf.delete_selection(&mut view.cursor);
+        return;
+    }
+
+    let cursor_pos = view.cursor.char_index;
+    if cursor_pos == 0 { return; }
+
+    if is_lister_buffer {
+        let char_to_left = buf.text.char(cursor_pos - 1);
+
+        if char_to_left == '/' {
+            // We are at a slash (e.g., "~/Documents/|").
+            // We want to delete "Documents/" so we end at "~/".
+
+            // Start the deletion range at the current cursor
+            let mut target_start = cursor_pos - 1;
+
+            // Iterate backward from the character before the current slash
+            let mut iter = buf.text.chars_at(cursor_pos - 1).reversed();
+            for c in iter {
+                if c == '/' { break; } // Stop when we hit the parent slash
+                target_start -= 1;
+            }
+
+            // Select from current position back to the parent slash and delete
+            view.cursor.anchor_char_index = Some(cursor_pos);
+            view.cursor.char_index = target_start;
+            buf.delete_selection(&mut view.cursor);
+            return;
+        }
+    }
+
+    // 3. Default: Just a normal character backspace
     buf.delete_backward(&mut view.cursor);
 });
 
@@ -146,9 +205,9 @@ command!(unset_anchor |cx| {
 });
 
 command!(basic_character |cx| {
-    let Some(c) = (match &cx.event.logical_key {
-        Key::Character(s) => s.chars().next(),
-        Key::Named(NamedKey::Space) => Some(' '),
+    let Some(c) = (match &cx.event.map(|e| &e.logical_key) {
+        Some(Key::Character(s))           => s.chars().next(),
+        Some(Key::Named(NamedKey::Space)) => Some(' '),
         _ => None,
     }) else {
         return
@@ -232,17 +291,203 @@ command!(open_new_buffer |cx| {
 });
 
 command!(cycle_buffers_left |cx| {
-    let buf_id = cx.editor.previous_buffer();
-    cx.editor.active_view_mut().switch_buffer(buf_id);
+    let buffer_id = cx.editor.previous_buffer();
+    cx.editor.active_view_mut().switch_buffer(buffer_id);
+    cx.editor.mru_focus(buffer_id); // @Refactor
 });
 
 command!(cycle_buffers_right |cx| {
-    let buf_id = cx.editor.next_buffer();
-    cx.editor.active_view_mut().switch_buffer(buf_id);
+    let buffer_id = cx.editor.next_buffer();
+    cx.editor.active_view_mut().switch_buffer(buffer_id);
+    cx.editor.mru_focus(buffer_id); // @Refactor
 });
 
-#[derive(Hash, Copy, Clone, Debug)]
+fn lister_item_list_from_command_table(cx: &CommandContext) -> Vec<ListerItem> {
+    cx.command_table.iter().enumerate().map(|(index, (atom, cmd))| {
+        ListerItem {
+            data: index as u64,
+            label: atom.0.into(),
+            sublabel: "".into(),
+        }
+    }).collect()
+}
+
+fn lister_item_list_from_buffer_list(cx: &CommandContext) -> Vec<ListerItem> {
+    cx.editor.most_recently_used_buffers.iter().filter_map(|&buffer_id| {
+        // Skip internal buffers
+        if buffer_id == cx.editor.lister_query_buffer { return None; }
+
+        let buffer = &cx.editor.buffers[buffer_id];
+        let label: SmallString<[u8; 32]> = buffer.path.as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("[scratch]")
+            .into();
+
+        let sublabel: SmallString<[u8; 64]> = buffer.path.as_ref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .into();
+
+        Some(ListerItem {
+            data: buffer_id.index() as u64,
+            label,
+            sublabel,
+        })
+    }).collect()
+}
+
+command!(open_lister_test |cx| {
+    let items = lister_item_list_from_command_table(cx);
+    cx.editor.lister.query_dirty = true;
+    cx.editor.lister.rebuild_filtered();
+    cx.editor.open_lister(items, |cx, item_data| {
+        (cx.command_table[item_data as usize].func)(cx);
+    });
+});
+
+command!(switch_buffer |cx| {
+    cx.editor.lister.set_selected_index_to_1_instead_of_0 = true;
+
+    let items = lister_item_list_from_buffer_list(cx);
+
+    cx.editor.open_lister(items, |cx, item_data| {
+        let buffer_id = BufferId::new(item_data as usize);
+        cx.editor.active_view_mut().switch_buffer(buffer_id);
+        cx.editor.mru_focus(buffer_id); // @Refactor
+    });
+
+    cx.editor.lister.selected_index = 1; // Start from 1, since 0 is the current buffer
+});
+
+fn path_to_display(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if path.starts_with(&home) {
+            return format!("~{}", &path[home.len()..]);
+        }
+    }
+    path.to_string()
+}
+
+fn display_to_path(display: &str) -> String {
+    if display.starts_with('~') {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}{}", home, &display[1..]);
+        }
+    }
+    display.to_string()
+}
+
+command!(open_file |cx| {
+    let items = Vec::new();
+    cx.editor.open_lister_with_frame_callback(
+        items,
+
+        |cx, item_data| {
+            let entry_kind: EntryKind = unsafe { core::mem::transmute(item_data as u8) };
+
+            let selected_item = &cx.editor.lister.items[cx.editor.lister.filtered[cx.editor.lister.selected_index]];
+            let path = &selected_item.sublabel;
+
+            if entry_kind == EntryKind::Dir {
+                //
+                // If the entry is a directory, change cwd and recurse.
+                //
+
+                let path: &Path = path.as_str().as_ref();
+                if let Ok(canon) = path.canonicalize() {
+                    cx.editor.canonicalized_current_working_directory = canon.into_os_string().into_string().unwrap().into(); // @Clone
+                }
+                open_file(cx);
+                return;
+            }
+
+            let Ok(new_buffer) = Buffer::from_file(path.as_str().as_ref()) else {
+                return;
+            };
+
+            let new_buffer_id = cx.editor.buffers.push(new_buffer);
+            cx.editor.mru_register_new_buffer(new_buffer_id);
+            cx.editor.active_view_mut().switch_buffer(new_buffer_id);
+            cx.editor.mru_focus(new_buffer_id); // @Refactor
+        },
+
+        |cx| {
+            let query_path = PathBuf::from(display_to_path(cx.editor.lister.query.as_str())); // @Clone
+            let dir_to_scan = if query_path.is_dir() {
+                std::fs::canonicalize(&query_path) // @Clone
+                    .unwrap_or(query_path)
+            } else {
+                query_path.parent()
+                    .and_then(|p| std::fs::canonicalize(p).ok())
+                    .unwrap_or_else(|| PathBuf::from(cx.editor.canonicalized_current_working_directory.as_str())) // @Clone
+            };
+
+            // Kick a scan if needed
+            cx.editor.director.get(dir_to_scan.as_path());
+
+            let last_scanned_dir_as_path: &Path = cx.editor.canonicalized_last_scanned_directory.as_str().as_ref();;
+
+            // Only rebuild items if the directory actually changed
+            if dir_to_scan != last_scanned_dir_as_path {
+                //
+                // Update cwd if it changed
+                //
+                let cwd_as_path: &Path = cx.editor.canonicalized_current_working_directory.as_str().as_ref();
+                if dir_to_scan.as_path() != cwd_as_path {
+                    cx.editor.canonicalized_current_working_directory = dir_to_scan.to_string_lossy().into(); // @Clone
+                }
+
+                let Some(entries) = cx.editor.director.get(dir_to_scan.as_path()) else {
+                    return false;
+                };
+
+                cx.editor.canonicalized_last_scanned_directory = dir_to_scan.to_string_lossy().into(); // @Clone
+                cx.editor.lister.items.clear();
+                for entry in entries.iter() {
+                    cx.editor.lister.items.push(ListerItem {
+                        data:     entry.kind as u64,
+                        label:    entry.name.into(),
+                        sublabel: entry.path.into(),
+                    });
+                }
+                cx.editor.lister.query_dirty = true;
+                cx.editor.lister.rebuild_filtered();
+            }
+
+            true
+        }
+    );
+
+    // Pre-fill query with current working directory
+    let cwd = cx.editor.canonicalized_current_working_directory.clone();
+    let mut display_path = path_to_display(&cwd);  // Converts to ~/... form
+    if !display_path.ends_with('/') {
+        display_path.push('/');
+    }
+
+    cx.editor.buffers[cx.editor.lister_query_buffer].clear();
+    cx.editor.buffers[cx.editor.lister_query_buffer].insert_literal(
+        &display_path,
+        &mut cx.editor.views[cx.editor.lister_query_view].cursor
+    );
+
+    // @Redundant?
+    // Sync the lister query string
+    cx.editor.lister.query.clear();
+    cx.editor.lister.query.push_str(&display_path);
+    cx.editor.lister.query_dirty = true;
+
+    cx.editor.lister.is_listing_file_entries = true;
+});
+
+#[derive(Copy, Clone, Debug)]
 pub struct CommandAtom(pub &'static str);
+
+impl Deref for CommandAtom {
+    type Target = str;
+    fn deref(&self) -> &Self::Target { self.0 }
+}
 
 impl Into<CommandAtom> for &'static str {
     fn into(self) -> CommandAtom { CommandAtom(self) }
@@ -254,14 +499,19 @@ impl PartialEq for CommandAtom {
         core::ptr::eq(self.0, other.0)
     }
 }
+impl Hash for CommandAtom {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.as_ptr().hash(state);
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct CommandTable {
-    cmds: HashMap<CommandAtom, &'static CommandEntry>,
+    cmds: FastIndexMap<CommandAtom, &'static CommandEntry>,
 }
 
 impl Deref for CommandTable {
-    type Target = HashMap<CommandAtom, &'static CommandEntry>;
+    type Target = FastIndexMap<CommandAtom, &'static CommandEntry>;
     fn deref(&self) -> &Self::Target {
         &self.cmds
     }
@@ -269,16 +519,25 @@ impl Deref for CommandTable {
 
 impl CommandTable {
     /// Harvest every `inventory::submit!` from all linked crates.
+    #[inline]
     pub fn from_inventory() -> Self {
-        let mut cmds = HashMap::new();
+        let mut cmds = FastIndexMap::with_capacity_and_hasher(128, Default::default());
         for entry in inventory::iter::<CommandEntry> {
             cmds.insert(entry.name.into(), entry);
         }
+
+        cmds.sort_unstable_by(|a: &CommandAtom, _, b, _| a.cmp(b));
+
         Self { cmds }
     }
 
+    #[inline]
     pub fn exec(&self, name: impl Into<CommandAtom>, context: &mut CommandContext) {
         let name = name.into();
+        dbg!(name.0.as_ptr());
+        for cmd in self.cmds.keys() {
+            dbg!(cmd, cmd.0.as_ptr());
+        }
         match self.cmds.get(&name) {
             Some(command) => (command.func)(context),
             None    => eprintln!("unknown command: {}", name.0),
@@ -318,7 +577,7 @@ impl KeyCombo {
 
 #[derive(Default)]
 pub struct Keymap {
-    bindings: HashMap<KeyCombo, CommandAtom>,
+    bindings: FastHashMap<KeyCombo, CommandAtom>,
 }
 
 impl Keymap {
@@ -344,8 +603,12 @@ impl Keymap {
         km.bind(KeyCombo::named(Backspace), "delete_backward");
         km.bind(KeyCombo::named(Delete),    "delete_forward");
         km.bind(KeyCombo::named(Enter),     "insert_newline");
+        km.bind(KeyCombo::alt('f'),         "move_word_forward");
+        km.bind(KeyCombo::alt('b'),         "move_word_backward");
+        km.bind(KeyCombo::alt('d'),         "delete_word_forward");
+        km.bind(KeyCombo::named_mods(NamedKey::Backspace, Mods::alt()),   "delete_word_backward");  // M-DEL
+        km.bind(KeyCombo::named_mods(NamedKey::Backspace, Mods::ctrl()),  "delete_word_backward");  // common alternative
 
-        // Ctrl chords
         km.bind(KeyCombo::ctrl('a'), "move_line_start");
         km.bind(KeyCombo::ctrl('e'), "move_line_end");
         km.bind(KeyCombo::ctrl('o'), "insert_newline_after");
@@ -359,6 +622,7 @@ impl Keymap {
         km.bind(KeyCombo::named_mods(Space, Mods::ctrl()), "set_anchor");
         km.bind(KeyCombo::ctrl('g'), "unset_anchor");
         km.bind(KeyCombo::alt('v'),  "move_page_up");
+        km.bind(KeyCombo::alt('q'),  "open_file");
 
         // Splits - physical keys so they're layout-independent
         km.bind(KeyCombo::ctrl('3'), "split_vertically");
@@ -376,6 +640,10 @@ impl Keymap {
         km.bind(KeyCombo::alt ('1'), "cycle_buffers_left");
         km.bind(KeyCombo::alt ('3'), "cycle_buffers_right");
 
+        // nocheckin
+        km.bind(KeyCombo::alt ('x'), "open_lister_test");
+        km.bind(KeyCombo::alt ('`'), "switch_buffer");
+
         km
     }
 }
@@ -386,17 +654,8 @@ impl Keymap {
     }
 
     pub fn lookup(&self, event: &KeyEvent, mods: Mods) -> Option<CommandAtom> {
-        // bare character insert
-        if !mods.ctrl && !mods.alt {
-            match &event.logical_key {
-                Key::Character(_) =>           return Some("basic_character".into()),
-                Key::Named(NamedKey::Space) => return Some("basic_character".into()),
-                _ => {}
-            }
-        }
-
         let combo = match &event.logical_key {
-            Key::Named(k) => KeyCombo::Named(k.clone(), mods.clone()),
+            Key::Named(k) => KeyCombo::Named(k.clone(), mods),
             Key::Character(s) => {
                 let c = s.chars().next()?;
                 KeyCombo::Char(c, mods)
@@ -404,12 +663,48 @@ impl Keymap {
             _ => return None,
         };
 
-        self.bindings.get(&combo).or_else(|| {
+        //
+        // Check explicit binding first
+        //
+        let found = self.bindings.get(&combo).or_else(|| {
             if let PhysicalKey::Code(code) = event.physical_key {
-                self.bindings.get(&KeyCombo::Physical(code, mods.clone()))
+                self.bindings.get(&KeyCombo::Physical(code, mods))
             } else {
                 None
             }
-        }).copied()
+        }).copied();
+
+        if found.is_some() {
+            return found;
+        }
+
+        //
+        // For named keys (non-printable), fall back to unshifted version
+        //
+        if mods.shift {
+            if let Key::Named(k) = &event.logical_key {
+                let unshifted = Mods { shift: false, ..mods };
+                let unshifted_combo = KeyCombo::Named(k.clone(), unshifted);
+                let found = self.bindings.get(&unshifted_combo).or_else(|| {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        self.bindings.get(&KeyCombo::Physical(code, unshifted))
+                    } else {
+                        None
+                    }
+                }).copied();
+
+                if found.is_some() {
+                    return found;
+                }
+            }
+        }
+
+        //
+        // Fall back to basic_character for printable input
+        //
+        match &event.logical_key {
+            Key::Character(_) | Key::Named(NamedKey::Space) => Some("basic_character".into()),
+            _ => None,
+        }
     }
 }

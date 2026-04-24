@@ -8,8 +8,10 @@ mod color;
 mod buffer;
 mod command;
 mod tracy;
+mod director;
 mod lexer;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use std::fmt::Write as _;
@@ -19,17 +21,197 @@ use buffer::{Buffer, Cursor};
 use color::Color;
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::{EntityRef, PrimaryMap};
-use gpu::{Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, reset_atlas};
+use director::Director;
+use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
 use lexer::token_color;
 
 use smallstr::SmallString;
 use smallvec::SmallVec;
+use util::format_bytes;
 use wgpu::naga::FastHashMap;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+
+#[cfg(debug_assertions)]
+macro_rules! checked_push {
+    ($vec:expr, $val:expr, $name:expr) => {
+        {
+            let cap_before = $vec.capacity();
+            $vec.push($val);
+            if $vec.capacity() != cap_before {
+                eprintln!(
+                    "[scratch] {} reallocated: {} -> {} (len={})",
+                    $name, cap_before, $vec.capacity(), $vec.len()
+                );
+            }
+        }
+    };
+
+    ($vec:expr, $val:expr) => {
+        checked_push!($vec, $val, stringify!($vec))
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! checked_push {
+    ($vec:expr, $val:expr, $name:expr) => { $vec.push($val); };
+    ($vec:expr, $val:expr) => { $vec.push($val); };
+}
+
+fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
+    println!("[Prewarming glyphs...]");
+    for scale in [
+        editor.scale,
+        editor.scale - SCALE_STEP,
+        editor.scale + SCALE_STEP,
+        editor.scale - 2.0 * SCALE_STEP,
+        editor.scale + 2.0 * SCALE_STEP,
+        editor.scale - 3.0 * SCALE_STEP,
+        editor.scale + 3.0 * SCALE_STEP,
+    ] {
+        let font_size = scale_base_font_size(scale);
+        prewarm_glyphs(gpu, font_size);
+    }
+
+    let vertex_batch_pool_allocation = gpu.batch_pool.iter()
+        .map(|b| b.verts.capacity())
+        .sum::<usize>();
+
+    println!("[Vertex batch pool preallocation]: {}", format_bytes(vertex_batch_pool_allocation));
+    println!("[Vertex buffer size]:              {}", format_bytes(gpu.vertex_buffer.size() as _));
+    println!("[Glyph memory usage]:              {}", format_bytes(gpu.glyphs.allocation_size()));
+
+    let used_pixels = gpu.atlas_cur_y as u32 * ATLAS_SIZE + gpu.atlas_cur_x as u32;
+    let bytes_per_pixel = 4;
+    let used_bytes = used_pixels * bytes_per_pixel;
+    let total_bytes = ATLAS_SIZE * ATLAS_SIZE * bytes_per_pixel;
+
+    println!(
+        "[Atlas] used={} / {} bytes ({:.2}%)",
+        format_bytes(used_bytes as _),
+        format_bytes(total_bytes as _),
+        (used_bytes as f32 / total_bytes as f32) * 100.0
+    );
+}
+
+fn draw_metrics(editor: &Editor, gpu: &mut Gpu) {
+    const BUILD_GOOD: f32  = 200.0;
+    const BUILD_SLOW: f32  = 800.0;
+
+    const RENDER_GOOD: f32 = 300.0;
+    const RENDER_SLOW: f32 = 1500.0;
+
+    const RELEX_GOOD: f32  = 100.0;
+    const RELEX_SLOW: f32  = 500.0;
+
+    const FRAME_GOOD: f32  = 500.0;
+    const FRAME_SLOW: f32  = 2000.0;
+
+    const HUD_Y: f32 = 14.0;
+    const HUD_LINE_H: f32 = 14.0;
+    const PAD_RIGHT: f32 = 180.0;
+
+    fn heat(v: f32, good: f32, slow: f32) -> Color {
+        let t = ((v - good) / (slow - good)).clamp(0.0, 1.0);
+
+        // Base16-ish muted ramp:
+        // green -> yellow -> orange -> red (all desaturated)
+        let (r, g, b) = if t < 0.33 {
+            // Muted green
+            (
+                (90.0 * t / 0.33 + 80.0) as u8,
+                (140.0 - 40.0 * t / 0.33) as u8,
+                (90.0) as u8,
+            )
+        } else if t < 0.66 {
+            // Muted yellow/orange
+            let tt = (t - 0.33) / 0.33;
+            (
+                (160.0 + 40.0 * tt) as u8,
+                (140.0 - 30.0 * tt) as u8,
+                (70.0 - 20.0 * tt) as u8,
+            )
+        } else {
+            // Muted red
+            let tt = (t - 0.66) / 0.34;
+            (
+                (200.0 + 20.0 * tt) as u8,
+                (90.0 - 20.0 * tt) as u8,
+                (70.0 - 10.0 * tt) as u8,
+            )
+        };
+
+        Color::rgba(r, g, b, 255)
+    }
+
+    let fps    = editor.fps;
+    let build  = editor.build_us;
+    let relex  = editor.relex_us;
+    let render = editor.render_us;
+    let frame  = build + relex + render;
+
+    let x_right = gpu.win_w - PAD_RIGHT;
+
+    let mut buf = SmallString::<[u8; 64]>::new();
+
+    buf.clear();
+    _ = write!(&mut buf, "fps: {:.0}", fps);
+    gpu::draw_text(
+        gpu,
+        &buf,
+        x_right,
+        HUD_Y + 0.0 * HUD_LINE_H,
+        12.0,
+        Color::rgba(180, 180, 180, 255),
+    );
+
+    buf.clear();
+    _ = write!(&mut buf, "build: {:.2}us", build);
+    gpu::draw_text(
+        gpu,
+        &buf,
+        x_right,
+        HUD_Y + 1.0 * HUD_LINE_H,
+        12.0,
+        heat(build, BUILD_GOOD, BUILD_SLOW),
+    );
+
+    buf.clear();
+    _ = write!(&mut buf, "relex: {:.2}us", relex);
+    gpu::draw_text(
+        gpu,
+        &buf,
+        x_right,
+        HUD_Y + 2.0 * HUD_LINE_H,
+        12.0,
+        heat(relex, RELEX_GOOD, RELEX_SLOW),
+    );
+
+    buf.clear();
+    _ = write!(&mut buf, "render: {:.2}us", render);
+    gpu::draw_text(
+        gpu,
+        &buf,
+        x_right,
+        HUD_Y + 3.0 * HUD_LINE_H,
+        12.0,
+        heat(render, RENDER_GOOD, RENDER_SLOW),
+    );
+
+    buf.clear();
+    _ = write!(&mut buf, "frame: {:.2}us", frame);
+    gpu::draw_text(
+        gpu,
+        &buf,
+        x_right,
+        HUD_Y + 4.0 * HUD_LINE_H,
+        12.0,
+        heat(frame, FRAME_GOOD, FRAME_SLOW),
+    );
+}
 
 pub struct Palette {
     pub bg:           Color,
@@ -58,6 +240,8 @@ const SCALE_STEP: f32 = 0.25;
 
 const SCROLL_ANIM_RATE: f32 = 46.67;
 const CURSOR_ANIM_RATE: f32 = 99.420;
+
+const LISTER_ITEMS_PADDING: f32 = 0.0;
 
 const PADDING_LEFT: f32 = 8.0;
 
@@ -153,9 +337,6 @@ pub struct Glyph {
     pub color:     Color,
     pub char:      char,
 
-    /// Byte offset within the buffer line's bytes
-    pub line_byte: u32,
-
     pub gpu_glyph: GpuGlyph
 }
 
@@ -243,21 +424,21 @@ impl LineLayout {
 
 #[derive(Clone, Debug)]
 pub struct TextLayout {
-    pub buffer_id:         BufferId,
+    pub buffer_id: BufferId,
 
     pub view_scroll:       f32, // view.scroll
     pub line_h:            f32,
     pub font_size:         f32,
     pub first_buffer_line: u32,
 
-    pub rect:              Rect,
+    pub rect: Rect,
 
-    pub visible_glyph_count: usize,
+    pub visible_glyph_count: u32,
 
     // @Memory @Speed: Reuse these allocations.
     // Because currently they're being reallocated each frame.
-    pub lines:             Vec<LineLayout>,
-    pub glyphs:            Vec<Glyph>
+    pub lines:  Vec<LineLayout>,
+    pub glyphs: Vec<Glyph>
 }
 
 impl TextLayout {
@@ -340,35 +521,126 @@ impl TextLayout {
 }
 
 /// Build the TextLayout for a single leaf panel
+fn rebuild_text_layout(
+    editor:    &mut Editor,
+    gpu:       &mut Gpu,
+
+    view_id:   ViewId,
+
+    rect: Rect, font_size: f32, line_h: f32,
+) {
+    let view      = &editor.views[view_id];
+    let buffer_id = view.buffer_id;
+
+    //
+    // @Speed @Note:
+    //
+    // Currently we re-lex visible tokens on every dirty frame,
+    // thats fine for now, since those conditions inside is_dirty
+    // make sure that either the amount of lines we see has changed,
+    // OR we now see completely different lines that in the previous frame.
+    //
+    // BUT, in the future, we might wanna have a different flag for this re-lex step.
+    //
+    {
+        let t0 = Instant::now();
+
+        let total      = editor.buffers[buffer_id].text.len_lines();
+        let scroll     = editor.views[view_id].scroll;
+        let first_vis  = (scroll / line_h) as u32;
+        let last_vis = (((scroll + rect.h) / line_h) as usize)
+            .saturating_sub(1)
+            .min(total.saturating_sub(1)) as u32;
+
+        editor.buffers[buffer_id].lex_visible(first_vis as _, last_vis as _);
+
+        editor.relex_us_acc += t0.elapsed().as_micros() as f32;
+    }
+
+    let should_snap = editor.views[view_id].layout.as_ref()
+        .map(|l| {
+            (l.rect.w - rect.w).abs() > 0.5
+                || (l.rect.h - rect.h).abs() > 0.5
+        }).unwrap_or(true); // true = first build
+
+    let t0 = Instant::now();
+    let layout = build_text_layout(
+        gpu,
+        &editor.buffers[buffer_id],
+        &editor.views[view_id],
+        rect, font_size, line_h,
+    );
+    editor.build_us_acc += t0.elapsed().as_micros() as f32;
+
+    editor.views[view_id].layout    = Some(layout);
+    editor.buffers[buffer_id].dirty = false;
+
+    if should_snap {
+        let (cl, cc) = (
+            editor.views[view_id].cursor_target_line,
+            editor.views[view_id].cursor_target_col,
+        );
+
+        editor.snap_cursor_to_target(view_id, cl, cc, rect);
+    }
+}
+
+/// Build the TextLayout for a single leaf panel
 fn build_text_layout(
     gpu:       &mut Gpu,
+
     buffer:    &Buffer,
     view:      &View,
-    rect:      Rect,
-    font_size: f32,
-    line_h:    f32,
+
+    rect: Rect, font_size: f32, line_h: f32,
 ) -> TextLayout {
     let _tracy = tracy::span!("build_text_layout");
 
-    let first_line = (view.scroll_anim / line_h) as u32;
-    let line_count = (rect.h / line_h) as u32 + 4;
+    //
+    // Calculate the base visible range based on the animation (what we see now)
+    //
+    let mut first_line = (view.scroll_anim / line_h).floor() as u32;
+    let mut last_line  = ((view.scroll_anim + rect.h) / line_h).ceil() as u32;
+
+    //
+    // Add a tiny bit of padding so lines don't pop at the very edges
+    //
+    first_line = first_line.saturating_sub(2);
+    last_line  = last_line.saturating_add(2);
+
+    //
+    // If the animation is moving DOWN, pad the BOTTOM more.
+    // If the animation is moving UP,   pad the TOP    more.
+    //
+    let diff = view.scroll - view.scroll_anim;
+    if diff > 0.0 {
+        // We are scrolling DOWN (target is below current anim)
+        // Add 40 lines of lookahead to the bottom
+        last_line = last_line.saturating_add(40);
+    } else if diff < 0.0 {
+        // We are scrolling UP   (target is above current anim)
+        // Add 40 lines of lookahead to the top
+        first_line = first_line.saturating_sub(40);
+    }
+
+    let line_count = last_line - first_line;
 
     let default_color = token_color(lexer::TokenKind::Default);
     let tokens        = &buffer.visible_tokens;
 
     let first_visible_byte = buffer.text.line_to_byte(first_line as usize);
 
-    let mut visible_glyph_count = 0;
+    let mut visible_glyph_count = 0u32;
 
     let mut current_token = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
 
-    // @Memory
+    // @Memory @Speed: Reuse these allocations!!!!!!!
     let mut lines  = Vec::with_capacity(line_count as usize);
-    let mut glyphs = Vec::with_capacity(80);
+    let mut glyphs = Vec::with_capacity(line_count as usize * 80);
 
     for vis_i in 0..line_count {
         let line_index = first_line + vis_i;
-        let Some(rope_line) = buffer.text.get_line(line_index as usize) else { break };
+        let Some(rope_line) = buffer.text.get_line(line_index as usize) else { continue };
 
         let has_nl   = rope_line.len_chars() > 0 && rope_line.char(rope_line.len_chars() - 1) == '\n';
         let line_len = rope_line.len_bytes().saturating_sub(if has_nl { 1 } else { 0 });
@@ -384,62 +656,67 @@ fn build_text_layout(
             line_byte_start,
         };
 
-        if line_len > 0 {
-            let mut local_x  = 0.0f32;
-            let mut byte_off = 0usize;
-
-            let glyph_start = glyphs.len() as u32;
-
-            for char in rope_line.chars() {
-                if char == '\n' { break; }
-
-                // Advance token cursor past tokens that end before this byte
-                while current_token < tokens.len() {
-                    let t = &tokens[current_token];
-                    if (t.start + t.len()) as usize <= line_byte_start + byte_off {
-                        current_token += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                // Color is from current token if it covers this byte, else default
-                let abs_byte = line_byte_start + byte_off;
-                let color = if current_token < tokens.len() {
-                    let t = &tokens[current_token];
-                    if abs_byte >= t.start as usize && abs_byte < (t.start + t.len()) as usize {
-                        token_color(t.kind())
-                    } else {
-                        default_color
-                    }
-                } else {
-                    default_color
-                };
-
-                let gpu_glyph = gpu::get_glyph(gpu, char, font_size)
-                    .unwrap_or_else(|| gpu::get_glyph(gpu, 'A', font_size).unwrap());
-
-                let advance = gpu_glyph.advance;
-
-                glyphs.push(Glyph {
-                    x:         local_x,
-                    color,
-                    char,
-                    line_byte: byte_off as u32,
-                    gpu_glyph,
-                });
-
-                local_x  += advance;
-                byte_off += char.len_utf8();
-            }
-
-            ll.glyph_start = glyph_start;
-            ll.glyph_count = glyphs.len() as u32 - glyph_start;
-            ll.width = local_x;
-            visible_glyph_count += ll.glyph_count as usize;
+        if line_len == 0 {
+            checked_push!(lines, ll);
+            continue;
         }
 
-        lines.push(ll);
+        let mut local_x  = 0.0f32;
+        let mut abs_byte = line_byte_start;
+
+        let mut token_index = current_token;
+
+        let glyph_start = glyphs.len() as u32;
+
+        for char in rope_line.chars() {
+            if char == '\n' { break; }
+
+            // Advance token cursor past tokens that end before this byte
+            while token_index < tokens.len() {
+                let t = &tokens[token_index];
+                if (t.start + t.len()) as usize <= abs_byte {
+                    token_index += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Color is from current token if it covers this byte, else default
+            let color = if token_index < tokens.len() {
+                let t = &tokens[token_index];
+                if abs_byte >= t.start as usize && abs_byte < (t.start + t.len()) as usize {
+                    token_color(t.kind())
+                } else {
+                    default_color
+                }
+            } else {
+                default_color
+            };
+
+            let gpu_glyph = gpu::get_glyph(gpu, char, font_size)
+                .unwrap_or_else(|| gpu::get_glyph(gpu, 'A', font_size).unwrap());
+
+            let advance = gpu_glyph.advance;
+
+            checked_push!(glyphs, Glyph {
+                x:         local_x,
+                color,
+                char,
+                gpu_glyph,
+            });
+
+            local_x  += advance;
+            abs_byte += char.len_utf8();
+        }
+
+        ll.glyph_start = glyph_start;
+        ll.glyph_count = glyphs.len() as u32 - glyph_start;
+        ll.width = local_x;
+        visible_glyph_count += ll.glyph_count;
+
+        checked_push!(lines, ll);
+
+        current_token = token_index;
     }
 
     TextLayout {
@@ -461,6 +738,7 @@ fn render_text_layout(
     buffer:      &Buffer,
     view:        &View,
     active_view_id: ViewId,
+    lister_query_view_id: ViewId,
     scale:       f32,
     show_cursor: bool,
     is_our_window_focused: bool,
@@ -492,6 +770,7 @@ fn render_text_layout(
     let min_cursor_w = min_cursor_w.max(space_width);
 
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
+    let is_this_view_into_query_buffer = lister_query_view_id == view.id;
 
     let default_color = token_color(lexer::TokenKind::Default);
 
@@ -541,7 +820,7 @@ fn render_text_layout(
     // Current-line highlight
     //
     //
-    if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
+    if !is_this_view_into_query_buffer && let Some(ll) = layout.line_for_buffer_line(cursor_line) {
         let _tracy = tracy::span!("render_text_layout::current_line");
 
         let y = view.cursor_anim_y + cursor_h;
@@ -615,25 +894,34 @@ fn render_text_layout(
         }
     }
 
+
     //
     //
     // Cursor (on the focused view (filled in rectangle))
     //
     //
-    if show_cursor && is_this_view_focused
+
+    let cursor_rect = |cursor_glyph_w: f32| {
+        let cursor_width = if is_this_view_into_query_buffer {
+            scale_base_cursor_width(scale)
+        } else {
+            cursor_glyph_w
+        };
+
+        Rect {
+            x: view.cursor_anim_x,
+            y: view.cursor_anim_y + cursor_h,
+            w: cursor_width,
+            h: line_h + cursor_h,
+        }
+    };
+
+    if show_cursor && (is_this_view_into_query_buffer || is_this_view_focused)
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
-        let _tracy = tracy::span!("render_text_layout::cursor(focused)");
-
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
-        gpu::draw_rect(
-            gpu,
-            view.cursor_anim_x,
-            view.cursor_anim_y + cursor_h,
-            cursor_glyph_w,
-            line_h + cursor_h,
-            palette().cursor,
-        );
+        let rect = cursor_rect(cursor_glyph_w);
+        gpu::draw_rect(gpu, rect.x, rect.y, rect.w, rect.h, palette().cursor);
     }
 
     //
@@ -658,7 +946,7 @@ fn render_text_layout(
                 glyphs,
                 origin_x,
                 y,
-                is_cursor_line && is_this_view_focused && show_cursor,
+                is_cursor_line && is_this_view_focused && !is_this_view_into_query_buffer && show_cursor,
                 cursor_col,
                 cursor_color,
                 default_color,
@@ -671,21 +959,168 @@ fn render_text_layout(
     // Cursor (on the UNfocused view (outlined rectangle))
     //
     //
-    if show_cursor && !is_this_view_focused
+    if show_cursor && !is_this_view_focused && !is_this_view_into_query_buffer
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
-        let _tracy = tracy::span!("render_text_layout::cursor(unfocused)");
-
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
-        gpu::draw_rect_outline(
-            gpu,
-            view.cursor_anim_x,
-            view.cursor_anim_y + cursor_h,
-            cursor_glyph_w,
-            line_h + cursor_h,
-            cursor_outline_thickness,
-            palette().cursor,
-        );
+        let rect = cursor_rect(cursor_glyph_w);
+        gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
+    }
+}
+
+// Frosted glass approximation - layered semi-transparent rects
+// with slight size variations to fake depth
+fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32) {
+    // Base dark fill
+    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
+        Color::rgba(12, 9, 4, 200));
+
+    // Warm tint layer
+    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
+        Color::rgba(40, 25, 8, 40));
+
+    // Slightly inset lighter layer - gives illusion of depth/glass
+    let i = scale * 1.0;
+    gpu::draw_rect(gpu, lister.x + i, lister.y + i, lister.w - i*2.0, lister.h - i*2.0,
+        Color::rgba(255, 200, 120, 12));
+
+    // Top edge highlight - light catches the glass rim
+    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, scale,
+        Color::rgba(255, 210, 140, 60));
+
+    // Left edge highlight
+    gpu::draw_rect(gpu, lister.x, lister.y, scale, lister.h,
+        Color::rgba(255, 210, 140, 30));
+
+    // Bottom edge shadow
+    gpu::draw_rect(gpu, lister.x, lister.y + lister.h - scale, lister.w, scale,
+        Color::rgba(0, 0, 0, 80));
+}
+
+fn render_lister_background(gpu: &mut Gpu, editor: &Editor) {
+    if editor.active_panel != editor.lister_split_panel { return; }
+
+    if !editor.lister.is_open { return; }
+
+    // Dim the whole screen
+    gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
+}
+
+fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
+    if !editor.lister.is_open { return; }
+
+    let scale     = editor.scale;
+    let font_size = editor.font_size();
+    let line_h    = editor.line_h();
+
+    let lister = lister_rect(gpu.win_w, gpu.win_h);
+    let Rect { x: px, y: py, w: pw, h: ph } = lister;
+
+    let pad     = (8.0 * scale).round();
+    let item_h  = (line_h + pad).round();
+    let input_h = (line_h + pad).round();
+    let sep     = scale.max(1.0);
+    let list_y  = py + input_h + sep;
+    let list_h  = ph - input_h - sep;
+
+    editor.lister.item_h = item_h;
+    editor.lister.list_h = list_h;
+
+    // Outer border
+    gpu::draw_rect_outline(gpu, px, py, pw, ph, sep,
+                           Color::rgba(180, 140, 80, 200));
+
+    // Inner border
+    gpu::draw_rect_outline(gpu, px + sep, py + sep, pw - sep*2.0, ph - sep*2.0, sep,
+                           Color::rgba(80, 60, 30, 80));
+
+    // Separator
+    gpu::draw_rect(gpu, px, py + input_h, pw, sep,
+                   Color::rgba(180, 140, 80, 160));
+
+    // Item count
+    editor.lister.scratch_str.clear();
+    _ = write!(&mut editor.lister.scratch_str, "{} results", editor.lister.filtered.len());
+    let count_w = gpu::measure_str(gpu, &editor.lister.scratch_str, font_size * 0.80);
+    gpu::draw_text(gpu, &editor.lister.scratch_str,
+                   px + pw - pad - count_w,
+                   py + input_h * 0.44 + line_h * 0.35,
+                   font_size * 0.80,
+                   Color::rgba(160, 120, 60, 150));
+
+    // Items
+    let first   = (editor.lister.scroll_anim / item_h) as usize;
+    let visible = (list_h / item_h) as usize + 2;
+    let frac    = editor.lister.scroll_anim % item_h;
+
+    gpu::push_clip(gpu, px, list_y, pw, list_h);
+
+    for slot in 0..visible {
+        let idx      = first + slot;
+        let Some(&item_idx) = editor.lister.filtered.get(idx) else { break };
+        let item     = &editor.lister.items[item_idx];
+        let iy       = list_y + slot as f32 * item_h - frac;
+
+        let is_selected = idx == editor.lister.selected_index;
+        let is_hovered  = editor.lister.hovered_index == Some(idx);
+
+        if iy > list_y + list_h { break; }
+
+        // Alternating row tint  very subtle, just enough to separate rows
+        if idx % 2 == 0 {
+            gpu::draw_rect(gpu, px, iy, pw, item_h,
+                           Color::rgba(255, 200, 100, 8));
+        }
+
+
+        if is_hovered && !is_selected {
+            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h,
+                           Color::rgba(60, 45, 15, 120));
+        }
+
+        if is_selected {
+            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h,
+                           Color::rgba(80, 55, 20, 180));
+            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h,
+                           Color::hex(0xc3a983));
+            gpu::draw_rect(gpu, px, iy, pw, sep, Color::rgba(180, 140, 80, 60));
+            gpu::draw_rect(gpu, px, iy + item_h - sep, pw, sep, Color::rgba(180, 140, 80, 60));
+        }
+
+        let label_x = px + pad + sep * 5.0;
+        let label_y = iy + item_h * 0.5 + line_h * 0.35;
+
+        gpu::draw_text(gpu, &item.label, label_x, label_y, font_size,
+                       if is_selected { Color::hex(0xf0d090) } else { Color::rgba(200, 190, 165, 220) });
+
+        if !item.sublabel.is_empty() {
+            let sub_w = gpu::measure_str(gpu, &item.sublabel, font_size * 0.82);
+            gpu::draw_text(gpu, &item.sublabel,
+                           px + pw - pad - sub_w,
+                           label_y,
+                           font_size * 0.82,
+                           if is_selected { Color::rgba(180, 140, 80, 200) }
+                           else        { Color::rgba(120, 100, 60, 120) });
+        }
+    }
+
+    gpu::pop_clip(gpu);
+
+    // Scrollbar
+    let total_items = editor.lister.filtered.len();
+    if total_items > 0 {
+        let total_h = total_items as f32 * item_h + item_h * LISTER_ITEMS_PADDING;
+        let bar_h    = (list_h * (list_h / total_h).min(1.0)).max(sep * 4.0);
+        let bar_frac = (editor.lister.scroll_anim / (total_h - list_h).max(1.0)).clamp(0.0, 1.0);
+        let bar_y    = list_y + bar_frac * (list_h - bar_h);
+
+        // Scrollbar track - very faint
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h,
+                       Color::rgba(255, 200, 100, 15));
+
+        // Scrollbar thumb
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h,
+                       Color::rgba(180, 140, 80, 140));
     }
 }
 
@@ -714,21 +1149,23 @@ pub struct PanelSplit {
 
 #[derive(Copy, Clone, Debug)]
 pub enum PanelKind {
-    Leaf  { view_id: ViewId },
+    Leaf { view_id: ViewId },
+    ListerSplit,
     Split(PanelSplit),
 }
 
 #[derive(Copy, Clone, Debug)]
 pub struct Panel {
-    pub id:     PanelId,
-    pub rect:   Rect,
-    pub kind:   PanelKind,
+    pub id:   PanelId,
+    pub rect: Rect,
+    pub kind: PanelKind,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct ViewState {
     pub cursor: Cursor,
-    pub scroll: f32
+    pub scroll: f32,
+    pub scroll_anim: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -736,11 +1173,11 @@ pub struct View {
     pub id:        ViewId,
     pub buffer_id: BufferId,
 
-    pub scroll:        f32,  // target scroll (set instantly on any scroll event)
-    pub scroll_anim:   f32,  // animated scroll (what actually gets rendered)
+    pub scroll:        f32,  // Target scroll (set instantly on any scroll event)
+    pub scroll_anim:   f32,  // Animated scroll (what actually gets rendered)
 
-    pub cursor_anim_x: f32,  // animated cursor screen position
-    pub cursor_anim_y: f32,  // animated cursor screen position
+    pub cursor_anim_x: f32,  // Animated cursor screen position @Redundant (We currently only animate cursor's Y movements)
+    pub cursor_anim_y: f32,  // Animated cursor screen position
 
     pub cursor_target_line: u32,
     pub cursor_target_col:  u32,
@@ -769,11 +1206,14 @@ impl View {
     #[inline]
     pub fn switch_buffer(&mut self, new: BufferId) {
         let old = self.buffer_id;
+        if old == new { return; }
 
         // Save old state
         self.per_buffer.insert(old, ViewState {
             cursor: self.cursor,
-            scroll: self.scroll
+            scroll: self.scroll,
+            scroll_anim: self.scroll_anim,
+            // @Incomplete ...
         });
 
         // Switch
@@ -784,9 +1224,11 @@ impl View {
         if let Some(state) = self.per_buffer.get(&new) {
             self.cursor = state.cursor;
             self.scroll = state.scroll;
+            self.scroll_anim = state.scroll_anim;
         } else {
             self.cursor = Cursor::new();
             self.scroll = 0.0;
+            self.scroll_anim = 0.0;
         }
     }
 
@@ -828,37 +1270,263 @@ impl View {
     }
 }
 
-//
-// EditorState  -  owns everything, lives on the main thread
-//
+pub enum ListerKeyDispatch {
+    Selected,
+    Close,
+    Other,
+    None
+}
 
-pub struct EditorState {
+pub struct ListerItem {
+    pub label:    SmallString<[u8; 32]>,
+    pub sublabel: SmallString<[u8; 64]>,
+    pub data:     u64,
+}
+
+pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> bool;
+pub type ListerSelectFn = fn(&mut CommandContext, u64);
+
+pub struct Lister {
+    pub is_open:       bool,
+    pub is_listing_file_entries: bool,
+
+    pub query:         SmallString<[u8; 128]>,
+
+    pub selected_index: usize,
+    pub  hovered_index: Option<usize>,
+
+    pub set_selected_index_to_1_instead_of_0: bool,
+
+    pub on_confirm:     Vec<ListerSelectFn>,
+    pub pending_datas:  Vec<u64>,
+    pub items_update_frame_update_callback: Vec<Option<ListerFrameUpdateCallback>>,
+
+    pub scroll:        f32,
+    pub scroll_anim:   f32,
+    pub item_h:        f32,
+    pub list_h:        f32,
+
+    // Storage - cleared and refilled when lister opens
+    pub items:         Vec<ListerItem>,
+
+    // Scratch - rebuilt only when query changes (dirty flag)
+    pub filtered:      Vec<usize>,   // Indices into items
+    pub query_dirty:   bool,
+    pub scratch_str:   String,       // For formatting, reused
+}
+
+impl Lister {
+    pub fn new() -> Self {
+        Self {
+            is_open: false,
+            query: SmallString::new(),
+            filtered: Default::default(),
+            items_update_frame_update_callback: Default::default(),
+            hovered_index: None,
+            is_listing_file_entries: false,
+            items: Default::default(),
+            on_confirm: Default::default(),
+            pending_datas: Default::default(),
+            query_dirty: false,
+            scratch_str: String::with_capacity(512),
+            scroll: 0.0,
+            set_selected_index_to_1_instead_of_0: false,
+            scroll_anim: 0.0,
+            selected_index: 0,
+            list_h: 0.0,
+            item_h: 0.0
+        }
+    }
+
+    pub fn rebuild_filtered(&mut self) {
+        if !self.query_dirty { return; }
+        self.filtered.clear();
+
+        let filter_str = if self.is_listing_file_entries {
+            // For filtering entries, only use the filename part of the query
+            // (the part after the last /)
+
+            let after_last_slash = self.query.as_str()
+                .rsplit('/')
+                .next()
+                .unwrap_or(self.query.as_str());
+
+            // If query ends with / or the part before the last slash is a dir,
+            // show everything - user navigated into a directory
+            if after_last_slash.is_empty() {
+                ""
+            } else {
+                after_last_slash
+            }
+        } else {
+            &self.query
+        };
+
+        if filter_str.is_empty() {
+            self.filtered.extend(0..self.items.len());
+            self.query_dirty = false;
+            return;
+        }
+
+        // Filter by subsequence
+        // Then score by edit distance on matched items only for sorting
+        let mut scored: Vec<(usize, usize)> = self.items.iter()
+            .enumerate()
+            .filter(|(_, item)| Self::fuzzy_match(&item.label, filter_str))
+            .map(|(i, item)| {
+                // Score: edit distance between query and best substring of label
+                // Use a large limit since we already know it's a subsequence match
+                let score = rustc_edit_distance::edit_distance_with_substrings(
+                    filter_str,
+                    &item.label,
+                    filter_str.len() * 3, // nocheckin
+                ).unwrap_or(usize::MAX);
+                (i, score)
+            }).collect();
+
+        scored.sort_unstable_by_key(|&(_, score)| score);
+        self.filtered.extend(scored.iter().map(|&(i, _)| i));
+        self.query_dirty = false;
+    }
+
+    fn fuzzy_match(text: &str, query: &str) -> bool {
+        let mut qchars = query.chars();
+        let mut qc = match qchars.next() { Some(c) => c, None => return true };
+        for tc in text.chars() {
+            if tc.to_ascii_lowercase() == qc.to_ascii_lowercase() {
+                qc = match qchars.next() { Some(c) => c, None => return true };
+            }
+        }
+        false
+    }
+
+    pub fn lister_key(&mut self, event: &KeyEvent, mods: Mods) -> ListerKeyDispatch {
+        if !self.is_open { return ListerKeyDispatch::None; }
+
+        let Mods { ctrl, alt, shift: _ } = mods;
+
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                ListerKeyDispatch::Close
+            }
+
+            Key::Named(NamedKey::Enter) => {
+                ListerKeyDispatch::Selected
+            }
+
+            Key::Named(NamedKey::ArrowDown) => {
+                if self.selected_index + 1 < self.filtered.len() {
+                    self.selected_index += 1;
+                    self.scroll_to_selected();
+                }
+                ListerKeyDispatch::Other
+            }
+
+            Key::Named(NamedKey::ArrowUp) => {
+                if self.selected_index > 0 {
+                    self.selected_index -= 1;
+                    self.scroll_to_selected();
+                }
+                ListerKeyDispatch::Other
+            }
+
+            Key::Character(s) if ctrl => match s.chars().next() {
+                Some('n') => {
+                    if self.selected_index + 1 < self.filtered.len() {
+                        self.selected_index += 1;
+                        self.scroll_to_selected();
+                    }
+
+                    ListerKeyDispatch::Other
+                }
+
+                Some('p') => {
+                    if self.selected_index > 0 {
+                        self.selected_index -= 1;
+                        self.scroll_to_selected();
+                    }
+
+                    ListerKeyDispatch::Other
+                }
+
+                Some('v') => {
+                    let page = (self.list_h / self.item_h) as usize;
+                    self.selected_index = (self.selected_index + page).min(self.filtered.len().saturating_sub(1));
+                    self.scroll_to_selected();
+                    ListerKeyDispatch::Other
+                }
+
+                Some('g') => ListerKeyDispatch::Close,
+
+                _ => ListerKeyDispatch::None
+            }
+
+            Key::Character(s) if alt => match s.chars().next() {
+                Some('v') => {
+                    let page = (self.list_h / self.item_h) as usize;
+                    self.selected_index = self.selected_index.saturating_sub(page);
+                    self.scroll_to_selected();
+                    ListerKeyDispatch::Other
+                }
+                _ => ListerKeyDispatch::None
+            }
+
+            _ => ListerKeyDispatch::None
+        }
+    }
+
+    fn scroll_to_selected(&mut self) {
+        let top    = self.selected_index as f32 * self.item_h;
+        let bottom = top + self.item_h;
+
+        // Only scroll when item is fully outside the visible area
+        if top < self.scroll {
+            self.scroll = top;
+        }
+        if bottom > self.scroll + self.list_h {
+            self.scroll = bottom - self.list_h;
+        }
+    }
+}
+
+pub struct Editor {
     // Storage
-    pub buffers:         PrimaryMap<BufferId, Buffer>,
-    pub views:           PrimaryMap<ViewId,   View>,
-    pub panels:          PrimaryMap<PanelId,  Panel>,
+    pub buffers: PrimaryMap<BufferId, Buffer>,
+    pub views:   PrimaryMap<ViewId,   View>,
+    pub panels:  PrimaryMap<PanelId,  Panel>,
 
     // Which panel is active (receives keyboard input)
-    pub active_panel:    PanelId,
+    pub active_panel:  PanelId,
 
     // Root panel id - its rect always equals the window
-    pub root_panel:      PanelId,
+    pub root_panel:    PanelId,
 
-    pub most_recently_used_buffers: VecDeque<BufferId>,
-    pub buffer_cycle_index: Option<usize>,
+    pub scratch_paren: Vec<char>,
+
+    pub most_recently_used_buffers:  VecDeque<BufferId>,
+    pub buffer_cycle_index:          Option<usize>,
+
+    pub panel_before_opening_lister: Option<PanelId>,
 
     // Scale for font/line-height
-    pub scale:           f32,
+    pub scale: f32,
 
     // Cursor blink
-    pub blink_epoch:     Instant,
+    pub blink_epoch:         Instant,
     pub last_cursor_visible: bool,
 
     // Mouse
     pub mouse_pos:          (f32, f32),
     pub mouse_left_pressed: bool,
+    pub is_cursor_visible:  bool,
 
-    scratch_paren:       Vec<char>,
+    lister_query_buffer: BufferId,
+    lister_query_view:   ViewId,
+    lister_query_panel:  PanelId, // @Redundant?
+    lister_split_panel:  PanelId,
+
+    pub canonicalized_current_working_directory: SmallString<[u8; 64]>,
+    pub canonicalized_last_scanned_directory:    SmallString<[u8; 64]>,
 
     pub last_input_time: Instant,
 
@@ -874,32 +1542,63 @@ pub struct EditorState {
     pub relex_us:        f32,
     pub build_us:        f32,
     pub render_us:       f32,
+
+    pub lister:          Lister,
+    pub director:        Director
 }
 
-impl EditorState {
+impl Editor {
     pub fn new(buffer: Buffer) -> Self {
-        let mut buffers = PrimaryMap::default();
-        let mut views   = PrimaryMap::default();
-        let mut panels  = PrimaryMap::default();
+        let mut buffers = PrimaryMap::with_capacity(32);
+        let mut views   = PrimaryMap::with_capacity(32);
+        let mut panels  = PrimaryMap::with_capacity(32);
 
-        let buf_id   = buffers.push(buffer);
-        let view_id  = ViewId::new(0);  views.push(View::new(view_id, buf_id));
-        let panel_id = PanelId::new(0); panels.push(Panel {
-            id:   panel_id,
+        let root_buffer = buffers.push(buffer);
+        let root_view   = views.next_key();  views.push(View::new(root_view, root_buffer));
+        let root_panel  = panels.next_key(); panels.push(Panel {
+            id:   root_panel,
             rect: Rect::default(),  // Set on first resize / resumed
-            kind: PanelKind::Leaf { view_id },
+            kind: PanelKind::Leaf { view_id: root_view },
         });
+
+        let lister_query_buffer = buffers.push(Buffer::default());
+        let lister_query_view   = views.next_key();  views.push(View::new(lister_query_view, lister_query_buffer));
+        let lister_query_panel  = panels.next_key(); panels.push(Panel {
+            id:   lister_query_panel,
+            rect: Rect::default(),  // Set on first resize / resumed
+            kind: PanelKind::Leaf { view_id: lister_query_view },
+        });
+
+        let lister_split_panel = panels.next_key();
+        panels.push(Panel {
+            id: lister_split_panel,
+            rect: Rect::default(),  // Set on first resize / resumed
+            kind: PanelKind::ListerSplit
+        });
+
+        let canonicalized_current_working_directory: SmallString<[_; _]> = std::env::args().nth(1)
+            .and_then(|p| Path::new(&p).parent().map(|p| p.to_path_buf()))
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .unwrap_or_else(|| std::fs::canonicalize(".").unwrap_or_default())
+            .into_os_string()
+            .into_string()
+            .unwrap()
+            .into();
 
         let mut editor = Self {
             buffers,
             views,
             panels,
+            lister_split_panel,
+            lister: Lister::new(),
             last_input_time: Instant::now(),
             last_cursor_visible: false,
+            is_cursor_visible: true,
             buffer_cycle_index: None,
-            scratch_paren: Default::default(),
-            active_panel: panel_id,
-            root_panel:   panel_id,
+            scratch_paren: Vec::with_capacity(256),
+            active_panel: root_panel,
+            root_panel,
+            panel_before_opening_lister: None,
             scale:        1.0,
             blink_epoch:  Instant::now(),
             last_frame_time:  Instant::now(),
@@ -914,11 +1613,72 @@ impl EditorState {
             build_us:  0.0,
             render_us_acc:  0.0,
             render_us:  0.0,
-            most_recently_used_buffers: Default::default()
+            canonicalized_last_scanned_directory: "".into(),
+            canonicalized_current_working_directory,
+            most_recently_used_buffers: VecDeque::with_capacity(32),
+            lister_query_panel,
+            lister_query_view,
+            lister_query_buffer,
+            director: Director::new()
         };
 
-        editor.mru_register_new_buffer(buf_id);
+        editor.mru_register_new_buffer(root_buffer);
         editor
+    }
+
+    pub fn hide_cursor(&mut self, win: &Window) {
+        if !self.is_cursor_visible { return }
+
+        self.is_cursor_visible = false;
+        win.set_cursor_visible(false);
+    }
+
+    pub fn show_cursor(&mut self, win: &Window) {
+        if self.is_cursor_visible { return }
+
+        self.is_cursor_visible = true;
+        win.set_cursor_visible(true);
+    }
+
+    pub fn is_lister_open_and_is_it_listing_file_entries(&self) -> bool {
+        self.lister.is_open && self.lister.is_listing_file_entries
+    }
+
+    pub fn is_lister_buffer_dirty(&self) -> bool {
+        self.buffers[self.lister_query_buffer].dirty
+    }
+
+    pub fn open_lister(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn) {
+        self.open_lister_impl(items, on_confirm, None)
+    }
+
+    pub fn open_lister_with_frame_callback(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: ListerFrameUpdateCallback) {
+        self.open_lister_impl(items, on_confirm, Some(frame_callback))
+    }
+
+    pub fn open_lister_impl(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: Option<ListerFrameUpdateCallback>) {
+        clear_buffer(self, self.lister_query_buffer);
+
+        self.set_active_panel(self.lister_split_panel);
+
+        self.lister.items_update_frame_update_callback.push(frame_callback);
+        self.lister.on_confirm.push(on_confirm);
+
+        self.lister.query.clear();
+        self.lister.filtered.clear();
+        self.lister.query_dirty     = true;
+        self.canonicalized_last_scanned_directory = SmallString::new();
+        self.lister.selected_index  = if self.lister.set_selected_index_to_1_instead_of_0 {
+            (items.len() > 1) as usize
+        } else {
+            0
+        };
+        self.lister.scroll          = 0.0;
+        self.lister.scroll_anim     = 0.0;
+        self.lister.is_open         = true;
+        self.lister.items           = items;
+
+        self.lister.rebuild_filtered();
     }
 
     pub fn view_and_buffer(&mut self, view_id: ViewId) -> (&View, &Buffer) {
@@ -951,12 +1711,26 @@ impl EditorState {
     pub fn active_view_id(&self) -> ViewId {
         match self.panels[self.active_panel].kind {
             PanelKind::Leaf { view_id } => view_id,
-            _ => VIEW_MAIN,
+            PanelKind::ListerSplit => self.lister_query_view,
+            PanelKind::Split(_) => VIEW_MAIN,
         }
     }
 
     pub fn active_view(&self) -> &View { &self.views[self.active_view_id()] }
     pub fn active_view_mut(&mut self) -> &mut View { let id = self.active_view_id(); &mut self.views[id] }
+
+    pub fn panel_of_view(&self, view_id: ViewId) -> PanelId { // @Speed
+        let mut leaf_panels = Default::default();
+        collect_leaves(self, self.root_panel, &mut leaf_panels);
+
+        for (panel, view, _) in leaf_panels {
+            if view == view_id {
+                return panel;
+            }
+        }
+
+        unreachable!()
+    }
 
     pub fn active_buffer(&self) -> &Buffer {
         let buf_id = self.active_view().buffer_id;
@@ -972,6 +1746,8 @@ impl EditorState {
     /// (exactly two children, both Leaf).  N+2 panels max.
     pub fn layout_panels(&mut self, win_rect: Rect) {
         self.layout_panel(self.root_panel, win_rect);
+        self.layout_panel(self.lister_query_panel, lister_rect(win_rect.w, win_rect.h));
+        self.layout_panel(self.lister_split_panel, lister_rect(win_rect.w, win_rect.h));
     }
 
     fn layout_panel(&mut self, id: PanelId, rect: Rect) {
@@ -980,6 +1756,7 @@ impl EditorState {
         // Collect split info without holding borrow
         let split = match self.panels[id].kind {
             PanelKind::Split(s) => s,
+            PanelKind::ListerSplit => return,
             PanelKind::Leaf { .. } => return,
         };
 
@@ -1076,7 +1853,7 @@ impl EditorState {
 
     pub fn toggle_active_panel(&mut self) {
         let mut leaves = Default::default();
-        collect_leaves(self.panels.as_values_slice(), self.root_panel, &mut leaves);
+        collect_leaves(self, self.root_panel, &mut leaves);
 
         if leaves.len() <= 1 {
             return;
@@ -1131,11 +1908,23 @@ impl EditorState {
         if let Some(pos) = self.most_recently_used_buffers.iter().position(|&b| b == buffer_id) {
             self.most_recently_used_buffers.remove(pos);
         }
+        // Insert at 1, not 0 - current buffer stays at front, new buffer is "next"
+        let insert_at = 1.min(self.most_recently_used_buffers.len());
+        self.most_recently_used_buffers.insert(insert_at, buffer_id);
+    }
 
-        self.most_recently_used_buffers.insert(0, buffer_id);
+    pub fn mru_focus(&mut self, id: BufferId) {
+        if self.buffer_cycle_index.is_some() { return; }
+        if let Some(pos) = self.most_recently_used_buffers.iter().position(|&x| x == id) {
+            self.most_recently_used_buffers.remove(pos);
+        }
+        self.most_recently_used_buffers.insert(0, id);
     }
 
     pub fn set_active_panel(&mut self, panel_id: PanelId) {
+        if panel_id == self.lister_split_panel {
+            self.panel_before_opening_lister = Some(self.active_panel);
+        }
         self.active_panel = panel_id;
     }
 
@@ -1166,7 +1955,7 @@ impl EditorState {
 
     pub fn panel_at(&self, px: f32, py: f32) -> Option<PanelId> {
         let mut leaves = Default::default();
-        collect_leaves(self.panels.as_values_slice(), self.root_panel, &mut leaves);
+        collect_leaves(self, self.root_panel, &mut leaves);
 
         for (panel_id, ..) in leaves {
             if self.panels[panel_id].rect.contains(px, py) {
@@ -1178,8 +1967,8 @@ impl EditorState {
     }
 }
 
-fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
-    let _tracy = tracy::span!("animate_views");
+fn animate(editor: &mut Editor, dt: f32) -> bool {
+    let _tracy = tracy::span!("animate");
 
     let epsilon       = 0.5f32; // Stop animating when close enough
     let mut animating = false;
@@ -1223,6 +2012,14 @@ fn animate_views(editor: &mut EditorState, dt: f32) -> bool {
 
             view.cursor_anim_x = target_x;
         }
+    }
+
+    let ds = editor.lister.scroll - editor.lister.scroll_anim;
+    if ds.abs() > epsilon {
+        editor.lister.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
+        animating = true;
+    } else {
+        editor.lister.scroll_anim = editor.lister.scroll;
     }
 
     animating
@@ -1283,9 +2080,6 @@ fn find_matching_paren(
             scratch_paren.clear();
             scratch_paren.extend(text.chars().take(end_col as usize));
 
-            scratch_paren.clear();
-            scratch_paren.extend(text.chars().take(end_col as usize));
-
             for col in (0..scratch_paren.len()).rev() {
                 let ch = scratch_paren[col];
                 if ch == close      { depth += 1; }
@@ -1307,22 +2101,29 @@ pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
     line_text.chars().nth(col as usize)
 }
 
-pub fn collect_leaves(panels: &[Panel], id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
-    let mut s = SmallVec::<[_; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
-    s.push(id);
+pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
+    let panels = &editor.panels;
 
-    while let Some(id) = s.pop() {
-        match panels[id.index()].kind {
-            PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id.index()].rect)),
+    let mut stack = SmallVec::<[_; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
+    if editor.lister.is_open {
+        stack.push(editor.lister_split_panel);
+    }
+
+    stack.push(id);
+
+    while let Some(id) = stack.pop() {
+        match panels[id].kind {
+            PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id].rect)),
+            PanelKind::ListerSplit  => out.push((id, editor.lister_query_view, panels[editor.lister_query_panel].rect)),
             PanelKind::Split(split) => {
-                s.push(split.right_id);
-                s.push(split.left_id);
+                stack.push(split.right_id);
+                stack.push(split.left_id);
             }
         }
     }
 }
 
-fn apply_scale(editor: &mut EditorState, new_scale: f32, anchor_my: Option<f32>) {
+fn apply_scale(editor: &mut Editor, new_scale: f32, anchor_my: Option<f32>) {
     let old_line_h = editor.line_h();
     editor.scale = new_scale.clamp(MIN_SCALE, MAX_SCALE);
     let new_line_h = editor.line_h();
@@ -1340,7 +2141,7 @@ fn apply_scale(editor: &mut EditorState, new_scale: f32, anchor_my: Option<f32>)
     }
 }
 
-fn rescale(editor: &mut EditorState, gpu: &mut Gpu, new_scale: f32) {
+fn rescale(editor: &mut Editor, gpu: &mut Gpu, new_scale: f32) {
     let new = new_scale.clamp(MIN_SCALE, MAX_SCALE);
     if new != editor.scale {
         reset_atlas(gpu);
@@ -1349,13 +2150,13 @@ fn rescale(editor: &mut EditorState, gpu: &mut Gpu, new_scale: f32) {
     }
 }
 
-fn force_layouts_from_all_views_to_rebuild(editor: &mut EditorState) {
+fn force_layouts_from_all_views_to_rebuild(editor: &mut Editor) {
     for view in editor.views.values_mut() {
         view.layout = None;
     }
 }
 
-fn scroll_page(editor: &mut EditorState, _gpu: &Gpu, direction: i32) {
+fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     let line_h   = editor.line_h();
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
@@ -1387,7 +2188,71 @@ fn scroll_page(editor: &mut EditorState, _gpu: &Gpu, direction: i32) {
     editor.reset_blink();
 }
 
-fn handle_left_mouse_click(editor: &mut EditorState) -> bool {
+const fn lister_rect(win_w: f32, win_h: f32) -> Rect {
+    let panel_w = (win_w * 0.45).clamp(320.0, 720.0);
+    let panel_h = (win_h * 0.65).clamp(200.0, 600.0);
+
+    Rect {
+        x: ((win_w - panel_w) * 0.50).round(),
+        y: ((win_h - panel_h) * 0.40).round(),
+        w: panel_w,
+        h: panel_h,
+    }
+}
+
+fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
+    let index = cx.editor.lister.selected_index;
+    let index = cx.editor.lister.filtered[index];
+    let item_data = cx.editor.lister.items[index].data;
+
+    let on_confirm = cx.editor.lister.on_confirm.pop().unwrap();
+    cx.editor.lister.pending_datas.push(item_data);
+    _ = cx.editor.lister.items_update_frame_update_callback.pop();
+    cx.editor.lister.set_selected_index_to_1_instead_of_0 = false;
+    on_confirm(cx, item_data);
+}
+
+fn handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &CommandTable) -> bool {
+    if editor.lister.is_open {
+        let lister = lister_rect(gpu.win_w, gpu.win_h);
+        let (mx, my) = editor.mouse_pos;
+        if lister.contains(mx, my) {
+            let line_h   = editor.line_h();
+            let scale    = editor.scale;
+            let pad      = (8.0 * scale).round();
+            let item_h   = editor.lister.item_h;
+            let input_h  = (line_h + pad).round();
+            let sep      = scale.max(1.0);
+            let list_y   = lister.y + input_h + sep;
+
+            if my >= list_y {
+                let local_y = my - list_y + editor.lister.scroll_anim;
+                let clicked = (local_y / item_h) as usize;
+                if clicked < editor.lister.filtered.len() {
+                    editor.lister.selected_index = clicked;
+                    editor.lister.is_open = false;
+                    editor.lister.is_listing_file_entries = true;
+
+                    let panel = editor.panel_before_opening_lister.take().unwrap();
+                    editor.set_active_panel(panel);
+                    editor.reset_blink();
+
+                    editor_dispatch_lister_confirm(&mut CommandContext { editor, gpu, command_table, event: None });
+                }
+            }
+
+            return true;
+        } else {
+            // Click outside lister closes it
+            editor.lister.is_open = false;
+            editor.lister.is_listing_file_entries = true;
+
+            let panel = editor.panel_before_opening_lister.take().unwrap();
+            editor.set_active_panel(panel);
+            return true;
+        }
+    }
+
     let (mx, my) = editor.mouse_pos;
     let pid = editor.panel_at(mx, my).unwrap_or(editor.active_panel);
 
@@ -1427,7 +2292,7 @@ fn handle_left_mouse_click(editor: &mut EditorState) -> bool {
     true
 }
 
-pub fn snap_cursor_to_target_point_in_active_view(editor: &mut EditorState) {
+pub fn snap_cursor_to_target_point_in_active_view(editor: &mut Editor) {
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
     let rect     = editor.panels[panel_id].rect;
@@ -1438,7 +2303,7 @@ pub fn snap_cursor_to_target_point_in_active_view(editor: &mut EditorState) {
     editor.snap_cursor_to_target(view_id, line, col, rect);
 }
 
-pub fn scroll_to_cursor(editor: &mut EditorState) {
+pub fn scroll_to_cursor(editor: &mut Editor) {
     let view_id = editor.active_view_id();
     let (view, buf) = editor.active_view_and_buffer_mut();
 
@@ -1453,10 +2318,47 @@ pub fn scroll_to_cursor(editor: &mut EditorState) {
     editor.views[view_id].cursor_target_line = line;
 }
 
+pub fn clear_buffer(editor: &mut Editor, buffer: BufferId) {
+    editor.buffers[buffer].clear();
+}
+
+pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl Into<Box<Path>>) {
+    let Ok(buffer) = Buffer::from_file(path) else { return };
+
+    let buffer_id = editor.buffers.push(buffer);
+    editor.mru_register_new_buffer(buffer_id);
+
+    editor.views[view].switch_buffer(buffer_id);
+    editor.mru_focus(buffer_id); // @Refactor
+}
+
+pub fn does_panel_need_rebuild(
+    editor: &Editor,
+
+    view: ViewId, buffer: BufferId,
+
+    rect: Rect,
+
+    font_size: f32, line_h: f32
+) -> bool {
+    let screen_lines = (rect.h / line_h) as u32;
+    let anim_first = (editor.views[view].scroll_anim / line_h) as u32;
+    editor.buffers[buffer].dirty || editor.views[view].layout.as_ref().map(|l| {
+        anim_first < l.first_buffer_line
+            || (
+                anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
+                    && screen_lines < l.lines.len() as u32
+            )
+            || (l.rect.w - rect.w).abs() > 0.5
+            || (l.rect.h - rect.h).abs() > 0.5
+            || (l.font_size - font_size).abs() > 0.01
+    }).unwrap_or(true)
+}
+
 #[derive(Default)]
 struct App {
     gpu:    Option<Gpu>,
-    editor: Option<EditorState>,
+    editor: Option<Editor>,
     window: Option<Arc<Window>>,
     mods:   winit::event::Modifiers,
 
@@ -1480,14 +2382,16 @@ impl ApplicationHandler for App {
         let path   = std::env::args().nth(1).expect("usage: naysayer <file>");
         let buffer = Buffer::from_file(path.as_ref()).expect("failed to open file");
 
-        let mut editor = EditorState::new(buffer);
+        let mut editor = Editor::new(buffer);
         editor.layout_panels(Rect::full(w as f32, h as f32));
+        editor.director.kick_scan(PathBuf::from("."), false);
 
         let mut gpu = gpu::init(Arc::clone(&win));
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
-        _ = gpu::get_glyph(&mut gpu, ' ', editor.font_size()); // For space_width in render_text_layout
 
-        self.gpu = Some(gpu);
+        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
+
+        self.gpu    = Some(gpu);
         self.editor = Some(editor);
         self.window = Some(win);
     }
@@ -1541,8 +2445,7 @@ impl ApplicationHandler for App {
             ($event: expr) => {
                 CommandContext {
                     editor, gpu,
-                    mods: self.mods, event: $event, command_table: &self.command_table,
-                    last_executed_command: None
+                    event: $event, command_table: &self.command_table,
                 }
             };
         }
@@ -1557,20 +2460,75 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                editor.hide_cursor(win);
+
                 let mods = Mods { alt, ctrl, shift };
+
+                let is_active_view_query = editor.active_view_id() == editor.lister_query_view;
+                if is_active_view_query {
+                    let result = editor.lister.lister_key(&event, mods);
+                    let is_selected = matches!(result, ListerKeyDispatch::Selected);
+                    match result {
+                        ListerKeyDispatch::Selected | ListerKeyDispatch::Close => {
+                            editor.lister.is_open = false;
+                            editor.lister.is_listing_file_entries = true;
+
+                            let panel_before_opening_lister = editor.panel_before_opening_lister.take().unwrap();
+                            editor.set_active_panel(panel_before_opening_lister);
+
+                            if is_selected {
+                                let mut cx = make_command_context!(Some(&event));
+                                editor_dispatch_lister_confirm(&mut cx);
+                            }
+
+                            win.request_redraw();
+
+                            return;
+                        }
+
+                        ListerKeyDispatch::Other => {
+                            editor.reset_blink();
+                            win.request_redraw();
+                            return;
+                        }
+
+                        ListerKeyDispatch::None => {}
+                    }
+                }
+
                 if let Some(command_name) = self.keymap.lookup(&event, mods) {
                     let Some(command) = self.command_table.get(&command_name) else {
                         return;
                     };
 
                     // Commit cycle if switching to a non-cycle command
-                    if !matches!(command_name, CommandAtom("cycle_buffers_left") | CommandAtom("cycle_buffers_right")) {
+                    if !matches!(command_name, CommandAtom("switch_buffer") | CommandAtom("cycle_buffers_left") | CommandAtom("cycle_buffers_right")) {
                         editor.commit_buffer_cycle();
                     }
 
-                    let mut cx = make_command_context!(&event);
-                    cx.last_executed_command = Some(command);
-                    (command.func)(&mut cx);
+                    {
+                        let mut cx = make_command_context!(Some(&event));
+                        (command.func)(&mut cx);
+                    }
+
+                    if editor.is_lister_buffer_dirty() {
+                        //
+                        // Keep lister query updated
+                        //
+
+                        let query = editor.buffers[editor.lister_query_buffer].text.chars();
+                        editor.lister.query.clear();
+                        editor.lister.query.extend(query);
+                        editor.lister.scroll = 0.0;
+                        editor.lister.selected_index = if editor.lister.set_selected_index_to_1_instead_of_0 {
+                            (editor.lister.items.len() > 1) as usize
+                        } else {
+                            0
+                        };
+                        editor.lister.query_dirty = true;
+                        editor.lister.rebuild_filtered();
+                    }
+
                     win.request_redraw();
                 }
             }
@@ -1587,10 +2545,51 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                editor.show_cursor(win);
+
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * editor.line_h(),
                     MouseScrollDelta::PixelDelta(p)   => p.y as f32,
                 };
+
+                if editor.lister.is_open { // @Refactor
+                    //
+                    // Lister scroll takes priority if open and mouse is over it
+                    //
+
+                    let lister = lister_rect(gpu.win_w, gpu.win_h);
+                    let (mx, my) = editor.mouse_pos;
+                    if lister.contains(mx, my) {
+                        let max_scroll = (
+                            editor.lister.filtered.len() as f32 * editor.lister.item_h
+                                + editor.lister.item_h * 2.0 - editor.lister.list_h
+                        ).max(0.0);
+
+                        editor.lister.scroll = (editor.lister.scroll - dy * 2.0).clamp(0.0, max_scroll);
+
+                        //
+                        // Update hovered index for new scroll position
+                        //
+                        let line_h  = editor.line_h();
+                        let scale   = editor.scale;
+                        let pad     = (8.0 * scale).round();
+                        let input_h = (line_h + pad).round();
+                        let sep     = scale.max(1.0);
+                        let list_y  = lister.y + input_h + sep;
+                        if my >= list_y {
+                            let local_y = my - list_y + editor.lister.scroll;  // Use new scroll, not anim
+                            let hovered = (local_y / editor.lister.item_h) as usize;
+                            editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
+                                Some(hovered)
+                            } else {
+                                None
+                            };
+                        }
+
+                        win.request_redraw();
+                        return;
+                    }
+                }
 
                 let (mx, my) = editor.mouse_pos;
                 let Some(panel_id) = editor.panel_at(mx, my) else { return };
@@ -1621,7 +2620,7 @@ impl ApplicationHandler for App {
                 } else if cur_line > last_vis {
                     last_vis.min(total.saturating_sub(1) as u32) as u32
                 } else {
-                    cur_line // Still visible, don't move
+                    cur_line  // Still visible, don't move
                 };
 
                 if new_line != cur_line {
@@ -1639,11 +2638,15 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                editor.show_cursor(win);
+
                 editor.mouse_left_pressed = false;
             }
 
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                if handle_left_mouse_click(editor) {
+                editor.show_cursor(win);
+
+                if handle_left_mouse_click(editor, gpu, &self.command_table) {
                     win.request_redraw();
                 }
 
@@ -1651,10 +2654,39 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                editor.show_cursor(win);
+
                 editor.mouse_pos = (position.x as f32, position.y as f32);
 
+                if editor.lister.is_open { // @Refactor
+                    let lister = lister_rect(gpu.win_w, gpu.win_h);
+                    let (mx, my) = editor.mouse_pos;
+                    let line_h  = editor.line_h();
+                    let scale   = editor.scale;
+                    let pad     = (8.0 * scale).round();
+                    let item_h  = editor.lister.item_h;
+                    let input_h = (line_h + pad).round();
+                    let sep     = scale.max(1.0);
+                    let list_y  = lister.y + input_h + sep;
+
+                    if lister.contains(mx, my) && my >= list_y {
+                        let local_y = my - list_y + editor.lister.scroll_anim;
+                        let hovered = (local_y / item_h) as usize;
+                        editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
+                            Some(hovered)
+                        } else {
+                            None
+                        };
+                        win.request_redraw();
+                    } else {
+                        editor.lister.hovered_index = None;
+                    }
+
+                    win.request_redraw();
+                }
+
                 if editor.mouse_left_pressed {
-                    if handle_left_mouse_click(editor) {
+                    if handle_left_mouse_click(editor, gpu, &self.command_table) {
                         win.request_redraw();
                     }
                 }
@@ -1676,6 +2708,9 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 tracy_client::frame_mark();
 
+                // Poll directory cache results
+                editor.director.poll();
+
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
                 editor.last_frame_time = now;
@@ -1696,7 +2731,7 @@ impl ApplicationHandler for App {
                 }
 
                 //
-                // Ensure vertex buffer has reserved capacity
+                // Ensure vertex buffer has enough capacity
                 //
                 {
                     let verts = gpu.verts_mut();
@@ -1706,12 +2741,12 @@ impl ApplicationHandler for App {
                         .values()
                         .filter_map(|v| v.layout.as_ref())
                         .map(|l| l.visible_glyph_count)
-                        .sum::<usize>();
+                        .sum::<u32>();
 
                     let reserve = estimated * 6 + 4096;
 
                     let _old_capacity = verts.capacity();
-                    verts.reserve(reserve);
+                    verts.reserve(reserve as usize);
 
                     #[cfg(debug_assertions)] {
                         let _new_capacity = verts.capacity();
@@ -1726,7 +2761,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                let still_animating = animate_views(editor, dt);
+                let still_animating = animate(editor, dt);
 
                 let font_size    = editor.font_size();
                 let line_h       = editor.line_h();
@@ -1734,81 +2769,30 @@ impl ApplicationHandler for App {
                 let active_panel = editor.active_panel;
 
                 let mut leaf_panels = Default::default();
-                collect_leaves(editor.panels.as_values_slice(), editor.root_panel, &mut leaf_panels);
+                collect_leaves(editor, editor.root_panel, &mut leaf_panels);
 
                 let mut should_request_redraw = false;
                 should_request_redraw |= still_animating;
 
-                for (panel_id, view_id, rect) in leaf_panels {
-                    let buf_id = editor.views[view_id].buffer_id;
+                if let Some(Some(callback)) = editor.lister.items_update_frame_update_callback.last().copied() {
+                    let mut cx = make_command_context!(None);
+                    should_request_redraw |= callback(&mut cx);
+                }
 
-                    let screen_lines = (rect.h / line_h) as u32;
-                    let anim_first = (editor.views[view_id].scroll_anim / line_h) as u32;
-                    let is_dirty = editor.buffers[buf_id].dirty
-                        || editor.views[view_id].layout.as_ref().map(|l| {
-                            anim_first < l.first_buffer_line
-                                || (
-                                    anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
-                                        && screen_lines < l.lines.len() as u32
-                                )
-                                || (l.rect.w - rect.w).abs() > 0.5
-                                || (l.rect.h - rect.h).abs() > 0.5
-                                || (l.font_size - font_size).abs() > 0.01
-                        }).unwrap_or(true);
+                for &(panel_id, view_id, rect) in &leaf_panels {
+                    if view_id == editor.lister_query_view {
+                        // Lister buffer is drawn below
+                        continue;
+                    }
+
+                    let buffer_id = editor.views[view_id].buffer_id;
+
+                    let is_dirty = does_panel_need_rebuild(editor, view_id, buffer_id, rect, font_size, line_h);
 
                     should_request_redraw |= is_dirty;
 
                     if is_dirty {
-                        //
-                        // @Speed @Note:
-                        //
-                        // Currently we re-lex visible tokens on every dirty frame,
-                        // thats fine for now, since those conditions inside is_dirty
-                        // make sure that either the amount of lines we see has changed,
-                        // OR we now see completely different lines that in the previous frame.
-                        //
-                        // BUT, in the future, we might wanna have a different flag for this re-lex step.
-                        //
-                        {
-                            let t0 = Instant::now();
-
-                            let total      = editor.buffers[buf_id].text.len_lines();
-                            let scroll     = editor.views[view_id].scroll;
-                            let first_vis  = (scroll / line_h) as u32;
-                            let last_vis = (((scroll + rect.h) / line_h) as usize)
-                                .saturating_sub(1)
-                                .min(total.saturating_sub(1)) as u32;
-
-                            editor.buffers[buf_id].lex_visible(first_vis as _, last_vis as _);
-
-                            editor.relex_us_acc = t0.elapsed().as_micros() as f32;
-                        }
-
-                        let should_snap = editor.views[view_id].layout.as_ref()
-                            .map(|l| {
-                                (l.rect.w - rect.w).abs() > 0.5
-                                    || (l.rect.h - rect.h).abs() > 0.5
-                            }).unwrap_or(true); // true = first build
-
-                        let t0 = Instant::now();
-                        let layout = build_text_layout(
-                            gpu,
-                            &editor.buffers[buf_id],
-                            &editor.views[view_id],
-                            rect, font_size, line_h,
-                        );
-                        editor.build_us_acc = t0.elapsed().as_micros() as f32;
-
-                        editor.views[view_id].layout = Some(layout);
-
-                        if should_snap {
-                            let (cl, cc) = (
-                                editor.views[view_id].cursor_target_line,
-                                editor.views[view_id].cursor_target_col,
-                            );
-
-                            editor.snap_cursor_to_target(view_id, cl, cc, rect);
-                        }
+                        rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
                     }
 
                     let show_cursor = if panel_id == active_panel {
@@ -1825,27 +2809,84 @@ impl ApplicationHandler for App {
                     let t1 = Instant::now();
                     render_text_layout(
                         gpu, layout,
-                        &editor.buffers[buf_id],
+                        &editor.buffers[buffer_id],
                         &editor.views[view_id],
                         editor.active_view_id(),
+                        editor.lister_query_view,
                         editor.scale,
                         show_cursor,
                         self.is_our_window_focused,
                         &mut editor.scratch_paren,
                     );
-                    editor.render_us_acc = t1.elapsed().as_micros() as f32;
+                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
                     gpu::pop_clip(gpu);
                 }
 
-                // Clear dirty after all views have rebuilt their layouts
-                for buf in editor.buffers.values_mut() {
-                    buf.dirty = false;
+                if editor.lister.is_open {
+                    //
+                    // Prepare lister bg
+                    //
+
+                    if active_panel == editor.lister_split_panel {
+                        let lister = lister_rect(gpu.win_w, gpu.win_h);
+                        render_lister_background_frosted(gpu, lister, editor.scale);
+                    }
+
+                    render_lister_background(gpu, editor);
                 }
 
-                let mut perf = SmallString::<[u8; 128]>::new();
-                _ = writeln!(&mut perf, "{:.0} fps  build:{:.2}us  relex:{:.2}us  render:{:.2}us", editor.fps, editor.build_us, editor.relex_us, editor.render_us);
-                gpu::draw_text(gpu, &perf, gpu.win_w - 456.0, 14.0, 12.0, Color::rgba(120, 120, 120, 255));
-                gpu::submit_frame(gpu).unwrap();
+                if editor.lister.is_open {
+                    // @Cutnpaste from above
+
+                    //
+                    // Render lister query buffer
+                    //
+
+                    let view_id = editor.lister_query_view;
+                    let panel_id = editor.lister_query_panel;
+                    let rect = editor.panels[editor.lister_query_panel].rect;
+                    let buffer_id = editor.views[view_id].buffer_id;
+
+                    let is_dirty = does_panel_need_rebuild(editor, view_id, buffer_id, rect, font_size, line_h);
+
+                    should_request_redraw |= is_dirty;
+
+                    if is_dirty {
+                        rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
+                    }
+
+                    let show_cursor = if panel_id == active_panel {
+                        //
+                        // Only make cursor blink on the active panel.
+                        //
+                        show_cursor
+                    } else {
+                        true
+                    };
+
+                    let layout = editor.views[view_id].layout.as_ref().unwrap();
+                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+                    let t1 = Instant::now();
+                    render_text_layout(
+                        gpu, layout,
+                        &editor.buffers[buffer_id],
+                        &editor.views[view_id],
+                        editor.active_view_id(),
+                        editor.lister_query_view,
+                        editor.scale,
+                        show_cursor,
+                        self.is_our_window_focused,
+                        &mut editor.scratch_paren,
+                    );
+                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
+                    gpu::pop_clip(gpu);
+                }
+
+                render_lister_foreground(gpu, editor);
+
+                draw_metrics(editor, gpu);
+
+                _ = gpu::submit_frame(gpu);
 
                 let new_cursor_visible = editor.cursor_visible();
                 let blink_changed = new_cursor_visible != editor.last_cursor_visible;

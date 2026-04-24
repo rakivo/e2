@@ -72,14 +72,36 @@ pub const fn token_color(kind: TokenKind) -> Color {
     }
 }
 
-// @Note: Alphabetical order is required for binary_search in lex_from
-static KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn",
-    "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
-    "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-    "Self", "self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while",
-];
+const C_WHITESPACE: u8 = 0;
+const C_ALPHA:      u8 = 1; // a-z, A-Z, _
+const C_DIGIT:      u8 = 2; // 0-9
+const C_SLASH:      u8 = 3; // /
+const C_QUOTE:      u8 = 4; // "
+const C_TICK:       u8 = 5; // '
+const C_PUNCT:      u8 = 6; // everything else
+
+static CHAR_CLASSES: [u8; 256] = {
+    let mut table = [C_PUNCT; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            table[i] = C_WHITESPACE;
+        } else if b.is_ascii_alphabetic() || b == b'_' {
+            table[i] = C_ALPHA;
+        } else if b.is_ascii_digit() {
+            table[i] = C_DIGIT;
+        } else if b == b'/' {
+            table[i] = C_SLASH;
+        } else if b == b'"' {
+            table[i] = C_QUOTE;
+        } else if b == b'\'' {
+            table[i] = C_TICK;
+        }
+        i += 1;
+    }
+    table
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum LexState {
@@ -101,6 +123,9 @@ pub fn lex_from(
     let len   = bytes.len();
     let mut i = 0usize;
     let mut cur_state = state;
+
+    // Ensure we don't reallocate mid-lex
+    out.reserve(len / 4);
 
     macro_rules! push {
         ($kind:expr, $start:expr, $end:expr) => {
@@ -135,172 +160,197 @@ pub fn lex_from(
     while i < len {
         let start = i;
         let b = bytes[i];
+        let class = CHAR_CLASSES[b as usize];
 
-        // Line comment
-        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |pos| i + pos);
-            push!(TokenKind::Comment, start, i);
-            continue;
-        }
-
-        // Block comment
-        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            i += 2;
-            let mut closed = false;
-            while i < len {
-                if let Some(next_star) = memchr::memchr(b'*', &bytes[i..]) {
-                    i += next_star;
-                    if i + 1 < len && bytes[i + 1] == b'/' {
-                        i += 2;
-                        push!(TokenKind::Comment, start, i);
-                        closed = true;
-                        break;
-                    }
-                    i += 1;
-                } else {
-                    i = len;
-                    break;
-                }
-            }
-            if !closed {
-                push!(TokenKind::Comment, start, i);
-                return LexState::InBlockComment;
-            }
-            continue;
-        }
-
-        // String literal (double quote)
-        if b == b'"' {
-            i += 1;
-            while i < len {
-                // Jump to the next quote or backslash
-                if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
-                    i += hit;
-
-                    if bytes[i] == b'\\' {
-                        // Skip the backslash and the escaped char
-                        i += 2;
-                        if i + 1 < len { i += 1; }
-
-                        continue;
-                    } else {
-                        i += 1; // Found the closing quote
-                        break;
-                    }
-                } else {
-                    i = len; // Unclosed string
-                    break;
-                }
-            }
-
-            push!(TokenKind::String, start, i);
-            continue;
-        }
-
-        // Char literal
-        if b == b'\'' {
-            // Rust lifetimes: 'a, 'static, 'lifetime_name
-            // A lifetime is ' followed by a letter/underscore and then
-            // an identifier character or end-of-token (space, comma, >, etc.)
-            // A char literal is ' followed by any char and then a closing '
-            // (or a backslash escape and then closing ')
-            //
-            // Heuristic: if the byte after ' is alphabetic/underscore AND
-            // there is no closing ' within 4 bytes, treat it as a lifetime.
-            let is_lifetime = {
-                let next = bytes.get(i + 1).copied().unwrap_or(0);
-                let after_next = bytes.get(i + 2).copied().unwrap_or(0);
-                (next.is_ascii_alphabetic() || next == b'_')
-                    && after_next != b'\''  // 'x' is a char literal, 'ab... is a lifetime
-            };
-
-            if is_lifetime {
+        match class {
+            C_WHITESPACE => {
+                // Hot path: Skip whitespace as a block
                 i += 1;
-                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                while i < len && CHAR_CLASSES[bytes[i] as usize] == C_WHITESPACE {
                     i += 1;
                 }
-                push!(TokenKind::Default, start, i);
-                continue;
             }
 
-            i += 1;
-            while i < len {
-                if let Some(hit) = memchr::memchr2(b'\'', b'\\', &bytes[i..]) {
-                    i += hit;
-                    if bytes[i] == b'\\' {
+            C_ALPHA => {
+                let mut has_lowercase = false;
+
+                i += 1; // We already know the first char is alpha/underscore
+                if b.is_ascii_lowercase() { has_lowercase = true; }
+
+                while i < len {
+                    let c = bytes[i];
+                    let class = CHAR_CLASSES[c as usize];
+                    if class == C_ALPHA || class == C_DIGIT {
+                        if c.is_ascii_lowercase() { has_lowercase = true; }
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Check for macro!
+                if i < len && bytes[i] == b'!' {
+                    i += 1;
+                    push!(TokenKind::Macro, start, i);
+                } else {
+                    let word = &src[start..i];
+
+                    let mut kind = match word.len() {
+                        2 => if matches!(word, "fn" | "if" | "as" | "in" | "do" | "is" | "go" | "to") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
+                        3 => if matches!(word, "for" | "let" | "mut" | "pub" | "use" | "mod" | "try" | "new" | "var" | "def" | "nil") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
+                        4 => if matches!(word, "impl" | "enum" | "type" | "else" | "case" | "char" | "byte" | "void" | "true" | "self" | "goto" | "with") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
+                        5 => if matches!(word, "match" | "const" | "while" | "break" | "async" | "await" | "trait" | "false" | "super" | "final" | "class" | "yield" | "range") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
+                        6 => if matches!(word, "return" | "struct" | "extern" | "import" | "public" | "static" | "switch" | "typeof" | "delete") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
+                        7 => if matches!(word, "default" | "private" | "virtual" | "package" | "extends" | "finally") {
+                            Some(TokenKind::Keyword)
+                        } else { None },
+
+                        _ => None,
+                    };
+
+                    // If not a specific keyword, apply the heuristic
+                    if kind.is_none() {
+                        kind = Some(if b == b'_' {
+                            if has_lowercase {
+                                TokenKind::Default       // snake_case (my_var)
+                            } else {
+                                TokenKind::Type          // SCREAMING_SNAKE (YARRR, MAX_VAL)
+                            }
+                        } else if b.is_ascii_uppercase() {
+                            TokenKind::Type
+                        } else {
+                            TokenKind::Default           // snake_case (my_var)
+                        });
+                    };
+
+                    push!(unsafe { kind.unwrap_unchecked() }, start, i);
+                }
+            }
+
+            C_DIGIT => {
+                i += 1;
+
+                while i < len && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'_' || bytes[i] == b'x' || bytes[i] == b'.') {
+                    i += 1;
+                }
+
+                // Optional suffix
+                if i < len && bytes[i].is_ascii_alphabetic() {
+                    while i < len && bytes[i].is_ascii_alphanumeric() { i += 1; }
+                }
+
+                push!(TokenKind::Number, start, i);
+            }
+
+            C_SLASH => {
+                if i + 1 < len {
+                    if bytes[i+1] == b'/' { // Line comment
+                        i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |pos| i + pos);
+                        push!(TokenKind::Comment, start, i);
+                    } else if bytes[i+1] == b'*' { // Block comment
                         i += 2;
-                        continue;
+
+                        let mut closed = false;
+                        while i < len {
+                            if let Some(pos) = memchr::memchr(b'*', &bytes[i..]) {
+                                i += pos + 1;
+                                if i < len && bytes[i] == b'/' {
+                                    i += 1;
+                                    closed = true;
+                                    push!(TokenKind::Comment, start, i);
+                                    break;
+                                }
+                            } else { break; }
+                        }
+
+                        if !closed {
+                            i = len;
+                            push!(TokenKind::Comment, start, i);
+                            return LexState::InBlockComment;
+                        }
                     } else {
                         i += 1;
-                        break;
+                        push!(TokenKind::Punct, start, i);
                     }
                 } else {
-                    i = len;
-                    break;
-                }
-            }
-            push!(TokenKind::String, start, i);
-            continue;
-        }
-
-        // Number
-        if b.is_ascii_digit() || (b == b'-' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
-            if b == b'-' { i += 1; }
-            if i + 1 < len && bytes[i] == b'0' && bytes[i + 1] == b'x' {
-                i += 2;
-
-                while i < len && (bytes[i].is_ascii_hexdigit()  || bytes[i] == b'_') { i += 1 }
-            } else {
-                while i < len && (bytes[i].is_ascii_digit()     || bytes[i] == b'_') { i += 1 }
-
-                if i < len && bytes[i] == b'.' && i + 1 < len && bytes[i+1].is_ascii_digit() {
                     i += 1;
-
-                    while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'_') { i += 1 }
+                    push!(TokenKind::Punct, start, i);
                 }
             }
 
-            // Optional suffixes
-            if i < len && bytes[i].is_ascii_alphabetic() {
-                while i < len && bytes[i].is_ascii_alphanumeric() { i += 1; }
-            }
-
-            push!(TokenKind::Number, start, i);
-            continue;
-        }
-
-        // Identifier, keyword, type, or macro
-        if b.is_ascii_alphabetic() || b == b'_' {
-            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
-            if i < len && bytes[i] == b'!' {
+            C_QUOTE => {
+                // String literal
                 i += 1;
-                push!(TokenKind::Macro, start, i);
-                continue;
+                while i < len {
+                    if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
+                        i += hit;
+                        if bytes[i] == b'\\' {
+                            i += 2; // Skip \ and the next char
+                        } else {
+                            i += 1; // Closing "
+                            break;
+                        }
+                    } else {
+                        i = len; break;
+                    }
+                }
+                push!(TokenKind::String, start, i);
             }
 
-            let word = &src[start..i];
+            C_TICK => {
+                // Lifetimes vs Char literals
+                let is_lifetime = if i + 1 < len {
+                    let next = bytes[i+1];
+                    (next.is_ascii_alphabetic() || next == b'_') && bytes.get(i + 2) != Some(&b'\'')
+                } else {
+                    false
+                };
 
-            let kind = if KEYWORDS.binary_search(&word).is_ok() {
-                TokenKind::Keyword
-            } else if b.is_ascii_uppercase() && word.len() > 1 {
-                TokenKind::Type
-            } else {
-                TokenKind::Default
-            };
+                if is_lifetime {
+                    i += 2;
+                    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        i += 1;
+                    }
 
-            push!(kind, start, i);
-            continue;
+                    push!(TokenKind::Default, start, i);
+                } else {
+                    // Char literal logic
+                    i += 1;
+                    while i < len {
+                        if let Some(hit) = memchr::memchr2(b'\'', b'\\', &bytes[i..]) {
+                            i += hit;
+                            if bytes[i] == b'\\' { i += 2; } else { i += 1; break; }
+                        } else {
+                            i = len;
+                            break;
+                        }
+                    }
+
+                    push!(TokenKind::String, start, i);
+                }
+            }
+
+            _ => {
+                // Punctuation
+                i += 1;
+                push!(TokenKind::Punct, start, i);
+            }
         }
-
-        // Whitespace - skip without emitting a token
-        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-            i += 1;
-            continue;
-        }
-
-        // Everything else: punctuation, one byte at a time
-        i += 1;
-        push!(TokenKind::Punct, start, i);
     }
 
     cur_state

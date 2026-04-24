@@ -32,9 +32,9 @@ impl Cursor {
 
 #[derive(Default)]
 pub struct Buffer {
-    pub text:   Rope,
-    pub path:   Option<Box<Path>>,
-    pub dirty:  bool,
+    pub text: Rope,
+    pub path: Option<Box<Path>>,
+    pub dirty: bool,
     pub lex_scratch: String,
     pub visible_tokens: Vec<Token>,
 }
@@ -187,6 +187,69 @@ impl Buffer {
         self.dirty = true;
     }
 
+    pub fn delete_word_forward(&mut self, cursor: &mut Cursor) {
+        let start = cursor.char_index;
+        let len   = self.text.len_chars();
+        let mut i = start;
+
+        // Skip non-word chars
+        while i < len && !is_word_char(self.text.char(i)) { i += 1; }
+        // Skip word chars
+        while i < len && is_word_char(self.text.char(i)) { i += 1; }
+
+        if i == start { return; }
+
+        self.text.remove(start..i);
+        cursor.char_index    = start.min(self.text.len_chars());
+        cursor.preferred_col = None;
+        self.dirty = true;
+    }
+
+    pub fn delete_word_backward(&mut self, cursor: &mut Cursor) {
+        let end = cursor.char_index;
+        if end == 0 { return; }
+        let mut i = end;
+
+        // Skip non-word chars going left
+        while i > 0 && !is_word_char(self.text.char(i - 1)) { i -= 1; }
+        // Skip word chars going left
+        while i > 0 && is_word_char(self.text.char(i - 1)) { i -= 1; }
+
+        if i == end { return; }
+
+        self.text.remove(i..end);
+        cursor.char_index    = i.min(self.text.len_chars());
+        cursor.preferred_col = None;
+        self.dirty = true;
+    }
+
+    pub fn delete_selection(&mut self, cursor: &mut Cursor) {
+        let anchor = match cursor.anchor_char_index {
+            Some(a) => a,
+            None => return,
+        };
+
+        let start = anchor.min(cursor.char_index);
+        let end = anchor.max(cursor.char_index);
+
+        if start != end {
+            self.text.remove(start..end);
+
+            // Move cursor to the start of the deleted range
+            cursor.char_index = start;
+            self.dirty = true;
+        }
+
+        // Always clear selection state
+        cursor.anchor_char_index = None;
+        cursor.preferred_col = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.dirty = true;
+        self.text = Rope::new();
+    }
+
     pub fn move_left(&self, cursor: &mut Cursor) {
         cursor.char_index = cursor.char_index.saturating_sub(1);
         cursor.preferred_col = None;
@@ -238,4 +301,34 @@ impl Buffer {
 
         cursor.char_index = line_start + target_col.min(line_len as u32) as usize;
     }
+
+    pub fn move_word_forward(&self, cursor: &mut Cursor) {
+        let len = self.text.len_chars();
+        let mut i = cursor.char_index;
+
+        // Skip non-word chars
+        while i < len && !is_word_char(self.text.char(i)) { i += 1; }
+        // Skip word chars
+        while i < len && is_word_char(self.text.char(i)) { i += 1; }
+
+        cursor.char_index    = i;
+        cursor.preferred_col = None;
+    }
+
+    pub fn move_word_backward(&self, cursor: &mut Cursor) {
+        let mut i = cursor.char_index;
+
+        // Skip non-word chars going left
+        while i > 0 && !is_word_char(self.text.char(i - 1)) { i -= 1; }
+        // Skip word chars going left
+        while i > 0 && is_word_char(self.text.char(i - 1)) { i -= 1; }
+
+        cursor.char_index    = i;
+        cursor.preferred_col = None;
+    }
+}
+
+#[inline]
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
