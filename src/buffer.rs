@@ -39,7 +39,8 @@ pub struct Buffer {
     pub last_insert: Option<(usize, u32)>, // (char_index, len)
     pub last_delete: Option<(usize, u32)>, // (char_index, len)
 
-    pub lex_scratch: String,
+    pub scratch_space_to_flatten_rope_into: String,
+
     pub visible_tokens: Vec<Token>,
     pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
 }
@@ -61,21 +62,25 @@ impl Buffer {
         cursor.char_index = line_start + col.min(line_len as u32) as usize;
     }
 
+    pub fn flatten_rope_into_scratch(&mut self, start_byte: usize, end_byte: usize) {
+        self.scratch_space_to_flatten_rope_into.clear();
+        for chunk in self.text.slice(self.text.byte_to_char(start_byte)..self.text.byte_to_char(end_byte)).chunks() {
+            self.scratch_space_to_flatten_rope_into.push_str(chunk);
+        }
+    }
+
     pub fn lex_visible(&mut self, start_line: usize, end_line: usize) {
         let start_byte = self.text.try_line_to_byte(start_line).unwrap_or(0);
-        let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes()-1);
+        let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes());
 
         // Determine block comment state at start_line
         let restart_state = self.state_at_byte(start_byte);
 
-        self.lex_scratch.clear();
-        for chunk in self.text.slice(self.text.byte_to_char(start_byte)..self.text.byte_to_char(end_byte)).chunks() {
-            self.lex_scratch.push_str(chunk);
-        }
+        self.flatten_rope_into_scratch(start_byte, end_byte);
 
         self.visible_tokens.clear();
         lex_from(
-            &self.lex_scratch,
+            &self.scratch_space_to_flatten_rope_into,
             start_byte,
             restart_state,
             &mut self.visible_tokens,

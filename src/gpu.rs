@@ -1,7 +1,7 @@
 #![allow(unused, dead_code)]
 
 use crate::color::{GpuColor, Color};
-use crate::{palette, tracy};
+use crate::{Glyph, palette, tracy};
 use crate::util::{format_bytes, px};
 
 use std::ops::Range;
@@ -52,6 +52,19 @@ impl Batch {
 }
 
 pub struct Gpu {
+    pub glyph_scratch: Vec<(GpuGlyph, f32)>,
+
+    pub current_vertex_buffer_capacity: u64,
+    pub batch_pool:     Vec<Batch>,
+    pub batch_count:    usize,
+
+    pub atlas_tex:      wgpu::Texture,
+    pub atlas_cur_x:    u16,
+    pub atlas_cur_y:    u16,
+    pub atlas_row_h:    u16,
+    pub glyphs:         FastHashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
+    pub font:           fontdue::Font,
+
     pub surface:        wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
     pub device:         wgpu::Device,
@@ -62,17 +75,6 @@ pub struct Gpu {
     pub pipeline:       wgpu::RenderPipeline,
     pub bind_group:     wgpu::BindGroup,
     pub vertex_buffer:  wgpu::Buffer,
-
-    pub atlas_tex:      wgpu::Texture,
-    pub atlas_cur_x:    u16,
-    pub atlas_cur_y:    u16,
-    pub atlas_row_h:    u16,
-    pub glyphs:         FastHashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
-    pub font:           fontdue::Font,
-
-    pub current_vertex_buffer_capacity: u64,
-    pub batch_pool:     Vec<Batch>,
-    pub batch_count:    usize,
 }
 
 impl Gpu {
@@ -231,6 +233,8 @@ async fn init_async(window: Arc<Window>) -> Gpu {
         glyphs: FastHashMap::with_capacity_and_hasher(2048, Default::default()),
         current_vertex_buffer_capacity: INITIAL_VERTEX_BUFFER_CAPACITY,
 
+        glyph_scratch: Vec::with_capacity(256),
+
         batch_pool:  vec![Batch::full_window(w as _, h as _)],
         batch_count: 1
     }
@@ -356,32 +360,67 @@ pub fn pop_clip(gpu: &mut Gpu) {
 }
 
 //
+//
 // Draw primitives
 //
+//
 
+/// 4 rects, 24 verts - reserve once for all of them.
+#[inline(always)]
 pub fn draw_rect_outline(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, thickness: f32, color: Color) {
-    draw_rect(gpu, x,           y,           w,         thickness, color); // top
-    draw_rect(gpu, x,           y + h,       w,         thickness, color); // bottom
-    draw_rect(gpu, x,           y,           thickness, h,         color); // left
-    draw_rect(gpu, x + w,       y,           thickness, h,         color); // right
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let color: GpuColor = color.into();
+    let verts  = gpu.verts_mut();
+
+    verts.reserve(24);
+    draw_rect_impl(verts, inv_sw, inv_sh, x,       y,       w,         thickness, color); // Top
+    draw_rect_impl(verts, inv_sw, inv_sh, x,       y + h,   w,         thickness, color); // Bottom
+    draw_rect_impl(verts, inv_sw, inv_sh, x,       y,       thickness, h,         color); // Left
+    draw_rect_impl(verts, inv_sw, inv_sh, x + w,   y,       thickness, h,         color); // Right
 }
 
+/// Primitive rect - caller provides pre-baked reciprocals and verts ref.
+#[inline(always)]
+pub fn draw_rect_impl(
+    verts: &mut Vec<Vert>,
+
+    inv_sw: f32, inv_sh: f32,
+    x: f32, y: f32, w: f32, h: f32,
+
+    color: GpuColor,
+) {
+    let x0 =  x             * inv_sw * 2.0 - 1.0;
+    let x1 = (x + w)        * inv_sw * 2.0 - 1.0;
+    let y0 =  1.0 - y       * inv_sh * 2.0;
+    let y1 =  1.0 - (y + h) * inv_sh * 2.0;
+
+    // uv defaults to [0,0] - zero-uv means solid color.
+    // Reserve once, write raw.
+    verts.reserve(6);
+    let base = verts.len();
+    unsafe {
+        let p = verts.as_mut_ptr().add(base);
+        p.add(0).write(Vert { pos: [x0, y0], uv: [0.0, 0.0], color });
+        p.add(1).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color });
+        p.add(2).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color });
+        p.add(3).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color });
+        p.add(4).write(Vert { pos: [x1, y1], uv: [0.0, 0.0], color });
+        p.add(5).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color });
+        verts.set_len(base + 6);
+    }
+}
+
+/// Convenience wrapper for call sites that still have a &mut Gpu handy.
+#[inline(always)]
 pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
-    let (sw, sh) = (gpu.win_w, gpu.win_h);
-
-    let [x0, y0] = px(x,   y,   sw, sh);
-    let [x1, y1] = px(x+w, y+h, sw, sh);
-
-    let color = color.into();
-    let verts = gpu.verts_mut();
-    verts.push(Vert { pos: [x0, y0], color, ..Default::default() });
-    verts.push(Vert { pos: [x1, y0], color, ..Default::default() });
-    verts.push(Vert { pos: [x0, y1], color, ..Default::default() });
-    verts.push(Vert { pos: [x1, y0], color, ..Default::default() });
-    verts.push(Vert { pos: [x1, y1], color, ..Default::default() });
-    verts.push(Vert { pos: [x0, y1], color, ..Default::default() });
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let color  = color.into();
+    draw_rect_impl(gpu.verts_mut(), inv_sw, inv_sh, x, y, w, h, color);
 }
 
+#[inline(always)]
 pub fn measure_str(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
     s.chars().map(|c| {
         get_glyph(gpu, c, font_size).map(|g| g.advance).unwrap_or(8.0)
@@ -390,46 +429,69 @@ pub fn measure_str(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
 
 // Draw text with a per-character color - pass a closure that maps char index -> color
 pub fn draw_text_colored(
-    gpu: &mut Gpu,
-    text: &str,
-    mut x: f32,
-    y: f32,
-    font_size: f32,
-    color_callback: impl Fn(usize) -> Color // Glyph index -> Color
+    gpu:            &mut Gpu,
+    text:           &str,
+    mut x:          f32,
+    y:              f32,
+    font_size:      f32,
+    color_callback: impl Fn(usize) -> Color,
 ) {
-    let (sw, sh) = (gpu.win_w, gpu.win_h);
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
 
-    let verts = &mut gpu.batch_pool[gpu.batch_count - 1].verts as *mut Vec<Vert>; // @Hack
-
-    for (i, c) in text.chars().enumerate() {
-        let Some(g) = get_glyph(gpu, c, font_size) else {
-            x += 8.0;
-            continue;
+    // Collect glyphs first so we can then hold &mut verts without aliasing.
+    // Stack-allocate for short strings; fall back to a bump on the caller's
+    // stack via a small fixed array. Typical UI strings are <128 chars.
+    // If you have a scratch Vec available on the caller, pass it in instead.
+    gpu.glyph_scratch.clear();
+    for c in text.chars() {
+        let advance = match get_glyph(gpu, c, font_size) {
+            Some(g) => { gpu.glyph_scratch.push((g, x)); g.advance }
+            None    => 8.0,
         };
-
-        if g.w > 0 && g.h > 0 {
-            let gx = (x + g.bearing_x as f32).round();
-            let gy = (y - g.bearing_y as f32 - g.h as f32).round();
-
-            let [x0, y0] = px(gx,              gy,              sw, sh);
-            let [x1, y1] = px(gx + g.w as f32, gy + g.h as f32, sw, sh);
-
-            let (u0, v0) = (g.uv_x            as f32,  g.uv_y           as f32);
-            let (u1, v1) = ((g.uv_x + g.uv_w) as f32, (g.uv_y + g.uv_h) as f32);
-
-            let color: GpuColor = color_callback(i).into();
-
-            let verts = unsafe { &mut *verts };                           // @Hack
-            verts.push(Vert { pos: [x0, y0], uv: [u0, v0], color });
-            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
-            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            verts.push(Vert { pos: [x1, y1], uv: [u1, v1], color });
-            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
-        }
-
-        x += g.advance;
+        x += advance;
     }
+
+    let glyph_scratch: &Vec<(GpuGlyph, f32)> = unsafe { &*(&gpu.glyph_scratch as *const _) }; // @Hack
+
+    let verts = gpu.verts_mut();
+    verts.reserve(glyph_scratch.len() * 6);
+
+    let base = verts.len();
+    let ptr  = unsafe { verts.as_mut_ptr().add(base) };
+    let mut count = 0usize;
+
+    for (i, (g, gx_origin)) in glyph_scratch.iter().enumerate() {
+        if g.w == 0 || g.h == 0 { continue; }
+
+        let gx = (gx_origin + g.bearing_x as f32).round();
+        let gy = (y - g.bearing_y as f32 - g.h as f32).round();
+
+        let x0 =  gx           * inv_sw * 2.0 - 1.0;
+        let x1 = (gx + g.w as f32) * inv_sw * 2.0 - 1.0;
+        let y0 =  1.0 - gy              * inv_sh * 2.0;
+        let y1 =  1.0 - (gy + g.h as f32) * inv_sh * 2.0;
+
+        let u0 =  g.uv_x            as f32;
+        let v0 =  g.uv_y            as f32;
+        let u1 = (g.uv_x + g.uv_w)  as f32;
+        let v1 = (g.uv_y + g.uv_h)  as f32;
+
+        let color: GpuColor = color_callback(i).into();
+
+        unsafe {
+            let v = ptr.add(count);
+            v.add(0).write(Vert { pos: [x0, y0], uv: [u0, v0], color });
+            v.add(1).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            v.add(2).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
+            v.add(3).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            v.add(4).write(Vert { pos: [x1, y1], uv: [u1, v1], color });
+            v.add(5).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
+        }
+        count += 6;
+    }
+
+    unsafe { verts.set_len(base + count); }
 }
 
 // Flat color convenience wrapper
@@ -444,59 +506,84 @@ pub fn draw_text(
     draw_text_colored(gpu, text, x, y, font_size, |_| color);
 }
 
-#[inline]
+// Pre-bake the reciprocal once per frame, pass it in.
+// Caller does: let inv = [1.0 / gpu.win_w, 1.0 / gpu.win_h];
+#[inline(always)]
+fn px_fast(x: f32, y: f32, inv_sw: f32, inv_sh: f32) -> ([f32; 2], [f32; 2]) {
+    // Returns ndc for both (x,y) and (x+w, y+h) isn't needed here -
+    // just inline the two-point conversion with muls instead of divs.
+    (
+        [x * inv_sw * 2.0 - 1.0,  1.0 - y * inv_sh * 2.0],
+        // Unused as separate fn, see below
+        [0.0, 0.0],
+    )
+}
+
 pub fn draw_text_for_editor(
-    gpu: &mut Gpu,
-    glyphs: &[crate::Glyph],
-    mut x: f32,
-    y: f32,
+    verts:    &mut Vec<Vert>,
 
-    is_cursor_line: bool,
-    cursor_col: u32,
-    cursor_color: Color,
-    default_color: Color,
+    inv_sw:   f32,                          // 1.0 / win_w - baked outside the line loop
+    inv_sh:   f32,                          // 1.0 / win_h
+
+    glyphs:   &[Glyph],
+
+    origin_x: f32,
+    y:        f32,
+
+    cursor_col_glyph_index: Option<usize>,  // None = not cursor line
+    cursor_color: GpuColor,
 ) {
-    let (sw, sh) = (gpu.win_w, gpu.win_h);
+    // Reserve once for all glyphs on this line — no growth, no repeated capacity checks.
+    // 6 verts per glyph (two tris).
+    let needed = glyphs.len() * 6;
+    verts.reserve(needed);
 
-    let verts = gpu.verts_mut();
+    // SAFETY: we just reserved exactly `needed` elements above.
+    // We write exactly 6 Verts per non-zero-size glyph, all fields initialized.
+    // We update len once at the end.
+    let base = verts.len();
+    let ptr = unsafe { verts.as_mut_ptr().add(base) };
+    let mut count = 0usize;
 
     for (i, g) in glyphs.iter().enumerate() {
         let gg = g.gpu_glyph;
+        if gg.w == 0 || gg.h == 0 { continue; }
 
-        if gg.w != 0 && gg.h != 0 {
-            let bearing_x = gg.bearing_x as f32;
-            let bearing_y = gg.bearing_y as f32;
-            let gw = gg.w as f32;
-            let gh = gg.h as f32;
+        // x is already the accumulated advance from layout - use g.x directly.
+        let gx = (origin_x + g.x + gg.bearing_x as f32).round();
+        let gy = (y        - gg.bearing_y as f32 - gg.h as f32).round();
+        let gw = gg.w as f32;
+        let gh = gg.h as f32;
 
-            let gx = (x + gg.bearing_x as f32).round();
-            let gy = (y - gg.bearing_y as f32 - gg.h as f32).round();
+        // 4 muls instead of 4 divides for the pixel→NDC conversion.
+        let x0 =  gx           * inv_sw * 2.0 - 1.0;
+        let x1 = (gx + gw)     * inv_sw * 2.0 - 1.0;
+        let y0 =  1.0 - gy           * inv_sh * 2.0;
+        let y1 =  1.0 - (gy + gh)    * inv_sh * 2.0;
 
-            let x1p = gx + gw;
-            let y1p = gy + gh;
+        let u0 =  gg.uv_x            as f32;
+        let v0 =  gg.uv_y            as f32;
+        let u1 = (gg.uv_x + gg.uv_w) as f32;
+        let v1 = (gg.uv_y + gg.uv_h) as f32;
 
-            let [x0, y0] = px(gx,  gy,  sw, sh);
-            let [x1, y1] = px(x1p, y1p, sw, sh);
+        let color: GpuColor = match cursor_col_glyph_index {
+            Some(ci) if ci == i => cursor_color,
+            _                   => g.color.into(),
+        };
 
-            let (u0, v0) = (gg.uv_x             as f32,  gg.uv_y            as f32);
-            let (u1, v1) = ((gg.uv_x + gg.uv_w) as f32, (gg.uv_y + gg.uv_h) as f32);
-
-            let color: GpuColor = if is_cursor_line && i as u32 == cursor_col {
-                cursor_color.into()
-            } else {
-                g.color.into()
-            };
-
-            verts.push(Vert { pos: [x0, y0], uv: [u0, v0], color });
-            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
-            verts.push(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            verts.push(Vert { pos: [x1, y1], uv: [u1, v1], color });
-            verts.push(Vert { pos: [x0, y1], uv: [u0, v1], color });
+        unsafe {
+            let v = ptr.add(count);
+            v.add(0).write(Vert { pos: [x0, y0], uv: [u0, v0], color });
+            v.add(1).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            v.add(2).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
+            v.add(3).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
+            v.add(4).write(Vert { pos: [x1, y1], uv: [u1, v1], color });
+            v.add(5).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
         }
-
-        x += g.advance();
+        count += 6;
     }
+
+    unsafe { verts.set_len(base + count); }
 }
 
 pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {

@@ -54,11 +54,10 @@ macro_rules! checked_reserve {
             if _new_cap != _old_cap {
                 let _elem = vec_element_size(&$vec);
                 eprintln!(
-                    "[{}] grew {} -> {} (len={})",
+                    "[{}] grew {} -> {}",
                     $name,
                     util::format_bytes(_old_cap * _elem),
                     util::format_bytes(_new_cap * _elem),
-                    $vec.len()
                 );
             }
         }
@@ -81,8 +80,8 @@ macro_rules! checked_push {
             $vec.push($val);
             if $vec.capacity() != cap_before {
                 eprintln!(
-                    "[scratch] {} reallocated: {} -> {} (len={})",
-                    $name, cap_before, $vec.capacity(), $vec.len()
+                    "[scratch] {} reallocated: {} -> {}",
+                    $name, cap_before, $vec.capacity()
                 );
             }
         }
@@ -473,10 +472,12 @@ pub struct TextLayout {
 
     pub visible_glyph_count: u32,
 
-    // @Memory @Speed: Reuse these allocations.
-    // Because currently they're being reallocated each frame.
-    pub lines:  Vec<LineLayout>,
-    pub glyphs: Vec<Glyph>
+    //
+    // Recycled each rebuild
+    //
+    pub lines:        Vec<LineLayout>,
+    pub glyphs:       Vec<Glyph>,
+    pub line_offsets: Vec<(usize, usize)>,
 }
 
 impl TextLayout {
@@ -659,23 +660,13 @@ fn build_text_layout(
     let buffer = &editor.buffers[buffer_id];
     let view   = &editor.views[view_id];
 
-    let default_color = token_color(lexer::TokenKind::Default);
-    let tokens        = &buffer.visible_tokens;
-
-    let first_visible_byte = buffer.text.line_to_byte(first_line as usize);
-
-    let mut visible_glyph_count = 0u32;
-
-    let mut line_byte_start = buffer.text.line_to_byte(first_line as usize);
-
-    let mut current_token = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
-
-    let (mut lines, mut glyphs) = if let Some(mut old) = old_layout {
+    let (mut lines, mut glyphs, mut line_offsets) = if let Some(mut old) = old_layout {
         old.lines.clear();
         old.glyphs.clear();
-        (old.lines, old.glyphs)
+        old.line_offsets.clear();
+        (old.lines, old.glyphs, old.line_offsets)
     } else {
-        (Default::default(), Default::default())
+        Default::default()
     };
 
     checked_reserve!(lines,  line_count as usize);
@@ -683,20 +674,71 @@ fn build_text_layout(
 
     //
     //
-    // @Speed: Instead of indirecting into the actual rope in this loop,
+    // Build line-start offset table from lex_scratch
+    //
+    //
+
+    let scratch     = buffer.scratch_space_to_flatten_rope_into.as_bytes();
+    let scratch_str = &buffer.scratch_space_to_flatten_rope_into;
+
+    //
+    // line_offsets[i] = (scratch_relative_start, scratch_relative_end_excl_nl)
+    //
+    checked_reserve!(line_offsets, line_count as usize + 1);
+    {
+        let mut pos = 0usize;
+        let mut collected = 0u32;
+
+        while collected < line_count && pos <= scratch.len() {
+            let remaining = &scratch[pos..];
+            let (line_end_excl_nl, next_pos) = match memchr::memchr(b'\n', remaining) {
+                Some(nl_rel) => (pos + nl_rel, pos + nl_rel + 1),
+                None         => (scratch.len(), scratch.len()),
+            };
+
+            checked_push!(line_offsets, (pos, line_end_excl_nl));
+            pos = next_pos;
+            collected += 1;
+
+            if pos >= scratch.len() { break; }
+        }
+
+        //
+        // Pad with sentinel (empty) entries for lines beyond scratch content
+        // (e.g. requesting past EOF). The loop below handles them gracefully.
+        //
+        while line_offsets.len() < line_count as usize {
+            checked_push!(line_offsets, (scratch.len(), scratch.len()));
+        }
+    }
+
+    //
+    // @Speed:
+    //
+    // Instead of indirecting into the actual rope in this loop,
     // we REALLY wanna reuse the lex_scratch from Buffer,
     // since it's already pre-populated at this point because of the lex_visible call above.
     //
-    //
+
+    let default_color = token_color(lexer::TokenKind::Default);
+    let tokens        = &buffer.visible_tokens;
+
+    // Clamp first_line to actual buffer line count before computing first_visible_byte
+    let total_lines = buffer.text.len_lines() as u32;
+    let first_line_clamped = first_line.min(total_lines.saturating_sub(1));
+    let first_visible_byte = buffer.text.line_to_byte(first_line_clamped as usize);
+
+    let mut visible_glyph_count = 0u32;
+
+    let mut token_cursor = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
 
     for vis_i in 0..line_count {
         let line_index = first_line + vis_i;
-        let Some(rope_line) = buffer.text.get_line(line_index as usize) else { continue };
 
-        let has_nl   = rope_line.len_chars() > 0 && rope_line.char(rope_line.len_chars() - 1) == '\n';
-        let line_len = rope_line.len_bytes().saturating_sub(if has_nl { 1 } else { 0 });
+        let (s_start, s_end) = line_offsets[vis_i as usize];
 
-        let next_byte_start = line_byte_start + rope_line.len_bytes();
+        // Absolute byte offset of this line's start
+        let line_byte_start = first_visible_byte + s_start;
 
         let mut ll = LineLayout {
             buffer_line:     line_index,
@@ -707,35 +749,33 @@ fn build_text_layout(
             line_byte_start,
         };
 
-        if line_len == 0 {
-            line_byte_start = next_byte_start;
+        if s_start == s_end {
             checked_push!(lines, ll);
             continue;
         }
 
-        let mut local_x  = 0.0f32;
-        let mut abs_byte = line_byte_start;
-
-        let mut token_index = current_token;
+        // @Note: This is fine because lex_scratch is valid UTF-8 and s_start/s_end are on char boundaries
+        // because memchr splits on b'\n' which is single-byte.
+        let line_str = &scratch_str[s_start..s_end];
 
         let glyph_start = glyphs.len() as u32;
 
-        for char in rope_line.chars() {
-            if char == '\n' { break; }
+        let mut local_x  = 0.0f32;
+        let mut abs_byte = line_byte_start;
 
-            // Advance token cursor past tokens that end before this byte
-            while token_index < tokens.len() {
-                let t = &tokens[token_index];
-                if (t.start + t.len()) as usize <= abs_byte {
-                    token_index += 1;
-                } else {
-                    break;
-                }
+        for ch in line_str.chars() {
+            //
+            // Advance token cursor past tokens that end before this byte.
+            // Because both tokens and lines are sorted by byte offset,
+            //
+            while token_cursor < tokens.len()
+                && (tokens[token_cursor].start + tokens[token_cursor].len()) as usize <= abs_byte
+            {
+                token_cursor += 1;
             }
 
-            // Color is from current token if it covers this byte, else default
-            let color = if token_index < tokens.len() {
-                let t = &tokens[token_index];
+            let color = if token_cursor < tokens.len() {
+                let t = &tokens[token_cursor];
                 if abs_byte >= t.start as usize && abs_byte < (t.start + t.len()) as usize {
                     token_color(t.kind())
                 } else {
@@ -745,20 +785,15 @@ fn build_text_layout(
                 default_color
             };
 
-            let gpu_glyph = gpu::get_glyph(gpu, char, font_size)
+            let gpu_glyph = gpu::get_glyph(gpu, ch, font_size)
                 .unwrap_or_else(|| gpu::get_glyph(gpu, 'A', font_size).unwrap());
 
             let advance = gpu_glyph.advance;
 
-            checked_push!(glyphs, Glyph {
-                x:         local_x,
-                color,
-                char,
-                gpu_glyph,
-            });
+            checked_push!(glyphs, Glyph { x: local_x, color, char: ch, gpu_glyph });
 
             local_x  += advance;
-            abs_byte += char.len_utf8();
+            abs_byte += ch.len_utf8();
         }
 
         ll.glyph_start = glyph_start;
@@ -766,11 +801,8 @@ fn build_text_layout(
         ll.width = local_x;
 
         visible_glyph_count += ll.glyph_count;
-        line_byte_start = next_byte_start;
 
         checked_push!(lines, ll);
-
-        current_token = token_index;
     }
 
     TextLayout {
@@ -781,6 +813,7 @@ fn build_text_layout(
         glyphs,
         lines,
         visible_glyph_count,
+        line_offsets,
         view_scroll: view.scroll,
         first_buffer_line: first_line,
     }
@@ -825,8 +858,6 @@ fn render_text_layout(
 
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
     let is_this_view_into_query_buffer = lister_query_view_id == view.id;
-
-    let default_color = token_color(lexer::TokenKind::Default);
 
     //
     //
@@ -991,24 +1022,39 @@ fn render_text_layout(
     {
         let _tracy = tracy::span!("render_text_layout::text");
 
-        let cursor_color = palette().cursor_text;
+        // Hoist reciprocals - 2 divides per frame instead of 2 divides per glyph.
+        let inv_sw = 1.0 / gpu.win_w;
+        let inv_sh = 1.0 / gpu.win_h;
+
+        let verts = gpu.verts_mut();
+
+        let cursor_color = palette().cursor_text.into();
 
         for ll in &layout.lines {
             let glyphs = ll.glyphs(&layout.glyphs);
             if glyphs.is_empty() { continue; }
 
             let y = line_y(ll.buffer_line) + line_h;
-            let is_cursor_line = ll.buffer_line == cursor_line;
+
+            let cursor_col_glyph_index = if ll.buffer_line == cursor_line
+                && is_this_view_focused
+                && !is_this_view_into_query_buffer
+                && show_cursor
+            {
+                Some(cursor_col as usize)
+            } else {
+                None
+            };
 
             draw_text_for_editor(
-                gpu,
+                verts,
+                inv_sw,
+                inv_sh,
                 glyphs,
                 origin_x,
                 y,
-                is_cursor_line && is_this_view_focused && !is_this_view_into_query_buffer && show_cursor,
-                cursor_col,
+                cursor_col_glyph_index,
                 cursor_color,
-                default_color,
             );
         }
     }
@@ -1561,6 +1607,8 @@ pub struct Editor {
     pub views:   PrimaryMap<ViewId,   View>,
     pub panels:  PrimaryMap<PanelId,  Panel>,
 
+    pub view_to_panel: FastHashMap<ViewId, PanelId>,
+
     // Which panel is active (receives keyboard input)
     pub active_panel:  PanelId,
 
@@ -1651,10 +1699,15 @@ impl Editor {
             .unwrap()
             .into();
 
+        let mut view_to_panel = FastHashMap::with_capacity_and_hasher(256, Default::default());
+        view_to_panel.insert(root_view, root_panel);
+        view_to_panel.insert(lister_query_view, lister_query_panel);
+
         let mut editor = Self {
             buffers,
             views,
             panels,
+            view_to_panel,
             lister_split_panel,
             lister: Lister::new(),
             last_input_time: Instant::now(),
@@ -1785,17 +1838,8 @@ impl Editor {
     pub fn active_view(&self) -> &View { &self.views[self.active_view_id()] }
     pub fn active_view_mut(&mut self) -> &mut View { let id = self.active_view_id(); &mut self.views[id] }
 
-    pub fn panel_of_view(&self, view_id: ViewId) -> PanelId { // @Speed
-        let mut leaf_panels = Default::default();
-        collect_leaves(self, self.root_panel, &mut leaf_panels);
-
-        for (panel, view, _) in leaf_panels {
-            if view == view_id {
-                return panel;
-            }
-        }
-
-        unreachable!()
+    pub fn panel_of_view(&self, view_id: ViewId) -> PanelId {
+        *self.view_to_panel.get(&view_id).unwrap()
     }
 
     pub fn active_buffer(&self) -> &Buffer {
@@ -1882,6 +1926,9 @@ impl Editor {
         self.views[new_view_id].layout = None;
         self.views[old_view_id].layout = None;
 
+        self.view_to_panel.insert(old_view_id, left_id);
+        self.view_to_panel.insert(new_view_id, right_id);
+
         // Active panel becomes the left child
         self.set_active_panel(left_id);
     }
@@ -1910,6 +1957,10 @@ impl Editor {
         };
 
         let PanelKind::Split(_split) = self.panels[parent].kind else { return };
+
+        if let PanelKind::Leaf { view_id } = self.panels[active_id].kind {
+            self.view_to_panel.remove(&view_id);
+        }
 
         let to_keep_kind = self.panels[to_keep].kind;
         self.panels[parent].kind = to_keep_kind;
@@ -2278,7 +2329,20 @@ fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
     on_confirm(cx, item_data);
 }
 
-fn handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &CommandTable) -> bool {
+/// NOTE: Takes editor by a mutable ref because it uses buffer's scratch space to flatten the rope.
+/// We might want to have a separate version of this function that would iterate the rope instead, but presumably it would be very slow on large files.
+pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer: BufferId) -> std::io::Result<()> { // @Incomplete
+    let buffer = &mut editor.buffers[buffer];
+    if buffer.path.is_none() { return Ok(()) }
+
+    let end_byte = buffer.text.len_bytes();
+    buffer.flatten_rope_into_scratch(0, end_byte);
+    std::fs::write(buffer.path.as_ref().unwrap(), &buffer.scratch_space_to_flatten_rope_into)?;
+
+    Ok(())
+}
+
+fn editor_handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &CommandTable) -> bool {
     if editor.lister.is_open {
         let lister = lister_rect(gpu.win_w, gpu.win_h);
         let (mx, my) = editor.mouse_pos;
@@ -2358,16 +2422,21 @@ fn handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &C
     true
 }
 
-pub fn adjust_cursors_after_mutation(editor: &mut Editor) {
+pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
     //
     // If user has two panels looking into the same buffer,
     // and he mutated the buffer this frame, ensure that
     // all cursors pointed into this buffer visually stay at the same place.
     //
 
+    // @Speed: In the future we kinda wanna maintain a hashmap of BufferId -> Edit,
+    // but iterating all buffers isn't that slow since they're completely flat.
+
     let _tracy = tracy::span!("adjust_cursors_after_mutation");
 
     let active_view_id = editor.active_view_id();
+
+    let mut adjusted: SmallVec<[ViewId; 24]> = SmallVec::new();
 
     for (buffer_id, buffer) in editor.buffers.iter_mut() {
         if let Some((at, len)) = buffer.last_insert.take() {
@@ -2377,6 +2446,7 @@ pub fn adjust_cursors_after_mutation(editor: &mut Editor) {
 
                 if view.cursor.char_index > at {
                     view.cursor.char_index += len as usize;
+                    adjusted.push(vid);
                 }
 
                 if let Some(a) = view.cursor.anchor_char_index {
@@ -2392,12 +2462,35 @@ pub fn adjust_cursors_after_mutation(editor: &mut Editor) {
 
                 if view.cursor.char_index > at {
                     view.cursor.char_index = view.cursor.char_index.saturating_sub(len as usize).max(at);
+                    adjusted.push(vid);
                 }
 
                 if let Some(a) = view.cursor.anchor_char_index {
                     if a > at { view.cursor.anchor_char_index = Some(a.saturating_sub(len as usize).max(at)); }
                 }
             }
+        }
+    }
+
+    let mut leaves = Default::default();
+    collect_leaves(editor, editor.root_panel, &mut leaves);
+
+    for vid in adjusted {
+        let Some(&panel_id) = editor.view_to_panel.get(&vid) else { continue };
+        let rect = editor.panels[panel_id].rect;
+
+        let (view, buf) = editor.view_and_buffer(vid);
+        let (line, col) = buf.cursor_line_col(&view.cursor);
+
+        editor.views[vid].cursor_target_line = line;
+        editor.views[vid].cursor_target_col  = col;
+        editor.snap_cursor_to_target(vid, line, col, rect);
+
+        // Force anim y in case the line wasn't in the layout
+        let line_h = editor.line_h();
+        if let Some(layout) = &editor.views[vid].layout {
+            let target_y = layout.rect.y + line as f32 * line_h - editor.views[vid].scroll_anim;
+            editor.views[vid].cursor_anim_y = target_y;
         }
     }
 }
@@ -2642,7 +2735,7 @@ impl ApplicationHandler for App {
                         };
                         editor.lister.is_query_dirty = true;
                         editor.lister.rebuild_filtered();
-                        editor.lister.is_query_dirty = true; // nocheckin
+                        editor.lister.is_query_dirty = true; // nocheckin @DocumentThis
                     }
 
                     win.request_redraw();
@@ -2762,7 +2855,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 editor.show_cursor(win);
 
-                if handle_left_mouse_click(editor, gpu, &self.command_table) {
+                if editor_handle_left_mouse_click(editor, gpu, &self.command_table) {
                     win.request_redraw();
                 }
 
@@ -2802,7 +2895,7 @@ impl ApplicationHandler for App {
                 }
 
                 if editor.mouse_left_pressed {
-                    if handle_left_mouse_click(editor, gpu, &self.command_table) {
+                    if editor_handle_left_mouse_click(editor, gpu, &self.command_table) {
                         win.request_redraw();
                     }
                 }

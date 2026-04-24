@@ -7,7 +7,7 @@ use smallstr::SmallString;
 use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{BufferId, Editor, ListerItem, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, adjust_cursors_after_mutation, buffer::Buffer, collect_leaves, director::EntryKind, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
+use crate::{BufferId, Editor, ListerItem, Panel, PanelId, PanelKind, PanelSplit, Rect, SCALE_STEP, View, ViewId, adjust_cursors_after_buffer_mutation, buffer::Buffer, collect_leaves, director::EntryKind, editor_save_buffer_onto_disk, force_layouts_from_all_views_to_rebuild, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut Editor,
@@ -20,7 +20,7 @@ pub struct CommandContext<'a> {
 
 impl<'a> CommandContext<'a> {
     pub fn finish(&mut self) {
-        adjust_cursors_after_mutation(self.editor);
+        adjust_cursors_after_buffer_mutation(self.editor);
         scroll_to_cursor(self.editor);
         self.editor.reset_blink();
     }
@@ -173,7 +173,7 @@ command!(delete_backward |cx| {
         }
     }
 
-    // 3. Default: Just a normal character backspace
+    // Default: Just a normal character backspace
     buf.delete_backward(&mut view.cursor);
 });
 
@@ -301,6 +301,11 @@ command!(cycle_buffers_right |cx| {
     let buffer_id = cx.editor.next_buffer();
     cx.editor.active_view_mut().switch_buffer(buffer_id);
     cx.editor.mru_focus(buffer_id); // @Refactor
+});
+
+command!(write_buffer_to_disk |cx| {
+    let buffer_id = cx.editor.active_view().buffer_id;
+    editor_save_buffer_onto_disk(cx.editor, buffer_id);
 });
 
 fn lister_item_list_from_command_table(cx: &CommandContext) -> Vec<ListerItem> {
@@ -441,6 +446,7 @@ command!(open_file |cx| {
                 }
                 cx.editor.lister.is_query_dirty = true;
                 cx.editor.lister.rebuild_filtered();
+                cx.editor.lister.is_query_dirty = true; // nocheckin @DocumentThis
             }
 
             if !cx.editor.lister.is_query_dirty { return false; } // Nothing changed, bail early
