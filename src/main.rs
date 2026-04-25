@@ -15,6 +15,7 @@ mod tracy;
 mod director;
 mod lexer;
 
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,7 @@ use std::collections::VecDeque;
 use buffer::{Buffer, Cursor};
 use color::Color;
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
+use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap};
 use director::Director;
 use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
@@ -1128,6 +1130,8 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
     let list_y  = py + input_h + sep;
     let list_h  = ph - input_h - sep;
 
+    let is_mouse_cursor_hidden = editor.is_cursor_visible;
+
     editor.lister.item_h = item_h;
     editor.lister.list_h = list_h;
 
@@ -1162,8 +1166,9 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
 
     for slot in 0..visible {
         let index      = first + slot;
-        let Some(&item_index) = editor.lister.filtered.get(index) else { break };
-        let item     = &editor.lister.items[item_index as usize];
+        let Some(&item_index) = editor.lister.filtered.get(index)            else { break };
+        let Some(item)        = editor.lister.items.get(item_index as usize) else { break };
+
         let iy       = list_y + slot as f32 * item_h - frac;
 
         let is_selected = index == editor.lister.selected_index as usize;
@@ -1177,7 +1182,7 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
         }
 
 
-        if is_hovered && !is_selected {
+        if is_mouse_cursor_hidden && is_hovered && !is_selected {
             gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(60, 45, 15, 120));
         }
 
@@ -1273,8 +1278,9 @@ pub struct ViewState {
 
 #[derive(Clone, Debug)]
 pub struct View {
-    pub id:        ViewId,
+    pub        id: ViewId,
     pub buffer_id: BufferId,
+    pub  panel_id: PanelId,
 
     pub scroll:        f32,  // Target scroll (set instantly on any scroll event)
     pub scroll_anim:   f32,  // Animated scroll (what actually gets rendered)
@@ -1298,12 +1304,22 @@ impl View {
             cursor_anim_x: 0.0, cursor_anim_y: 0.0, scroll_anim: 0.0,
             cursor_target_line: 0,
             cursor_target_col: 0,
-            per_buffer: Default::default()
+            per_buffer: Default::default(),
+            panel_id: PanelId::reserved_value()  // Set on first layout
         }
     }
 
     pub fn new(id: ViewId, buffer_id: BufferId) -> Self {
         Self::new_with_scroll(id, buffer_id, 0.0)
+    }
+
+    #[inline]
+    pub fn panel_id(&self) -> Option<PanelId> {
+        if self.panel_id.is_reserved_value() {
+            return None;
+        }
+
+        Some(self.panel_id)
     }
 
     #[inline]
@@ -1607,7 +1623,7 @@ pub struct Editor {
     pub views:   PrimaryMap<ViewId,   View>,
     pub panels:  PrimaryMap<PanelId,  Panel>,
 
-    pub view_to_panel: FastHashMap<ViewId, PanelId>,
+    pub canonicalized_path_to_buffer_id: FastHashMap<Arc<Path>, BufferId>,
 
     // Which panel is active (receives keyboard input)
     pub active_panel:  PanelId,
@@ -1639,9 +1655,6 @@ pub struct Editor {
     lister_query_panel:  PanelId, // @Redundant?
     lister_split_panel:  PanelId,
 
-    pub canonicalized_current_working_directory: SmallString<[u8; 64]>,
-    pub canonicalized_last_scanned_directory:    SmallString<[u8; 64]>,
-
     pub last_input_time: Instant,
 
     pub frame_count:     u32,
@@ -1656,6 +1669,9 @@ pub struct Editor {
     pub relex_us:        f32,
     pub build_us:        f32,
     pub render_us:       f32,
+
+    pub canonicalized_current_working_directory: SmallString<[u8; 256]>,
+    pub canonicalized_last_scanned_directory:    SmallString<[u8; 256]>,
 
     pub lister:          Lister,
     pub director:        Director
@@ -1699,16 +1715,18 @@ impl Editor {
             .unwrap()
             .into();
 
-        let mut view_to_panel = FastHashMap::with_capacity_and_hasher(256, Default::default());
-        view_to_panel.insert(root_view, root_panel);
-        view_to_panel.insert(lister_query_view, lister_query_panel);
+        views[root_view]        .panel_id = root_panel;
+        views[lister_query_view].panel_id = lister_query_panel;
+
+        let mut canonicalized_path_to_buffer_id = FastHashMap::with_capacity_and_hasher(128, Default::default());
+        canonicalized_path_to_buffer_id.insert(buffers[root_buffer].path.clone().unwrap().into(), root_buffer);  // @Clone
 
         let mut editor = Self {
             buffers,
             views,
             panels,
-            view_to_panel,
             lister_split_panel,
+            canonicalized_path_to_buffer_id,
             lister: Lister::new(),
             last_input_time: Instant::now(),
             last_cursor_visible: false,
@@ -1839,7 +1857,7 @@ impl Editor {
     pub fn active_view_mut(&mut self) -> &mut View { let id = self.active_view_id(); &mut self.views[id] }
 
     pub fn panel_of_view(&self, view_id: ViewId) -> PanelId {
-        *self.view_to_panel.get(&view_id).unwrap()
+        self.views[view_id].panel_id
     }
 
     pub fn active_buffer(&self) -> &Buffer {
@@ -1863,7 +1881,6 @@ impl Editor {
     fn layout_panel(&mut self, id: PanelId, rect: Rect) {
         self.panels[id].rect = rect;
 
-        // Collect split info without holding borrow
         let split = match self.panels[id].kind {
             PanelKind::Split(s) => s,
             PanelKind::ListerSplit => return,
@@ -1926,8 +1943,8 @@ impl Editor {
         self.views[new_view_id].layout = None;
         self.views[old_view_id].layout = None;
 
-        self.view_to_panel.insert(old_view_id, left_id);
-        self.view_to_panel.insert(new_view_id, right_id);
+        self.views[new_view_id].panel_id = right_id;
+        self.views[old_view_id].panel_id = left_id;
 
         // Active panel becomes the left child
         self.set_active_panel(left_id);
@@ -1959,7 +1976,7 @@ impl Editor {
         let PanelKind::Split(_split) = self.panels[parent].kind else { return };
 
         if let PanelKind::Leaf { view_id } = self.panels[active_id].kind {
-            self.view_to_panel.remove(&view_id);
+            self.views[view_id].panel_id = PanelId::reserved_value();
         }
 
         let to_keep_kind = self.panels[to_keep].kind;
@@ -2319,25 +2336,36 @@ const fn lister_rect(win_w: f32, win_h: f32) -> Rect {
 
 fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
     let index = cx.editor.lister.selected_index;
-    let index = cx.editor.lister.filtered[index as usize];
-    let item_data = cx.editor.lister.items[index as usize].data;
+    let Some(index) = cx.editor.lister.filtered.get(index as usize) else { return };
+    let item_data = cx.editor.lister.items[*index as usize].data;
 
-    let on_confirm = cx.editor.lister.on_confirm.pop().unwrap();
+    let Some(on_confirm) = cx.editor.lister.on_confirm.pop()        else { return };
+
     cx.editor.lister.pending_datas.push(item_data);
     _ = cx.editor.lister.items_update_frame_update_callback.pop();
     cx.editor.lister.set_selected_index_to_1_instead_of_0 = false;
+
     on_confirm(cx, item_data);
 }
 
-/// NOTE: Takes editor by a mutable ref because it uses buffer's scratch space to flatten the rope.
-/// We might want to have a separate version of this function that would iterate the rope instead, but presumably it would be very slow on large files.
-pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer: BufferId) -> std::io::Result<()> { // @Incomplete
-    let buffer = &mut editor.buffers[buffer];
-    if buffer.path.is_none() { return Ok(()) }
+//
+// @Note @Speed: We might want to somehow parallelize this for very slow hard drives,
+// but besides from that, saving a 100mb file on my cheap ass SSD wasn't that slow at all.
+//
+pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) -> std::io::Result<()> {
+    let buffer = &editor.buffers[buffer_id];
+    let Some(path) = buffer.path.as_ref() else { return Ok(()) };
 
-    let end_byte = buffer.text.len_bytes();
-    buffer.flatten_rope_into_scratch(0, end_byte);
-    std::fs::write(buffer.path.as_ref().unwrap(), &buffer.scratch_space_to_flatten_rope_into)?;
+    let tmp_path = path.with_extension("tmp");
+    let mut f = BufWriter::new(std::fs::File::create(&tmp_path)?);
+    for chunk in buffer.text.chunks() {
+        f.write(chunk.as_bytes())?;
+    }
+
+    f.flush()?;
+    drop(f);
+
+    std::fs::rename(&tmp_path, path)?;
 
     Ok(())
 }
@@ -2476,7 +2504,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
     collect_leaves(editor, editor.root_panel, &mut leaves);
 
     for vid in adjusted {
-        let Some(&panel_id) = editor.view_to_panel.get(&vid) else { continue };
+        let Some(panel_id) = editor.views[vid].panel_id() else { continue };
         let rect = editor.panels[panel_id].rect;
 
         let (view, buf) = editor.view_and_buffer(vid);
@@ -2530,6 +2558,8 @@ pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl In
 
     let buffer_id = editor.buffers.push(buffer);
     editor.mru_register_new_buffer(buffer_id);
+
+    editor.canonicalized_path_to_buffer_id.insert(editor.buffers[buffer_id].path.clone().unwrap().into(), buffer_id);  // @Clone
 
     editor.views[view].switch_buffer(buffer_id);
     editor.mru_focus(buffer_id); // @Refactor
@@ -2588,7 +2618,7 @@ impl ApplicationHandler for App {
 
         let mut editor = Editor::new(buffer);
         editor.layout_panels(Rect::full(w as f32, h as f32));
-        editor.director.kick_scan(PathBuf::from("."), false);
+        editor.director.kick_scan(PathBuf::from("."), true, true, false);
 
         let mut gpu = gpu::init(Arc::clone(&win));
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
@@ -2916,9 +2946,6 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 tracy_client::frame_mark();
-
-                // Poll directory cache results
-                editor.director.poll();
 
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);

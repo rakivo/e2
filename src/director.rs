@@ -3,22 +3,41 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use parking_lot::{Mutex, Condvar};
+use crossbeam_channel::{Receiver, Sender};
+use smallvec::SmallVec;
 use wgpu::naga::FastHashMap;
+
+const CHUNK_SIZE: usize = 64;  // @Tune
+
+type Queue = Arc<(Mutex<Vec<ScanRequest>>, Condvar)>;
+
+const MAX_ENTRIES_PER_DIR_IF_ITS_NOT_A_USER_INITIATED_SCAN: usize = 500;
+
+const SKIP_DIRS: &[&str] = &[
+    "node_modules", "target", ".git", ".hg", ".svn",
+    "vendor", "dist", "build", "__pycache__", ".cache",
+    ".npm", ".cargo", "venv", ".venv", "env",
+];
+
+fn should_skip_dir(name: &str) -> bool {
+    name.starts_with('.') || SKIP_DIRS.contains(&name)  // @Speed
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EntryKind {
-    File,
-    Dir,
+    File = 0,
+    Dir  = 1,
 }
 
 #[derive(Debug)]
 pub struct CachedDir {
-    pub entries:      DirEntries,
-    pub scanned_at:   SystemTime,    // When we last scanned
-    pub mtime:        SystemTime,    // Dir mtime at scan time
-    pub inode:        u64,
-    pub state:        ScanState,
+    pub entries:    DirEntries,
+    pub scanned_at: SystemTime,
+    pub mtime:      SystemTime,
+    pub inode:      u64,
+    pub state:      ScanState,
 }
 
 impl Deref for CachedDir {
@@ -36,94 +55,221 @@ pub enum ScanState {
     Failed,
 }
 
-// Flat storage same as before
+const RESERVED_BIT_COUNT_FOR_ENTRY_KIND: usize = 3;
+
+const ENTRY_KIND_MASK:                   u16   = 0b1110_0000_0000_0000;
+const ENTRY_NAME_LEN_MASK:               u16   = !ENTRY_KIND_MASK;
+const ENTRY_NAME_LEN_SHIFT:              usize = size_of_val(&ENTRY_KIND_MASK)*8 - RESERVED_BIT_COUNT_FOR_ENTRY_KIND;
+
+const _: () = assert!(ENTRY_KIND_MASK.count_ones()      == RESERVED_BIT_COUNT_FOR_ENTRY_KIND as u32);
+const _: () = assert!(ENTRY_NAME_LEN_MASK.count_zeros() == RESERVED_BIT_COUNT_FOR_ENTRY_KIND as u32);
+
+#[derive(Debug, Clone, Copy)]
+pub struct DirEntryData {
+    pub name_start:    u32,
+    pub path_start:    u32,
+    pub kind_name_len: u16,
+    pub path_len:      u16,
+}
+
+impl DirEntryData {
+    #[inline]
+    pub const fn new(name_start: u32, name_len: u16, path_start: u32, path_len: u16, kind: EntryKind) -> Self {
+        Self {
+            name_start,
+            path_start,
+            kind_name_len: (name_len & ENTRY_NAME_LEN_MASK) | ((kind as u16) << ENTRY_NAME_LEN_SHIFT),
+            path_len,
+        }
+    }
+
+    #[inline]
+    pub const fn kind(&self) -> EntryKind {
+        match self.kind_name_len >> ENTRY_NAME_LEN_SHIFT {
+            0 => EntryKind::File,
+            1 => EntryKind::Dir,
+            _ => EntryKind::File,  // Reserved
+        }
+    }
+
+    #[inline]
+    pub const fn name_len(&self) -> usize {
+        (self.kind_name_len & ENTRY_NAME_LEN_MASK) as usize
+    }
+
+    #[inline]
+    pub const fn path_len(&self) -> usize {
+        self.path_len as usize
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DirEntries {
-    pub generation:   u64,
+    pub generation: u64,
 
-    pub blob:         String,
-    pub name_starts:  Vec<u32>,
-    pub name_lens:    Vec<u32>,
-    pub path_starts:  Vec<u32>,
-    pub path_lens:    Vec<u32>,
-    pub kinds:        Vec<EntryKind>,
-    pub inodes:       Vec<u64>,       // For invalidation
+    pub blob:     String,
+
+    pub entries:  Vec<DirEntryData>,
 }
 
 impl DirEntries {
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = DirEntry<'_>> {
-        (0..self.name_starts.len()).map(|i| DirEntry {
-            name:  &self.blob[self.name_starts[i] as usize..][..self.name_lens[i] as usize],
-            path:  &self.blob[self.path_starts[i] as usize..][..self.path_lens[i] as usize],
-            kind:  self.kinds[i],
-            inode: self.inodes[i],
+        self.entries.iter().map(|entry| {
+            DirEntry {
+                name: &self.blob[entry.name_start as usize..][..entry.name_len()],
+                path: &self.blob[entry.path_start as usize..][..entry.path_len()],
+                kind: entry.kind()
+            }
         })
+    }
+
+    #[inline] pub fn len(&self)      -> usize { self.entries.len() }
+    #[inline] pub fn is_empty(&self) -> bool  { self.len() == 0 }
+
+    #[inline]
+    fn append_chunk(&mut self, mut chunk: DirEntries) {
+        let blob_offset = self.blob.len() as u32;
+        self.blob.push_str(&chunk.blob);
+
+        let mut chunk_entries = core::mem::take(&mut chunk.entries);
+        for entry in chunk_entries.iter_mut() {
+            entry.name_start = entry.name_start + blob_offset;
+            entry.path_start = entry.path_start + blob_offset;
+        }
+
+        self.entries.extend(chunk_entries);
     }
 }
 
 pub struct DirEntry<'a> {
-    pub name:  &'a str,
-    pub path:  &'a str,
-    pub kind:  EntryKind,
-    pub inode: u64,
+    pub name: &'a str,
+    pub path: &'a str,
+    pub kind: EntryKind,
 }
 
 struct ScanRequest {
-    pub path:       Arc<Path>,
-    pub generation: u64,
-    pub recursive:  bool,
+    path:       Arc<Path>,
+
+    generation: u64,
+
+    is_recursive:      bool,
+    is_user_initiated: bool,
 }
 
-struct ScanResult {
-    pub path:       Arc<Path>,
-    pub entries:    DirEntries,
-    pub mtime:      SystemTime,
-    pub inode:      u64,
-    pub generation: u64,
-    pub error:      Option<std::io::Error>,
+struct ScanChunk {
+    path:       Arc<Path>,
+    entries:    DirEntries,
+    mtime:      SystemTime,
+    inode:      u64,
+    generation: u64,
+    is_done:    bool,
+
+    error:      Option<std::io::Error>,
 }
 
 pub struct Director {
-    // Keyed by canonical path
     pub entries: FastHashMap<Arc<Path>, CachedDir>,
-
-    // Background scan results
-    receiver: std::sync::mpsc::Receiver<ScanResult>,
-    sender:   std::sync::mpsc::SyncSender<ScanRequest>,
+    receiver:    Receiver<ScanChunk>,
+    queue:       Queue,
 }
 
 impl Director {
     pub fn new() -> Self {
-        let (req_tx, req_rx) = std::sync::mpsc::sync_channel::<ScanRequest>(8);
-        let (res_tx, res_rx) = std::sync::mpsc::sync_channel::<ScanResult>(8);
+        let queue: Queue = Default::default();
+        let queue_worker = queue.clone();
 
-        // Worker thread - processes scan requests
+        let (res_tx, res_rx) = crossbeam_channel::bounded(CHUNK_SIZE);
+
         std::thread::spawn(move || {
-            while let Ok(req) = req_rx.recv() {
-                let result = do_scan(req.path, req.recursive, req.generation);
-                _ = res_tx.try_send(result);
+            loop {
+                let req = {
+                    let (lock, cvar) = &*queue_worker;
+                    let mut q = lock.lock();
+                    cvar.wait_while(&mut q, |q| q.is_empty());
+
+                    //
+                    // Always take the newest request, discard the rest
+                    //
+
+                    let n = q.len() - 1;
+                    q.drain(..n).for_each(drop);
+                    q.pop().unwrap()
+                };
+
+                do_scan(req.path, req.is_recursive, req.is_user_initiated, req.generation, &res_tx);
             }
         });
 
         Self {
             entries:  FastHashMap::default(),
             receiver: res_rx,
-            sender:   req_tx,
+            queue,
         }
+    }
+
+    /// Drain completed chunks - call once per frame.
+    /// Returns true if anything changed (caller should rebuild filtered list).
+    pub fn poll(&mut self) -> bool {
+        let mut any_new = false;
+
+        while let Ok(chunk) = self.receiver.try_recv() {
+            let entry = self.entries.entry(chunk.path.clone()).or_insert_with(|| CachedDir {
+                entries:    DirEntries { generation: chunk.generation, ..Default::default() },
+                scanned_at: SystemTime::now(),
+                mtime:      chunk.mtime,
+                inode:      chunk.inode,
+                state:      ScanState::Scanning,
+            });
+
+            //
+            // Discard chunks from cancelled/superseded scans
+            //
+            if chunk.generation < entry.generation { continue }
+
+            if let Some(e) = chunk.error {
+                eprintln!("scan error for {:?}: {}", chunk.path, e);
+                entry.state = ScanState::Failed;
+                any_new = true;
+                continue;
+            }
+
+            //
+            // First chunk for this generation - clear old entries
+            //
+            if entry.entries.generation != chunk.generation {
+                entry.entries = DirEntries { generation: chunk.generation, ..Default::default() };
+            }
+
+            entry.entries.append_chunk(chunk.entries);
+
+            if chunk.is_done {
+                entry.mtime      = chunk.mtime;
+                entry.inode      = chunk.inode;
+                entry.scanned_at = SystemTime::now();
+                entry.state      = ScanState::Ready;
+            }
+
+            any_new = true;
+        }
+
+        any_new
     }
 
     /// Get entries for a path. Returns cached data if valid, kicks scan if stale/missing.
     /// Never blocks - returns None if not yet ready.
+    #[inline]
     pub fn get(&mut self, path: &Path) -> Option<&DirEntries> {
         let needs_scan = match self.entries.get(path) {
-            None => true,
+            None         => true,
             Some(cached) => {
-                cached.state != ScanState::Scanning && self.is_stale(path, cached)
+                cached.state != ScanState::Scanning
+                    && cached.scanned_at.elapsed().unwrap_or_default().as_secs_f32() > 1.0
             }
         };
 
         if needs_scan {
-            self.kick_scan(path, false);
+            self.kick_scan(path, false, false, true);
         }
 
         self.entries.get(path)
@@ -131,79 +277,17 @@ impl Director {
             .map(|c| &c.entries)
     }
 
-    /// Force invalidate a specific path (e.g. after a file save)
-    pub fn invalidate(&mut self, path: &Path) {
-        if let Some(cached) = self.entries.get_mut(path) {
-            cached.state = ScanState::Scanning;
-            self.kick_scan(path.to_path_buf(), false);
-        }
-    }
-
-    fn is_stale(&self, path: &Path, cached: &CachedDir) -> bool {
-        //
-        // Don't bother checking more than once per second
-        //
-        if cached.scanned_at.elapsed().unwrap_or_default().as_secs_f32() < 1.0 {
-            return false;
-        }
-
-        match std::fs::metadata(path) {  // @SlowFileSystem
-            Err(_) => true, // Path removed
-
-            Ok(meta) => {
-                // Inode changed = replaced entirely
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if meta.ino() != cached.inode { return true; }
-                }
-
-                // Mtime changed = contents changed
-                meta.modified().map(|m| m != cached.mtime).unwrap_or(true)
-            }
-        }
-    }
-
-    /// Call once per frame - integrates completed scans
-    pub fn poll(&mut self) {
-        while let Ok(result) = self.receiver.try_recv() {
-            let entry = self.entries.entry(result.path.clone()).or_insert_with(|| CachedDir { // @Clone
-                entries:    DirEntries { generation: result.generation, ..Default::default() },
-                scanned_at: SystemTime::now(),
-                mtime:      result.mtime,
-                inode:      result.inode,
-                state:      ScanState::Ready,
-            });
-
-            //
-            // Only apply if this is newer than what we have
-            //
-            if result.generation >= entry.generation {
-                if let Some(e) = result.error {
-                    eprintln!("scan error for {:?}: {}", result.path, e);
-                    entry.state = ScanState::Failed;
-                } else {
-                    entry.entries    = result.entries;
-                    entry.mtime      = result.mtime;
-                    entry.inode      = result.inode;
-                    entry.scanned_at = SystemTime::now();
-                    entry.state      = ScanState::Ready;
-                    entry.generation = result.generation;
-                }
-            }
-        }
-    }
-
-    pub fn kick_scan(&mut self, path: impl Into<Arc<Path>>, recursive: bool) {
+    pub fn kick_scan(
+        &mut self,
+        path: impl Into<Arc<Path>>,
+        is_recursive: bool, is_high_priority: bool, is_user_initiated: bool
+    ) {
         let path = path.into();
 
         let generation = self.entries.get(&path)
             .map(|c| c.generation + 1)
             .unwrap_or(0);
 
-        //
-        // Mark as scanning so we don't kick again next frame
-        //
         self.entries.entry(path.clone()).or_insert_with(|| CachedDir {
             entries:    DirEntries { generation, ..Default::default() },
             scanned_at: SystemTime::UNIX_EPOCH,
@@ -212,22 +296,51 @@ impl Director {
             state:      ScanState::Scanning,
         }).state = ScanState::Scanning;
 
-        _ = self.sender.try_send(ScanRequest { path, generation, recursive });
+        let (lock, cvar) = &*self.queue;
+        let mut q = lock.lock();
+        if is_high_priority {
+            //
+            // High priority: displace everything, go first
+            //
+            q.clear();
+            q.push(ScanRequest { path, generation, is_recursive, is_user_initiated });
+        } else {
+            //
+            // Low priority: only queue if nothing else is pending
+            //
+            if q.is_empty() {
+                q.push(ScanRequest { path, generation, is_recursive, is_user_initiated });
+            }
+        }
+
+        cvar.notify_one();
     }
 }
 
-fn do_scan(path: impl Into<Arc<Path>>, recursive: bool, generation: u64) -> ScanResult {
-    let path = path.into();
+fn do_scan(
+    path:           Arc<Path>,
 
+    recursive:      bool,
+    user_initiated: bool,
+
+    generation:     u64,
+
+    tx:             &Sender<ScanChunk>,
+) {
     let meta = match std::fs::metadata(&path) {
-        Err(e) => return ScanResult {
-            path,
-            entries: DirEntries::default(),
-            mtime: SystemTime::UNIX_EPOCH,
-            inode: 0,
-            generation,
-            error: Some(e),
-        },
+        Err(e) => {
+            _ = tx.try_send(ScanChunk {
+                path,
+                entries:    DirEntries::default(),
+                mtime:      SystemTime::UNIX_EPOCH,
+                inode:      0,
+                generation,
+                is_done:    true,
+                error:      Some(e),
+            });
+
+            return;
+        }
 
         Ok(m) => m,
     };
@@ -239,48 +352,77 @@ fn do_scan(path: impl Into<Arc<Path>>, recursive: bool, generation: u64) -> Scan
 
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-    let mut entries = DirEntries::default();
-    let mut stack: Vec<Arc<Path>> = vec![path.clone()]; // @Clone
+    let mut stack = SmallVec::<[_; 4]>::with_capacity(1);
+    stack.push((path.clone(), 0));
 
-    while let Some(dir) = stack.pop() { // @Incomplete
+    while let Some((dir, depth)) = stack.pop() {
         let Ok(read_dir) = std::fs::read_dir(&dir) else { continue };
+
+        let mut chunk        = DirEntries::default();
+        let mut entry_count  = 0usize;
+
         for entry in read_dir.flatten() {
-            let Ok(ft)   = entry.file_type()                               else { continue };
-            let Ok(meta) = entry.metadata()                                else { continue };
-            let path     = entry.path();
-            let Some(path_str) = path.to_str()                             else { continue };
-            let Some(name_str) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Ok(ft) = entry.file_type()                              else { continue };
 
-            if name_str.starts_with('.')                                        { continue }
-            if matches!(name_str, "target" | "node_modules" | ".git")           { continue }
+            let p = entry.path();
+            let Some(path_str) = p.to_str()                             else { continue };
+            let Some(name_str) = p.file_name().and_then(|n| n.to_str()) else { continue };
 
-            #[cfg(unix)]
-            let inode = { use std::os::unix::fs::MetadataExt; meta.ino() };
-            #[cfg(not(unix))]
-            let inode = 0u64;
+            if should_skip_dir(name_str)                                     { continue };
+
+            entry_count += 1;
+            if user_initiated && entry_count > MAX_ENTRIES_PER_DIR_IF_ITS_NOT_A_USER_INITIATED_SCAN {
+                //
+                // Directory is huge - emit what we have and don't recurse into it.
+                // (Only if the search isn't user initiated)
+                //
+
+                break;
+            }
 
             let kind = if ft.is_dir() { EntryKind::Dir } else { EntryKind::File };
 
-            let name_start = entries.blob.len() as u32;
-            entries.blob.push_str(name_str);
-            let name_len = entries.blob.len() as u32 - name_start;
+            let name_start = chunk.blob.len() as u32;
+            chunk.blob.push_str(name_str);
+            let name_len = chunk.blob.len() as u32 - name_start;
 
-            let path_start = entries.blob.len() as u32;
-            entries.blob.push_str(path_str);
-            let path_len = entries.blob.len() as u32 - path_start;
+            let path_start = chunk.blob.len() as u32;
+            chunk.blob.push_str(path_str);
+            let path_len = chunk.blob.len() as u32 - path_start;
 
-            entries.name_starts.push(name_start);
-            entries.name_lens.push(name_len);
-            entries.path_starts.push(path_start);
-            entries.path_lens.push(path_len);
-            entries.kinds.push(kind);
-            entries.inodes.push(inode);
+            chunk.entries.push(DirEntryData::new(name_start, name_len as _, path_start, path_len as _, kind));
 
+            //
+            // Queue subdirs for recursion if not too deep and not skipped
+            //
             if recursive && kind == EntryKind::Dir {
-                stack.push(path.into_boxed_path().into());
+                stack.push((p.into_boxed_path().into(), depth + 1));
+            }
+
+            if chunk.len() >= CHUNK_SIZE {
+                _ = tx.try_send(ScanChunk {
+                    path:    path.clone(),
+                    entries: std::mem::take(&mut chunk),
+                    mtime,
+                    inode,
+                    generation,
+                    is_done:    false,
+                    error:   None,
+                });
             }
         }
-    }
 
-    ScanResult { path, entries, mtime, inode, generation, error: None }
+        let is_done = stack.is_empty();
+        if !chunk.is_empty() || is_done {
+            _ = tx.try_send(ScanChunk {
+                path:    path.clone(),
+                entries: chunk,
+                mtime,
+                inode,
+                generation,
+                is_done,
+                error:   None,
+            });
+        }
+    }
 }
