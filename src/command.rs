@@ -1,6 +1,6 @@
 #![allow(unused, dead_code)]
 
-use std::{hash::Hash, ops::Deref, path::{Path, PathBuf}};
+use std::{hash::Hash, ops::Deref, path::{MAIN_SEPARATOR, Path, PathBuf}};
 
 use cranelift_entity::EntityRef;
 use smallstr::SmallString;
@@ -134,12 +134,16 @@ command!(delete_forward |cx| {
 });
 
 command!(delete_backward |cx| {
+    //
     // Identify if we are in a path query
+    //
     let is_lister_buffer = cx.editor.active_view().buffer_id == cx.editor.lister_query_buffer;
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
+    //
     // If there's a selection, always just delete the selection
+    //
     if view.cursor.anchor_char_index.is_some() {
         buf.delete_selection(&mut view.cursor);
         return;
@@ -151,21 +155,21 @@ command!(delete_backward |cx| {
     if is_lister_buffer {
         let char_to_left = buf.text.char(cursor_pos - 1);
 
-        if char_to_left == '/' {
+        if char_to_left == MAIN_SEPARATOR {
+            //
             // We are at a slash (e.g., "~/Documents/|").
             // We want to delete "Documents/" so we end at "~/".
+            //
 
             // Start the deletion range at the current cursor
             let mut target_start = cursor_pos - 1;
 
-            // Iterate backward from the character before the current slash
             let iter = buf.text.chars_at(cursor_pos - 1).reversed();
             for c in iter {
-                if c == '/' { break; } // Stop when we hit the parent slash
+                if c == MAIN_SEPARATOR { break; }
                 target_start -= 1;
             }
 
-            // Select from current position back to the parent slash and delete
             view.cursor.anchor_char_index = Some(cursor_pos);
             view.cursor.char_index = target_start;
             buf.delete_selection(&mut view.cursor);
@@ -424,7 +428,7 @@ command!(open_file |cx| {
             {
                 let path: &Path = path.as_str().as_ref();
                 if let Ok(canon) = path.canonicalize()
-                && let Some(&old_buffer_id) = cx.editor.canonicalized_path_to_buffer_id.get(path)
+                && let Some(&old_buffer_id) = cx.editor.canonicalized_path_to_buffer_id.get(canon.as_path())
                 {
                     cx.editor.active_view_mut().switch_buffer(old_buffer_id);
                     cx.editor.mru_focus(old_buffer_id); // @Refactor
@@ -435,7 +439,9 @@ command!(open_file |cx| {
             let Ok(new_buffer) = Buffer::from_file(path.as_str().as_ref()) else { return };
 
             let new_buffer_id = cx.editor.buffers.push(new_buffer);
-            cx.editor.canonicalized_path_to_buffer_id.insert(cx.editor.buffers[new_buffer_id].path.clone().unwrap().into(), new_buffer_id);  // @Clone @Refactor
+            if let Some(canon) = cx.editor.buffers[new_buffer_id].path.clone().and_then(|p| p.canonicalize().ok()) {
+                cx.editor.canonicalized_path_to_buffer_id.insert(canon.into() , new_buffer_id);  // @Clone @Refactor
+            }
             cx.editor.mru_register_new_buffer(new_buffer_id);
             cx.editor.active_view_mut().switch_buffer(new_buffer_id);
             cx.editor.mru_focus(new_buffer_id); // @Refactor
@@ -472,7 +478,7 @@ command!(open_file |cx| {
             let query_path = display_to_path(cx.editor.lister.query.as_str()); // @Clone
             let query_path: &Path = query_path.as_ref();
 
-            let candidate = if cx.editor.lister.query.chars().last() == Some('/') {
+            let candidate = if cx.editor.lister.query.chars().last() == Some(MAIN_SEPARATOR) {
                 query_path.to_path_buf()
             } else {
                 query_path.parent()
@@ -485,7 +491,7 @@ command!(open_file |cx| {
             let last_scanned: &Path = cx.editor.canonicalized_last_scanned_directory.as_str().as_ref();
 
             let dir_to_scan = if candidate != last_scanned {
-                std::fs::canonicalize(&candidate).unwrap_or(candidate)  // @SlowFileSystem
+                candidate.canonicalize().unwrap_or(candidate)  // @SlowFileSystem
             } else {
                 last_scanned.to_path_buf()
             };
@@ -531,7 +537,7 @@ command!(open_file |cx| {
     let start_dir = cx.editor.buffers[cx.editor.active_view().buffer_id].path
         .as_deref()
         .and_then(|p| p.parent())
-        .and_then(|p| std::fs::canonicalize(p).ok())  // @SlowFileSystem
+        .and_then(|p| p.canonicalize().ok())  // @SlowFileSystem
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| cx.editor.canonicalized_current_working_directory.as_str().to_owned());
 
@@ -539,7 +545,7 @@ command!(open_file |cx| {
 
     // Pre-fill query with current working directory
     let mut display_path = path_to_display(&start_dir);
-    if !display_path.ends_with('/') { display_path.push('/'); }
+    if !display_path.ends_with(MAIN_SEPARATOR) { display_path.push(MAIN_SEPARATOR); }
     cx.editor.buffers[cx.editor.lister_query_buffer].clear();
     cx.editor.buffers[cx.editor.lister_query_buffer].insert_literal(
         &display_path,

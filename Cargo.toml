@@ -32,6 +32,9 @@ rustc-edit-distance = "0.1.0"
 mimalloc = { version = "=0.1.47", optional = true }
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
+dirs = "6.0.0"
+memmap2 = "0.9.10"
+ctrlc = "3.5.2"
 
 [profile.release]
 debug = 1

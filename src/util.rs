@@ -1,6 +1,6 @@
 #![allow(unused, dead_code)]
 
-use std::{borrow::Cow, fmt::Display};
+use std::{borrow::Cow, fmt::Display, path::MAIN_SEPARATOR};
 
 #[inline]
 pub fn format_bytes(bytes: usize) -> String {
@@ -40,7 +40,7 @@ pub fn display_path<'a>(path: &'a str, max_chars: usize) -> Cow<'a, str> {
 
     // find a slash after the cut point so we don't break mid-component
     let cut = path.len() - max_chars + 1; // +1 for the ellipsis char
-    if let Some(slash) = path[cut..].find('/') {
+    if let Some(slash) = path[cut..].find(MAIN_SEPARATOR) {
         format!("…{}", &path[cut + slash..]).into()
     } else {
         format!("…{}", &path[path.len() - max_chars + 1..]).into()

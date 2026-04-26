@@ -1,3 +1,33 @@
+#![feature(likely_unlikely)]
+
+// TODO: Paste animation continuation threshold
+
+// TODO: Talk to system clipboard
+
+// TODO: Mouse double left click should select the word
+
+// TODO: Multi-cursors
+
+// TODO: Undo+redo
+// TODO: mark-sexp
+// TODO: move-line
+// TODO: backward-list/forward-list
+// TODO: backward-list/forward-list
+// TODO: beginning-of-defun/end-of-defun
+
+// TODO: Auto-indentation (minor)
+// TODO: Automatic session save
+
+// TODO: Lexer support for HERE strings
+// TODO: Lexer support for raw  strings
+
+// TODO: Lexing is buggy with large strings
+// For instance: if we only see the closing quote and the opening quote is off the screen,
+// currently it just highlights as if the closing quote was an opening one.
+// `
+// But the actual reliable solution to this would involve going back/forward into the file,
+// searching for a matching quote with a "state machine".
+
 #[cfg(feature = "dhat")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -14,26 +44,30 @@ mod command;
 mod tracy;
 mod director;
 mod lexer;
+mod session;
+
+use lexer::token_color;
+use util::format_bytes;
+use session::{apply_session, default_session_path, load_session, save_session};
 
 use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::fmt::Write as _;
 use std::collections::VecDeque;
 
 use buffer::{AnimatedInsertion, Buffer, Cursor};
-use color::Color;
+use color::{Color, GpuColor};
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap};
 use director::Director;
 use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
-use lexer::token_color;
 
+use memmap2::MmapOptions;
 use smallstr::SmallString;
 use smallvec::SmallVec;
-use util::format_bytes;
 use wgpu::naga::FastHashMap;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -345,7 +379,7 @@ pub struct Glyph {
 
     pub byte_offset: u32, // Absolute byte offset into buffer
 
-    pub color:     Color,
+    pub color:     GpuColor,
     pub char:      char,
 
     pub gpu_glyph: GpuGlyph
@@ -549,10 +583,13 @@ fn rebuild_text_layout(
     let view = &editor.views[view_id];
     let buffer_id = view.buffer_id;
 
-    let should_snap = view.layout.as_ref().map(|l| {
+    let mut should_snap = view.layout.as_ref().map(|l| {
         (l.rect.w - rect.w).abs() > 0.5
             || (l.rect.h - rect.h).abs() > 0.5
     }).unwrap_or(true); // true = first build
+
+    let should_snap_cursor_anim_to_buffer = view.cursor_anim_y.is_nan(); // @Note: See View::new and animate()
+    should_snap |= should_snap_cursor_anim_to_buffer;
 
     let t0 = Instant::now();
     let mut layout = build_text_layout(
@@ -563,15 +600,23 @@ fn rebuild_text_layout(
     );
     editor.build_us_acc += t0.elapsed().as_micros() as f32;
 
-    layout_update_currently_animated_insertion_ids(&mut layout, &editor.buffers[buffer_id].currently_animated_insertions);
+    layout_update_currently_animated_insertions(
+        &mut layout,
+        &editor.buffers[buffer_id].currently_animated_insertions
+    );
 
     editor.views[view_id].layout = Some(layout);
 
     if should_snap {
-        let (cl, cc) = (
-            editor.views[view_id].cursor_target_line,
-            editor.views[view_id].cursor_target_col,
-        );
+        let (cl, cc) = if should_snap_cursor_anim_to_buffer {
+            let view = &editor.views[view_id];
+            editor.buffers[view.buffer_id].cursor_line_col(&view.cursor)
+        } else {
+            (
+                editor.views[view_id].cursor_target_line,
+                editor.views[view_id].cursor_target_col,
+            )
+        };
 
         editor.snap_cursor_to_target(view_id, cl, cc, rect);
     }
@@ -651,7 +696,6 @@ fn build_text_layout(
     };
 
     checked_reserve!(lines,  line_count as usize);
-    checked_reserve!(glyphs, line_count as usize * 80);
 
     //
     //
@@ -661,6 +705,9 @@ fn build_text_layout(
 
     let scratch     = buffer.scratch_space_to_flatten_rope_into.as_bytes();
     let scratch_str = &buffer.scratch_space_to_flatten_rope_into;
+
+    let approximate_glyph_count = scratch_str.len();
+    checked_reserve!(glyphs, approximate_glyph_count);  // @Tune
 
     //
     // line_offsets[i] = (scratch_relative_start, scratch_relative_end_excl_nl)
@@ -764,7 +811,7 @@ fn build_text_layout(
                 }
             } else {
                 default_color
-            };
+            }.into();
 
             let gpu_glyph = gpu::get_glyph(gpu, ch, font_size)
                 .unwrap_or_else(|| gpu::get_glyph(gpu, 'A', font_size).unwrap());
@@ -785,6 +832,11 @@ fn build_text_layout(
 
         checked_push!(lines, ll);
     }
+
+    // :Metrics
+    // let actual_glyph_count = glyphs.len();
+    // println!("[Approximated glyph count]: {approximate_glyph_count}");
+    // println!("[Actual       glyph count]: {actual_glyph_count}");
 
     TextLayout {
         buffer_id,
@@ -862,7 +914,7 @@ fn render_text_layout(
 
             for line_index in draw_start..=draw_end {
                 let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
-                let y = line_y(line_index) + cursor_h;
+                let y = line_y(line_index) + cursor_h + scale*2.0;
 
                 let (x0, x1) = if start_line == end_line {
                     (layout.x_for_col(origin_x, start_col, ll), layout.x_for_col(origin_x, end_col, ll))
@@ -1015,9 +1067,9 @@ fn render_text_layout(
         let highlight = palette().paste_highlight.into();
 
         // Precompute insertion ts
-        let mut insertion_ts = [1.0f32; PASTE_ANIMATION_MAX_ID];
+        let mut insertion_ts = [1.0f32; PASTE_ANIMATION_MAX_ID + 1]; // [0] = 1.0 sentinel
         for a in buffer.currently_animated_insertions.iter() {
-            insertion_ts[a.id as usize - 1] = a.t;
+            insertion_ts[a.id as usize] = a.t; // a.id is 1-based, fits in [1..=PASTE_ANIMATION_MAX_ID]
         }
 
         for ll in &layout.lines {
@@ -1238,6 +1290,7 @@ cranelift_entity::entity_impl!(ViewId);
 
 pub const PANEL_NONE: PanelId = PanelId(u32::MAX-1);
 pub const  VIEW_MAIN: ViewId  = ViewId(0);
+pub const  ROOT_BUFFER: BufferId  = BufferId(0);
 
 #[derive(Clone, Copy, Debug)]
 pub struct PanelSplit {
@@ -1293,9 +1346,10 @@ impl View {
     pub fn new_with_scroll(id: ViewId, buffer_id: BufferId, scroll: f32) -> Self {
         Self {
             id, buffer_id, scroll, cursor: Cursor::new(), layout: None,
-            cursor_anim_x: 0.0, cursor_anim_y: 0.0, scroll_anim: 0.0,
-            cursor_target_line: 0,
-            cursor_target_col: 0,
+            cursor_anim_x: f32::NAN,
+            cursor_anim_y: f32::NAN,
+            cursor_target_line: 0, cursor_target_col: 0,
+            scroll_anim: 0.0,
             per_buffer: Default::default(),
             panel_id: PanelId::reserved_value()  // Set on first layout
         }
@@ -1466,7 +1520,7 @@ impl Lister {
             // (the part after the last /)
 
             let after_last_slash = self.query.as_str()
-                .rsplit('/')
+                .rsplit(MAIN_SEPARATOR)
                 .next()
                 .unwrap_or(self.query.as_str());
 
@@ -1487,20 +1541,22 @@ impl Lister {
             return;
         }
 
-        // Filter by subsequence
-        // Then score by edit distance on matched items only for sorting
+        //
+        // Filter by subsequence,
+        // then score by edit distance on matched items only for sorting
+        //
         self.scoring_scratch.clear();
         self.scoring_scratch.extend(self.items.iter()
             .enumerate()
             .filter(|(_, item)| Self::fuzzy_match(&item.label, filter_str))
             .map(|(i, item)| {
-                // Score: edit distance between query and best substring of label
-                // Use a large limit since we already know it's a subsequence match
                 let score = rustc_edit_distance::edit_distance_with_substrings(
                     filter_str,
                     &item.label,
-                    filter_str.len() * 3, // nocheckin
+                    // Use a large limit since we already know it's a subsequence match
+                    filter_str.len() * 3,
                 ).unwrap_or(usize::MAX);
+
                 (i as u32, score as u32)
             }));
 
@@ -1517,6 +1573,7 @@ impl Lister {
                 qc = match qchars.next() { Some(c) => c, None => return true };
             }
         }
+
         false
     }
 
@@ -1670,33 +1727,41 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(buffer: Buffer) -> Self {
+    pub fn new() -> Self {
         let mut buffers = PrimaryMap::with_capacity(32);
         let mut views   = PrimaryMap::with_capacity(32);
         let mut panels  = PrimaryMap::with_capacity(32);
 
-        let root_buffer = buffers.push(buffer);
-        let root_view   = views.next_key();  views.push(View::new(root_view, root_buffer));
-        let root_panel  = panels.next_key(); panels.push(Panel {
-            id:   root_panel,
-            rect: Rect::default(),  // Set on first resize / resumed
-            kind: PanelKind::Leaf { view_id: root_view },
-        });
-
+        // Reserve the fixed slots that always exist.
+        // These indices are stable — session restore adds on top of them.
         let lister_query_buffer = buffers.push(Buffer::new());
-        let lister_query_view   = views.next_key();  views.push(View::new(lister_query_view, lister_query_buffer));
-        let lister_query_panel  = panels.next_key(); panels.push(Panel {
+        let lister_query_view   = views.next_key();
+        views.push(View::new(lister_query_view, lister_query_buffer));
+        let lister_query_panel  = panels.next_key();
+        panels.push(Panel {
             id:   lister_query_panel,
-            rect: Rect::default(),  // Set on first resize / resumed
+            rect: Rect::default(),
             kind: PanelKind::Leaf { view_id: lister_query_view },
         });
-
         let lister_split_panel = panels.next_key();
         panels.push(Panel {
-            id: lister_split_panel,
-            rect: Rect::default(),  // Set on first resize / resumed
-            kind: PanelKind::ListerSplit
+            id:   lister_split_panel,
+            rect: Rect::default(),
+            kind: PanelKind::ListerSplit,
         });
+
+        // Placeholder root - will be replaced by apply_session or open_initial_buffer.
+        // We need something here so root_panel is a valid key.
+        let scratch_buffer = buffers.push(Buffer::new());
+        let scratch_view   = views.next_key();
+        views.push(View::new(scratch_view, scratch_buffer));
+        let root_panel = panels.next_key();
+        panels.push(Panel {
+            id:   root_panel,
+            rect: Rect::default(),
+            kind: PanelKind::Leaf { view_id: scratch_view },
+        });
+        views[scratch_view].panel_id = root_panel;
 
         let canonicalized_current_working_directory: SmallString<[_; _]> = std::env::args().nth(1)
             .and_then(|p| Path::new(&p).parent().map(|p| p.to_path_buf()))
@@ -1707,11 +1772,9 @@ impl Editor {
             .unwrap()
             .into();
 
-        views[root_view]        .panel_id = root_panel;
         views[lister_query_view].panel_id = lister_query_panel;
 
-        let mut canonicalized_path_to_buffer_id = FastHashMap::with_capacity_and_hasher(128, Default::default());
-        canonicalized_path_to_buffer_id.insert(buffers[root_buffer].path.clone().unwrap().into(), root_buffer);  // @Clone
+        let canonicalized_path_to_buffer_id = FastHashMap::with_capacity_and_hasher(128, Default::default());
 
         let mut editor = Self {
             buffers,
@@ -1751,7 +1814,23 @@ impl Editor {
             director: Director::new()
         };
 
-        editor.mru_register_new_buffer(root_buffer);
+        //
+        // Try to restore session first
+        //
+        let session_path = &default_session_path();
+        let _restored = if let Ok(file)      = std::fs::File::open(session_path)
+                        && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
+                        && let Some(session) = load_session(&mmap[..])
+        {
+            apply_session(&mut editor, session);
+            true
+        } else {
+            false
+        };
+
+        // Open the file from argv if user provided it
+        open_initial_buffer(&mut editor);
+
         editor
     }
 
@@ -2113,7 +2192,7 @@ const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
 const PASTE_ANIMATION_MASK:     u64   = (1 << PASTE_ANIMATION_BITS) - 1;   // 0b1111
 const PASTE_ANIMATION_MAX_ID:   usize = PASTE_ANIMATION_MASK as usize;     // 15
 
-pub fn layout_update_currently_animated_insertion_ids(layout: &mut TextLayout, insertions: &[AnimatedInsertion]) {
+pub fn layout_update_currently_animated_insertions(layout: &mut TextLayout, insertions: &[AnimatedInsertion]) {
     layout.glyph_insertion_ids.clear();
     if insertions.is_empty() { return; }
 
@@ -2186,12 +2265,15 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
             let target_y = layout.rect.y + cursor_line as f32 * line_h - view.scroll_anim;
 
             let dy = target_y - view.cursor_anim_y;
-
-            if dy.abs() > layout.rect.h {
+            if view.cursor_anim_y.is_nan() {  // @Redundant
+                // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
+            } else if dy.abs() > layout.rect.h {
                 view.cursor_anim_y = target_y;
+
             } else if dy.abs() > epsilon {
                 view.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
                 still_animating = true;
+
             } else {
                 view.cursor_anim_y = target_y;
             }
@@ -2218,7 +2300,7 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
     }
 
     //
-    // Blink the cursor
+    // Lister smooth scrolling
     //
     let ds = editor.lister.scroll - editor.lister.scroll_anim;
     if ds.abs() > epsilon {
@@ -2536,7 +2618,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
 
     let active_view_id = editor.active_view_id();
 
-    let mut adjusted: SmallVec<[ViewId; 24]> = SmallVec::new();
+    let mut adjusted_views: SmallVec<[ViewId; 24]> = SmallVec::new();
 
     for (buffer_id, buffer) in editor.buffers.iter_mut() {
         if let Some((at, len)) = buffer.last_insert.take() {
@@ -2546,7 +2628,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
 
                 if view.cursor.char_index > at {
                     view.cursor.char_index += len as usize;
-                    adjusted.push(vid);
+                    adjusted_views.push(vid);
                 }
 
                 if let Some(a) = view.cursor.anchor_char_index {
@@ -2562,7 +2644,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
 
                 if view.cursor.char_index > at {
                     view.cursor.char_index = view.cursor.char_index.saturating_sub(len as usize).max(at);
-                    adjusted.push(vid);
+                    adjusted_views.push(vid);
                 }
 
                 if let Some(a) = view.cursor.anchor_char_index {
@@ -2575,22 +2657,23 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
     let mut leaves = Default::default();
     collect_leaves(editor, editor.root_panel, &mut leaves);
 
-    for vid in adjusted {
-        let Some(panel_id) = editor.views[vid].panel_id() else { continue };
+    for view_id in adjusted_views {
+        let Some(panel_id) = editor.views[view_id].panel_id() else { continue };
         let rect = editor.panels[panel_id].rect;
 
-        let (view, buf) = editor.view_and_buffer(vid);
+        let (view, buf) = editor.view_and_buffer(view_id);
+
         let (line, col) = buf.cursor_line_col(&view.cursor);
 
-        editor.views[vid].cursor_target_line = line;
-        editor.views[vid].cursor_target_col  = col;
-        editor.snap_cursor_to_target(vid, line, col, rect);
+        editor.views[view_id].cursor_target_line = line;
+        editor.views[view_id].cursor_target_col  = col;
+        editor.snap_cursor_to_target(view_id, line, col, rect);
 
         // Force anim y in case the line wasn't in the layout
         let line_h = editor.line_h();
-        if let Some(layout) = &editor.views[vid].layout {
-            let target_y = layout.rect.y + line as f32 * line_h - editor.views[vid].scroll_anim;
-            editor.views[vid].cursor_anim_y = target_y;
+        if let Some(layout) = &editor.views[view_id].layout {
+            let target_y = layout.rect.y + line as f32 * line_h - editor.views[view_id].scroll_anim;
+            editor.views[view_id].cursor_anim_y = target_y;
         }
     }
 }
@@ -2660,6 +2743,47 @@ pub fn does_panel_need_rebuild(
     }).unwrap_or(true)
 }
 
+fn open_initial_buffer(editor: &mut Editor) {
+    let path = std::env::args().nth(1).map(|p| PathBuf::from(p));
+
+    let canon = path.as_deref().and_then(|p| p.canonicalize().ok());
+
+    if let Some(canon) = &canon
+    && let Some(&old_buffer_id) = editor.canonicalized_path_to_buffer_id.get(canon.as_path())
+    {
+        //
+        // If this buffer is already opened, just switch onto it.
+        //
+        editor.active_view_mut().switch_buffer(old_buffer_id);
+        editor.mru_focus(old_buffer_id); // @Refactor
+        return;
+    }
+
+    let buffer = path.as_deref()
+        .and_then(|p| Buffer::from_file(p).ok())
+        .unwrap_or_else(Buffer::new);
+
+    let buffer_id  = editor.buffers.push(buffer);
+    editor.mru_register_new_buffer(buffer_id);
+
+    let view_id = editor.views.next_key();
+    editor.views.push(View::new(view_id, buffer_id));
+
+    let panel_id = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   panel_id,
+        rect: Rect::default(),
+        kind: PanelKind::Leaf { view_id },
+    });
+    editor.views[view_id].panel_id = panel_id;
+    editor.root_panel   = panel_id;
+    editor.active_panel = panel_id;
+
+    if let Some(p) = canon {
+        editor.canonicalized_path_to_buffer_id.insert(p.into(), buffer_id);
+    }
+}
+
 #[derive(Default)]
 struct App {
     gpu:    Option<Gpu>,
@@ -2674,7 +2798,11 @@ struct App {
     keymap: Keymap,
 }
 
-impl ApplicationHandler for App {
+enum UserEvent {
+    ExitRequested,
+}
+
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let win: Arc<_> = el.create_window(
             Window::default_attributes()
@@ -2685,10 +2813,7 @@ impl ApplicationHandler for App {
         let size = win.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
-        let path   = std::env::args().nth(1).expect("usage: naysayer <file>");
-        let buffer = Buffer::from_file(path.as_ref()).expect("failed to open file");
-
-        let mut editor = Editor::new(buffer);
+        let mut editor = Editor::new();
         editor.layout_panels(Rect::full(w as f32, h as f32));
         editor.director.kick_scan(PathBuf::from("."), true, true, false);
 
@@ -2713,16 +2838,24 @@ impl ApplicationHandler for App {
         let since_input = editor.last_input_time.elapsed().as_millis();
 
         if since_input < BLINK_START_DELAY_MS {
+            //
             // Waiting to start blinking - wake up when delay expires
+            //
             let ms_until = BLINK_START_DELAY_MS - since_input;
             el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + std::time::Duration::from_millis(ms_until as u64)
+                Instant::now() + Duration::from_millis(ms_until as u64)
             ));
+
         } else if since_input > BLINK_STOP_IDLE_MS {
+            //
             // Idle too long - just wait for input
+            //
             el.set_control_flow(ControlFlow::Wait);
+
         } else {
+            //
             // Actively blinking - wake up at next blink transition
+            //
             let elapsed = editor.blink_epoch.elapsed().as_millis();
             let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
             let phase   = elapsed % cycle;
@@ -2731,10 +2864,26 @@ impl ApplicationHandler for App {
             } else {
                 cycle - phase
             };
+
             el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + std::time::Duration::from_millis(ms_until as u64)
+                Instant::now() + Duration::from_millis(ms_until as u64)
             ));
+
             win.request_redraw();
+        }
+    }
+
+    fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::ExitRequested => {
+                el.exit();
+            }
+        }
+    }
+
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let Some(editor) = &self.editor {
+            _ = save_session(editor, &default_session_path());
         }
     }
 
@@ -2744,8 +2893,7 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let (Some(gpu), Some(editor), Some(win)) =
-            (&mut self.gpu, &mut self.editor, &self.window) else { return };
+        let (Some(gpu), Some(editor), Some(win)) = (&mut self.gpu, &mut self.editor, &self.window) else { return };
 
         let ctrl  = self.mods.state().control_key();
         let shift = self.mods.state().shift_key();
@@ -3218,8 +3366,13 @@ impl ApplicationHandler for App {
 fn main() {
     let _client = tracy_client::Client::start();
 
-    let el = EventLoop::new().unwrap();
+    let el = EventLoop::<UserEvent>::with_user_event().build().unwrap();
     el.set_control_flow(ControlFlow::Wait);
+
+    let proxy = el.create_proxy();
+    ctrlc::set_handler(move || {
+        _ = proxy.send_event(UserEvent::ExitRequested);
+    }).unwrap();
 
     let command_table = CommandTable::from_inventory();
     let keymap = Keymap::default_keymap();

@@ -1,3 +1,5 @@
+use std::path::MAIN_SEPARATOR;
+
 use crate::color::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,7 +93,7 @@ static CHAR_CLASSES: [u8; 256] = {
             table[i] = C_ALPHA;
         } else if b.is_ascii_digit() {
             table[i] = C_DIGIT;
-        } else if b == b'/' {
+        } else if b == MAIN_SEPARATOR as u8 {
             table[i] = C_SLASH;
         } else if b == b'"' {
             table[i] = C_QUOTE;
@@ -141,7 +143,7 @@ pub fn lex_from(
         while i < len {
             if let Some(next_star) = memchr::memchr(b'*', &bytes[i..]) {
                 i += next_star;
-                if i + 1 < len && bytes[i + 1] == b'/' {
+                if i + 1 < len && bytes[i + 1] == MAIN_SEPARATOR as u8 {
                     i += 2;
                     cur_state = LexState::Normal;
                     push!(TokenKind::Comment, start, i);
@@ -263,7 +265,7 @@ pub fn lex_from(
 
             C_SLASH => {
                 if i + 1 < len {
-                    if bytes[i+1] == b'/' { // Line comment
+                    if bytes[i+1] == MAIN_SEPARATOR as u8 { // Line comment
                         i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |pos| i + pos);
                         push!(TokenKind::Comment, start, i);
                     } else if bytes[i+1] == b'*' { // Block comment
@@ -273,7 +275,7 @@ pub fn lex_from(
                         while i < len {
                             if let Some(pos) = memchr::memchr(b'*', &bytes[i..]) {
                                 i += pos + 1;
-                                if i < len && bytes[i] == b'/' {
+                                if i < len && bytes[i] == MAIN_SEPARATOR as u8 {
                                     i += 1;
                                     closed = true;
                                     push!(TokenKind::Comment, start, i);

@@ -35,7 +35,7 @@ pub struct AnimatedInsertion {
     pub byte_start: usize,
     pub byte_len:   u32,
     pub t:          f32,   // 0.0 = just inserted (bright), 1.0 = fully faded
-    pub id:         u8,   // stable, never reused within a session (or wrap at 15)
+    pub id:         u8,    // stable, never reused within a session (or wrap at 15)
 }
 
 #[derive(Default)]
@@ -45,8 +45,8 @@ pub struct Buffer {
 
     pub is_dirty: bool,
 
-    pub last_insert: Option<(usize, u32)>, // (char_index, len)
-    pub last_delete: Option<(usize, u32)>, // (char_index, len)
+    pub last_insert: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
+    pub last_delete: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
 
     pub scratch_space_to_flatten_rope_into: String,
 
@@ -73,11 +73,44 @@ impl Buffer {
     }
 
     pub fn append_last_insertion_to_currently_animated_insertions(&mut self) {
-        if let Some((byte_start, byte_len)) = self.last_insert {
-            let id = self.next_insertion_id;
-            self.next_insertion_id = (id % PASTE_ANIMATION_MAX_ID as u8) + 1; // stays in 1..=MAX_ID
-            self.currently_animated_insertions.push(AnimatedInsertion { byte_len, byte_start, t: 0.0, id });
+        let Some((char_start, byte_len)) = self.last_insert else { return };
+
+        let byte_start = self.text.char_to_byte(char_start);
+        let byte_end   = byte_start + byte_len as usize;
+
+        //
+        // Check for overlap with existing animations and merge
+        //
+        for existing in &mut self.currently_animated_insertions {
+            let ex_end = existing.byte_start + existing.byte_len as usize;
+            let overlaps = byte_start <= ex_end && byte_end >= existing.byte_start;
+            if overlaps {
+                let merged_start = existing.byte_start.min(byte_start);
+                let merged_end   = ex_end.max(byte_end);
+                existing.byte_start = merged_start;
+                existing.byte_len   = (merged_end - merged_start) as u32;
+                existing.t          = 0.0;  // Restart the animation
+            }
         }
+
+        // @Robustness: No overlap - add new entry, evict oldest if full
+        if self.currently_animated_insertions.len() == PASTE_ANIMATION_MAX_ID {
+            self.currently_animated_insertions.remove(0);
+            // Rebase ids since we shifted
+            for (i, a) in self.currently_animated_insertions.iter_mut().enumerate() {
+                a.id = (i + 1) as u8;
+            }
+            self.next_insertion_id = self.currently_animated_insertions.len() as u8 + 1;
+        }
+
+        let id = self.next_insertion_id;
+        self.next_insertion_id = (self.next_insertion_id % PASTE_ANIMATION_MAX_ID as u8) + 1;
+        self.currently_animated_insertions.push(AnimatedInsertion {
+            byte_start,
+            byte_len,
+            t: 0.0,
+            id,
+        });
     }
 
     pub fn set_cursor_line_col(&self, line: u32, col: u32, cursor: &mut Cursor) {
@@ -189,8 +222,6 @@ impl Buffer {
         let idx = cursor.char_index.min(self.text.len_chars());
         self.invalidate_cache_from_char(idx);
 
-        let len = l.chars().count();
-
         for c in l.chars() {
             let idx = cursor.char_index.min(self.text.len_chars());
             self.text.insert_char(idx, c);
@@ -199,6 +230,7 @@ impl Buffer {
         }
 
         self.is_dirty = true;
+        let len: u32 = l.chars().map(|c| c.len_utf8() as u32).sum();
         self.last_insert = Some((idx, len as u32));
     }
 

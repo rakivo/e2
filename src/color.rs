@@ -48,17 +48,17 @@ impl Into<wgpu::Color> for Color {
 }
 
 impl Color {
-    #[inline]
-    pub fn into_gpu(self) -> GpuColor {
+    #[inline(always)]
+    pub const fn into_gpu(self) -> GpuColor {
         GpuColor::rgba(self.r, self.g, self.b, self.a)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn hsv(h: f32, s: f32, v: f32) -> Self {
         GpuColor::hsv(h, s, v).into()
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn hex(rgb: u32) -> Self {
         let r = ((rgb >> 16) & 0xff) as u8;
         let g = ((rgb >>  8) & 0xff) as u8;
@@ -66,7 +66,7 @@ impl Color {
         Self::rgba(r, g, b, 255)
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Color { r, g, b, a }
     }
@@ -150,7 +150,7 @@ impl Default for GpuColor {
 }
 
 impl GpuColor {
-    #[inline]
+    #[inline(always)]
     pub const fn into_color(self) -> Color {
         Color {
             r: (self.0[0] * 255.0) as _,
@@ -160,12 +160,12 @@ impl GpuColor {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0])
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn hsv(h: f32, s: f32, v: f32) -> Self {
         let i = (h * 6.0) as u32;
         let f = h * 6.0 - i as f32;
