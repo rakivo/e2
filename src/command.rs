@@ -355,20 +355,55 @@ command!(open_command_lister |cx| {
     });
 });
 
-command!(paste_yarson_test |cx| {
+command!(paste |cx| {
+    let Some(clipboard) = cx.editor.get_clipboard() else {
+        return;
+    };
+
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
-    buf.insert_literal("\
-command!(open_command_lister |cx| {
-    let items = lister_item_list_from_command_table(cx);
-    cx.editor.lister.is_query_dirty = true;
-    cx.editor.lister.rebuild_filtered();
-    cx.editor.open_lister(items, |cx, item_data| {
-        (cx.command_table[item_data as usize].func)(cx);
-    });
-});", &mut view.cursor);
+    buf.insert_literal(&clipboard, &mut view.cursor);
     buf.append_last_insertion_to_currently_animated_insertions();
     view.cursor.unset_anchor();
+});
+
+fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    let Some(anchor_char_index) = view.cursor.anchor_char_index else {
+        return;
+    };
+
+    let char_index = view.cursor.char_index;
+    let slice = if anchor_char_index < char_index {
+        buf.text.slice(anchor_char_index..char_index)
+    } else {
+        buf.text.slice(char_index..anchor_char_index)
+    };
+
+    buf.scratch_space_to_flatten_rope_into.clear(); // :BufferScratch
+    buf.scratch_space_to_flatten_rope_into.extend(slice.chars());
+
+    if unset_anchor {
+        view.cursor.unset_anchor();
+    }
+
+    let buffer_id = view.buffer_id;
+    Editor::set_clipboard(
+        &mut cx.editor.clipboard,
+        &cx.editor.buffers[buffer_id].scratch_space_to_flatten_rope_into
+    );
+}
+
+command!(copy |cx| {
+    copy_impl(cx, true);
+});
+
+command!(delete_selection_and_copy |cx| {
+    copy_impl(cx, false);
+
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.delete_selection(&mut view.cursor);
 });
 
 command!(switch_buffer |cx| {
@@ -699,7 +734,9 @@ impl Keymap {
         km.bind(KeyCombo::ctrl('k'), "delete_forward_until_newline");
         km.bind(KeyCombo::ctrl('d'), "delete_forward");
         km.bind(KeyCombo::ctrl('v'), "move_page_down");
-        km.bind(KeyCombo::ctrl('y'), "paste_yarson_test");
+        km.bind(KeyCombo::ctrl('y'), "paste");
+        km.bind(KeyCombo::ctrl('w'), "delete_selection_and_copy");
+        km.bind(KeyCombo::alt ('w'), "copy");
         km.bind(KeyCombo::named_mods(Space, Mods::ctrl()), "set_anchor");
         km.bind(KeyCombo::ctrl('g'), "unset_anchor");
         km.bind(KeyCombo::alt('v'),  "move_page_up");
@@ -720,10 +757,8 @@ impl Keymap {
         km.bind(KeyCombo::ctrl(';'), "open_new_buffer");
         km.bind(KeyCombo::alt ('1'), "cycle_buffers_left");
         km.bind(KeyCombo::alt ('3'), "cycle_buffers_right");
-
-        // nocheckin
-        km.bind(KeyCombo::alt ('x'), "open_command_lister");
         km.bind(KeyCombo::alt ('`'), "switch_buffer");
+        km.bind(KeyCombo::alt ('x'), "open_command_lister");
 
         km
     }

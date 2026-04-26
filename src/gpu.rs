@@ -370,10 +370,10 @@ pub fn draw_rect_outline(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, thicknes
     let verts  = gpu.verts_mut();
 
     verts.reserve(24);
-    draw_rect_impl(verts, inv_sw, inv_sh, x,       y,       w,         thickness, color); // Top
-    draw_rect_impl(verts, inv_sw, inv_sh, x,       y + h,   w,         thickness, color); // Bottom
-    draw_rect_impl(verts, inv_sw, inv_sh, x,       y,       thickness, h,         color); // Left
-    draw_rect_impl(verts, inv_sw, inv_sh, x + w,   y,       thickness, h,         color); // Right
+    draw_rect_impl(verts, inv_sw, inv_sh, x,                 y,         w,         thickness, color); // Top
+    draw_rect_impl(verts, inv_sw, inv_sh, x,                 y + h,     w,         thickness, color); // Bottom
+    draw_rect_impl(verts, inv_sw, inv_sh, x,                 y,         thickness, h,         color); // Left
+    draw_rect_impl(verts, inv_sw, inv_sh, x + w - thickness, y,         thickness, h,         color); // Right
 }
 
 /// Primitive rect - caller provides pre-baked reciprocals and verts ref.

@@ -619,6 +619,10 @@ fn rebuild_text_layout(
         };
 
         editor.snap_cursor_to_target(view_id, cl, cc, rect);
+
+        if should_snap_cursor_anim_to_buffer {  // @Robustness
+            scroll_to_cursor(editor);
+        }
     }
 }
 
@@ -679,7 +683,7 @@ fn build_text_layout(
     //
     {
         let t0 = Instant::now();
-        editor.buffers[buffer_id].lex_visible(first_line as _, last_line as _);
+        editor.buffers[buffer_id].lex_visible(first_line as _, last_line as _); // :BufferScratch
         editor.relex_us_acc += t0.elapsed().as_micros() as f32;
     }
 
@@ -703,7 +707,7 @@ fn build_text_layout(
     //
     //
 
-    let scratch     = buffer.scratch_space_to_flatten_rope_into.as_bytes();
+    let scratch     = buffer.scratch_space_to_flatten_rope_into.as_bytes(); // :BufferScratch
     let scratch_str = &buffer.scratch_space_to_flatten_rope_into;
 
     let approximate_glyph_count = scratch_str.len();
@@ -914,16 +918,27 @@ fn render_text_layout(
 
             for line_index in draw_start..=draw_end {
                 let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
-                let y = line_y(line_index) + cursor_h + scale*2.0;
+                let y = line_y(line_index) + cursor_h;
 
                 let (x0, x1) = if start_line == end_line {
                     (layout.x_for_col(origin_x, start_col, ll), layout.x_for_col(origin_x, end_col, ll))
                 } else if line_index == start_line {
+                    // Cover left gutter too
+                    if layout.x_for_col(origin_x, start_col, ll) > rect.x {
+                        gpu::draw_rect(
+                            gpu,
+                            rect.x, y,
+                            layout.x_for_col(origin_x, start_col, ll) - rect.x,
+                            line_h,
+                            palette().selection
+                        );
+                    }
+
                     (layout.x_for_col(origin_x, start_col, ll), rect.x + rect.w)
                 } else if line_index == end_line {
-                    (rect.x, layout.x_for_col(origin_x, end_col, ll))
+                    (rect.x,                                    layout.x_for_col(origin_x, end_col, ll))
                 } else {
-                    (rect.x, rect.x + rect.w)
+                    (rect.x,                                    rect.x + rect.w)
                 };
 
                 if x1 > x0 {
@@ -1290,7 +1305,6 @@ cranelift_entity::entity_impl!(ViewId);
 
 pub const PANEL_NONE: PanelId = PanelId(u32::MAX-1);
 pub const  VIEW_MAIN: ViewId  = ViewId(0);
-pub const  ROOT_BUFFER: BufferId  = BufferId(0);
 
 #[derive(Clone, Copy, Debug)]
 pub struct PanelSplit {
@@ -1339,7 +1353,7 @@ pub struct View {
     pub cursor:      Cursor,
     pub layout:      Option<TextLayout>,
 
-    pub per_buffer:  FastHashMap<BufferId, ViewState>,
+    pub persistent_state_per_buffer: FastHashMap<BufferId, ViewState>,
 }
 
 impl View {
@@ -1350,7 +1364,7 @@ impl View {
             cursor_anim_y: f32::NAN,
             cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: 0.0,
-            per_buffer: Default::default(),
+            persistent_state_per_buffer: Default::default(),
             panel_id: PanelId::reserved_value()  // Set on first layout
         }
     }
@@ -1374,7 +1388,7 @@ impl View {
         if old == new { return; }
 
         // Save old state
-        self.per_buffer.insert(old, ViewState {
+        self.persistent_state_per_buffer.insert(old, ViewState {
             cursor: self.cursor,
             scroll: self.scroll,
             scroll_anim: self.scroll_anim,
@@ -1386,7 +1400,7 @@ impl View {
         self.layout    = None;
 
         // Restore if exists
-        if let Some(state) = self.per_buffer.get(&new) {
+        if let Some(state) = self.persistent_state_per_buffer.get(&new) {
             self.cursor = state.cursor;
             self.scroll = state.scroll;
             self.scroll_anim = state.scroll_anim;
@@ -1701,7 +1715,7 @@ pub struct Editor {
 
     lister_query_buffer: BufferId,
     lister_query_view:   ViewId,
-    lister_query_panel:  PanelId, // @Redundant?
+    lister_query_panel:  PanelId,  // @Redundant?
     lister_split_panel:  PanelId,
 
     pub last_input_time: Instant,
@@ -1723,7 +1737,9 @@ pub struct Editor {
     pub canonicalized_last_scanned_directory:    SmallString<[u8; 256]>,
 
     pub lister:          Lister,
-    pub director:        Director
+    pub director:        Director,
+
+    pub clipboard:       Option<arboard::Clipboard>,
 }
 
 impl Editor {
@@ -1732,8 +1748,24 @@ impl Editor {
         let mut views   = PrimaryMap::with_capacity(32);
         let mut panels  = PrimaryMap::with_capacity(32);
 
-        // Reserve the fixed slots that always exist.
-        // These indices are stable — session restore adds on top of them.
+        //
+        // Root buffer/view/panel at index 0 is always the main editing surface,
+        // Replaced by apply_session or open_initial_buffer before the first frame.
+        //
+        let root_buffer = buffers.push(Buffer::new());
+        let root_view   = views.next_key();
+        views.push(View::new(root_view, root_buffer));
+        let root_panel  = panels.next_key();
+        panels.push(Panel {
+            id:   root_panel,
+            rect: Rect::default(),
+            kind: PanelKind::Leaf { view_id: root_view },
+        });
+        views[root_view].panel_id = root_panel;
+
+        //
+        // Lister internals
+        //
         let lister_query_buffer = buffers.push(Buffer::new());
         let lister_query_view   = views.next_key();
         views.push(View::new(lister_query_view, lister_query_buffer));
@@ -1743,25 +1775,14 @@ impl Editor {
             rect: Rect::default(),
             kind: PanelKind::Leaf { view_id: lister_query_view },
         });
+        views[lister_query_view].panel_id = lister_query_panel;
+
         let lister_split_panel = panels.next_key();
         panels.push(Panel {
             id:   lister_split_panel,
             rect: Rect::default(),
             kind: PanelKind::ListerSplit,
         });
-
-        // Placeholder root - will be replaced by apply_session or open_initial_buffer.
-        // We need something here so root_panel is a valid key.
-        let scratch_buffer = buffers.push(Buffer::new());
-        let scratch_view   = views.next_key();
-        views.push(View::new(scratch_view, scratch_buffer));
-        let root_panel = panels.next_key();
-        panels.push(Panel {
-            id:   root_panel,
-            rect: Rect::default(),
-            kind: PanelKind::Leaf { view_id: scratch_view },
-        });
-        views[scratch_view].panel_id = root_panel;
 
         let canonicalized_current_working_directory: SmallString<[_; _]> = std::env::args().nth(1)
             .and_then(|p| Path::new(&p).parent().map(|p| p.to_path_buf()))
@@ -1811,7 +1832,8 @@ impl Editor {
             lister_query_panel,
             lister_query_view,
             lister_query_buffer,
-            director: Director::new()
+            director: Director::new(),
+            clipboard: arboard::Clipboard::new().ok(),
         };
 
         //
@@ -1834,6 +1856,19 @@ impl Editor {
         editor
     }
 
+    #[inline]
+    pub fn get_clipboard(&mut self) -> Option<String> {
+        self.clipboard.as_mut()?.get_text().ok()
+    }
+
+    #[inline]
+    pub fn set_clipboard(clipboard: &mut Option<arboard::Clipboard>, text: &str) {
+        if let Some(cb) = clipboard {
+            _ = cb.set_text(text);
+        }
+    }
+
+    #[inline]
     pub fn hide_cursor(&mut self, win: &Window) {
         if !self.is_cursor_visible { return }
 
@@ -1841,6 +1876,7 @@ impl Editor {
         win.set_cursor_visible(false);
     }
 
+    #[inline]
     pub fn show_cursor(&mut self, win: &Window) {
         if self.is_cursor_visible { return }
 
@@ -1848,18 +1884,22 @@ impl Editor {
         win.set_cursor_visible(true);
     }
 
+    #[inline]
     pub fn is_lister_open_and_is_it_listing_file_entries(&self) -> bool {
         self.lister.is_open && self.lister.is_listing_file_entries
     }
 
+    #[inline]
     pub fn is_lister_buffer_dirty(&self) -> bool {
         self.buffers[self.lister_query_buffer].is_dirty
     }
 
+    #[inline]
     pub fn open_lister(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn) {
         self.open_lister_impl(items, on_confirm, None)
     }
 
+    #[inline]
     pub fn open_lister_with_frame_callback(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: ListerFrameUpdateCallback) {
         self.open_lister_impl(items, on_confirm, Some(frame_callback))
     }
@@ -2110,6 +2150,8 @@ impl Editor {
 
     // @Refactor
     pub fn mru_register_new_buffer(&mut self, buffer_id: BufferId) {
+        if buffer_id == self.lister_query_buffer { return }
+
         if let Some(pos) = self.most_recently_used_buffers.iter().position(|&b| b == buffer_id) {
             self.most_recently_used_buffers.remove(pos);
         }
@@ -2763,24 +2805,17 @@ fn open_initial_buffer(editor: &mut Editor) {
         .and_then(|p| Buffer::from_file(p).ok())
         .unwrap_or_else(Buffer::new);
 
-    let buffer_id  = editor.buffers.push(buffer);
-    editor.mru_register_new_buffer(buffer_id);
+    //
+    // Reuse the root buffer slot
+    //
 
-    let view_id = editor.views.next_key();
-    editor.views.push(View::new(view_id, buffer_id));
+    editor.buffers[editor.views[VIEW_MAIN].buffer_id] = buffer;
 
-    let panel_id = editor.panels.next_key();
-    editor.panels.push(Panel {
-        id:   panel_id,
-        rect: Rect::default(),
-        kind: PanelKind::Leaf { view_id },
-    });
-    editor.views[view_id].panel_id = panel_id;
-    editor.root_panel   = panel_id;
-    editor.active_panel = panel_id;
+    let root_buf_id = editor.views[VIEW_MAIN].buffer_id;
+    editor.mru_register_new_buffer(root_buf_id);
 
     if let Some(p) = canon {
-        editor.canonicalized_path_to_buffer_id.insert(p.into(), buffer_id);
+        editor.canonicalized_path_to_buffer_id.insert(p.into(), root_buf_id);
     }
 }
 

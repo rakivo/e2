@@ -21,8 +21,10 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::buffer::Buffer;
-use crate::{BufferId, PanelId, ViewId, Panel, Editor, PanelKind, PanelSplit, Rect, View};
+use smallvec::SmallVec;
+
+use crate::buffer::{Buffer, Cursor};
+use crate::{Editor, Panel, PanelId, PanelKind, PanelSplit, Rect, VIEW_MAIN, View, ViewId, ViewState};
 
 const MAGIC:   u32 = 0x4E455353; // "SSEN"
 const VERSION: u8  = 1;
@@ -136,7 +138,7 @@ pub struct Session<'file> {
 pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
     let t0 = Instant::now();
 
-    let mut out    = Vec::with_capacity(4096); // @Memory @Speed: Reuse that memory?
+    let mut out    = Vec::with_capacity(4096);                         // @Memory @Speed: Reuse that memory?
     let mut leaves = Vec::with_capacity(editor.panels.len() * 4 / 6);  // @Memory @Tune
 
     write_u32(&mut out, MAGIC);
@@ -147,20 +149,24 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
 
     write_u32(&mut out, leaves.len() as u32);
 
-    let active_buf = editor.active_view().buffer_id;
+    let active_view = editor.active_view();
+    // let active_buf = active_view.buffer_id;
+
     let mut active_index = u32::MAX;
 
-    for (i, &(_, view_id)) in leaves.iter().enumerate() {
+    for (i, &(panel_id, view_id)) in leaves.iter().enumerate() {
         let view        = &editor.views[view_id];
         let buf         = &editor.buffers[view.buffer_id];
         let file_path   = buf.path.as_deref().and_then(|p| p.to_str()).unwrap_or("");
         let (line, col) = (view.cursor_target_line, view.cursor_target_col);
 
-        if view.buffer_id == active_buf { active_index = i as u32; }
+        if active_view.id == view_id && view.panel_id() == Some(panel_id) { active_index = i as u32; }
+        // if view.buffer_id == active_buf { active_index = i as u32; }
 
         write_str(&mut out, file_path);
         write_u32(&mut out, line);
         write_u32(&mut out, col);
+        dbg!(line, col);
         write_f32(&mut out, view.scroll_anim);
     }
 
@@ -178,23 +184,26 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
 
 // Walk the panel tree and collect (panel_id, view_id) for every leaf
 // that has a real file buffer. Order matches the write_panel traversal.
-fn collect_leaves(editor: &Editor, panel_id: PanelId, out: &mut Vec<(PanelId, ViewId)>) {
-    match editor.panels[panel_id].kind {
-        PanelKind::Leaf { view_id } => {
-            let buf_id = editor.views[view_id].buffer_id;
-            if buf_id != editor.lister_query_buffer
-                && editor.buffers[buf_id].path.is_some()
-            {
-                out.push((panel_id, view_id));
+fn collect_leaves(editor: &Editor, root: PanelId, out: &mut Vec<(PanelId, ViewId)>) {
+    let mut stack = SmallVec::<[_; 48]>::with_capacity((editor.panels.len() as f32 * 1.5) as usize);
+    stack.push(root);
+
+    while let Some(panel_id) = stack.pop() {
+        match editor.panels[panel_id].kind {
+            PanelKind::Leaf { view_id } => {
+                let buffer_id = editor.views[view_id].buffer_id;
+                if buffer_id != editor.lister_query_buffer {
+                    out.push((panel_id, view_id));
+                }
             }
-        }
 
-        PanelKind::Split(s) => {
-            collect_leaves(editor, s.left_id,  out);
-            collect_leaves(editor, s.right_id, out);
-        }
+            PanelKind::Split(s) => {
+                stack.push(s.right_id);
+                stack.push(s.left_id);
+            }
 
-        PanelKind::ListerSplit => {}
+            PanelKind::ListerSplit => {}
+        }
     }
 }
 
@@ -203,8 +212,8 @@ pub fn load_session<'a>(data: &'a [u8]) -> Option<Session<'a>> {
 
     let mut r = Reader::new(&data);
 
-    if r.u32()? != MAGIC   { return None; }
-    if r.u8()?  != VERSION { return None; }
+    if r.u32()? != MAGIC   { return None }
+    if r.u8()?  != VERSION { return None }
 
     let cwd   = r.str()?;
     let count = r.u32()? as usize;
@@ -231,45 +240,71 @@ pub fn apply_session(editor: &mut Editor, session: Session) {
 
     editor.canonicalized_current_working_directory = session.cwd.into();
 
-    let mut leaf_buffers = Vec::<BufferId>::with_capacity(session.leaves.len());
-    let mut leaf_views   = Vec::<ViewId>  ::with_capacity(session.leaves.len());
+    let mut leaf_views  = Vec::<ViewId>::with_capacity(session.leaves.len());
 
-    for sl in &session.leaves {
+    let root_buffer_id  = editor.views[VIEW_MAIN].buffer_id;
+    let root_view_id    = VIEW_MAIN;
+
+    for (i, sl) in session.leaves.iter().enumerate() {
         let file_path = Path::new(&sl.path);
+        let canon     = file_path.canonicalize().ok();
 
-        let buf = Buffer::from_file(file_path).unwrap_or_else(|_| {
-            //
-            // We couldn't find the file, make an empty buffer instead.
-            //
-            let mut b = Buffer::new();
-            b.path = Some(file_path.into());
-            b
-        });
+        //
+        // If this file is already open, reuse its buffer id
+        //
+        let existing_buffer_id = canon.as_deref()
+            .and_then(|c| editor.canonicalized_path_to_buffer_id.get(c))
+            .copied();
 
-        let total_lines_count = buf.text.len_lines();
+        let buffer_id = if let Some(bufer_id) = existing_buffer_id {
+            bufer_id
+        } else {
+            let buffer = Buffer::from_file(file_path).unwrap_or_else(|_| {
+                let mut b = Buffer::new();
+                b.path = Some(file_path.into());
+                b
+            });
+            let buffer_id = editor.buffers.push(buffer);
+            if let Some(c) = canon {
+                editor.canonicalized_path_to_buffer_id.insert(c.into(), buffer_id);
+            }
+            editor.mru_register_new_buffer(buffer_id);
+            buffer_id
+        };
 
-        let buffer_id = editor.buffers.push(buf);
-        let view_id   = editor.views.next_key();
-        editor.views.push(View::new(view_id, buffer_id));
+        let view_id = if i == 0 {
+            let view_id = root_view_id;
+            editor.views[view_id].buffer_id = root_buffer_id;
+            view_id
+        } else {
+            let view_id = editor.views.next_key();
+            editor.views.push(View::new(view_id, buffer_id));
+            view_id
+        };
 
         editor.buffers[buffer_id].set_cursor_line_col(
             sl.line, sl.col,
             &mut editor.views[view_id].cursor,
         );
 
-        let line = sl.line.clamp(0, total_lines_count as _);
+        let total_line_count = editor.buffers[buffer_id].text.len_lines() as u32;
+
+        let line = sl.line.clamp(0, total_line_count as _);
         editor.views[view_id].cursor_target_line = line;
         editor.views[view_id].cursor_target_col  = sl.col;
         editor.views[view_id].scroll             = sl.scroll_anim;
         editor.views[view_id].scroll_anim        = sl.scroll_anim;
 
-        editor.mru_register_new_buffer(buffer_id);
+        let mut cursor = Cursor::new();
+        cursor.char_index = editor.buffers[buffer_id].text.line_to_char(line as _);
+        editor.views[view_id].cursor = cursor;
 
-        if let Ok(canon) = file_path.canonicalize() {
-            editor.canonicalized_path_to_buffer_id.insert(canon.into(), buffer_id);
-        }
+        editor.views[view_id].persistent_state_per_buffer.insert(buffer_id, ViewState {
+            cursor,
+            scroll:      sl.scroll_anim,
+            scroll_anim: sl.scroll_anim,
+        });
 
-        leaf_buffers.push(buffer_id);
         leaf_views.push(view_id);
     }
 
@@ -284,6 +319,7 @@ pub fn apply_session(editor: &mut Editor, session: Session) {
         if let Some(panel_id) = editor.views[view_id].panel_id() {
             editor.active_panel = panel_id;
         }
+
         editor.mru_focus(buf_id);
     }
 
@@ -298,15 +334,22 @@ fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) 
                 .copied()
                 .unwrap_or_else(|| editor.views.keys().next().unwrap());
 
-            let panel_id = editor.panels.next_key();
-            editor.panels.push(Panel {
-                id:   panel_id,
-                rect: Rect::default(),
-                kind: PanelKind::Leaf { view_id },
-            });
-            editor.views[view_id].panel_id = panel_id;
-
-            panel_id
+            // Reuse the existing panel for this view if it already has one,
+            // otherwise push a new one.
+            if let Some(existing_panel) = editor.views[view_id].panel_id() {
+                // Update kind in case it changed
+                editor.panels[existing_panel].kind = PanelKind::Leaf { view_id };
+                existing_panel
+            } else {
+                let panel_id = editor.panels.next_key();
+                editor.panels.push(Panel {
+                    id:   panel_id,
+                    rect: Rect::default(),
+                    kind: PanelKind::Leaf { view_id },
+                });
+                editor.views[view_id].panel_id = panel_id;
+                panel_id
+            }
         }
 
         SessionPanel::Split { vertical, ratio, left, right } => {

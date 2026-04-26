@@ -122,14 +122,14 @@ impl Buffer {
         cursor.char_index = line_start + col.min(line_len as u32) as usize;
     }
 
-    pub fn flatten_rope_into_scratch(&mut self, start_byte: usize, end_byte: usize) {
+    pub fn flatten_rope_into_scratch(&mut self, start_byte: usize, end_byte: usize) { // :BufferScratch
         self.scratch_space_to_flatten_rope_into.clear();
         for chunk in self.text.slice(self.text.byte_to_char(start_byte)..self.text.byte_to_char(end_byte)).chunks() {
             self.scratch_space_to_flatten_rope_into.push_str(chunk);
         }
     }
 
-    pub fn lex_visible(&mut self, start_line: usize, end_line: usize) {
+    pub fn lex_visible(&mut self, start_line: usize, end_line: usize) { // :BufferScratch
         let start_byte = self.text.try_line_to_byte(start_line).unwrap_or(0);
         let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes());
 
