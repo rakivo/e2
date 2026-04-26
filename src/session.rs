@@ -127,10 +127,10 @@ pub enum SessionPanel {
 }
 
 pub struct Session<'file> {
-    pub cwd:        &'file str,
-    pub leaves:     Vec<SessionLeaf<'file>>,
+    pub cwd:          &'file str,
+    pub leaves:       Vec<SessionLeaf<'file>>,
     pub active_index: u32,
-    pub root:       SessionPanel,
+    pub root:         SessionPanel,
 }
 
 pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
@@ -329,7 +329,7 @@ fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) 
     }
 }
 
-pub fn default_session_path() -> std::path::PathBuf {
+pub fn default_session_path() -> Box<Path> {
     // ~/.local/share/naysayer/session.bin                 on Linux
     // ~/Library/Application Support/naysayer/session.bin  on Mac
     // %APPDATA%\naysayer\session.bin                      on Windows
@@ -337,5 +337,5 @@ pub fn default_session_path() -> std::path::PathBuf {
 
     let dir = base.join("naysayer");
     _ = std::fs::create_dir_all(&dir);
-    dir.join("session.bin")
+    dir.join("session.bin").into()
 }
