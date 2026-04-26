@@ -33,11 +33,6 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
 }
 
 #[inline]
-pub fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t), lerp(a[3],b[3],t)]
-}
-
-#[inline]
 pub fn display_path<'a>(path: &'a str, max_chars: usize) -> Cow<'a, str> {
     if path.len() <= max_chars {
         return path.into();

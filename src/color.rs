@@ -1,6 +1,16 @@
 #![allow(unused, dead_code)]
 
-use std::ops::Deref;
+use std::ops::{Deref, Index};
+
+#[inline(always)]
+pub fn lerp_color(a: GpuColor, b: GpuColor, t: f32) -> GpuColor {
+    GpuColor([
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ])
+}
 
 #[derive(Default, Debug, Copy, Clone)]
 pub struct Color {
@@ -88,6 +98,14 @@ impl Color {
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuColor(pub [f32; 4]);
+
+impl Index<usize> for GpuColor {
+    type Output = f32;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
 
 impl From<[f32; 4]> for GpuColor {
     fn from(value: [f32; 4]) -> Self {

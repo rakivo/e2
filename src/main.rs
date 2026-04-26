@@ -22,7 +22,7 @@ use std::time::Instant;
 use std::fmt::Write as _;
 use std::collections::VecDeque;
 
-use buffer::{Buffer, Cursor};
+use buffer::{AnimatedInsertion, Buffer, Cursor};
 use color::Color;
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::packed_option::ReservedValue;
@@ -258,6 +258,7 @@ pub struct Palette {
     pub current_line: Color,
     pub cursor:       Color,
     pub cursor_text:  Color,
+    pub paste_highlight: Color,
     pub paren_match:  Color
 }
 
@@ -269,16 +270,10 @@ pub const fn palette() -> Palette {
         cursor:       Color::hex(0xc3a983),
         current_line: Color::hex(0x231b0e),
         cursor_text:  Color::rgba(13, 13, 13, 255),
-        paren_match:  Color::rgba(190, 128, 133, 200)
+        paren_match:  Color::rgba(190, 128, 133, 200),
+        paste_highlight: Color::hex(0xe6c86a),
     }
 }
-
-const MIN_SCALE:  f32 = 0.75;
-const MAX_SCALE:  f32 = 5.00;
-const SCALE_STEP: f32 = 0.25;
-
-const SCROLL_ANIM_RATE: f32 = 46.67;
-const CURSOR_ANIM_RATE: f32 = 99.420;
 
 const LISTER_ITEMS_PADDING: f32 = 0.0;
 
@@ -301,30 +296,6 @@ define_base_and_scale! {
     const BASE_CURSOR_HEIGHT: f32 = 2.0;
     const BASE_CURSOR_WIDTH:  f32 = 2.0;
     const BASE_CURSOR_OUTLINE_THICKNESS: f32 = 1.5;
-}
-
-const BLINK_ON_MS:  u128 = 530;
-const BLINK_OFF_MS: u128 = 370;
-
-const BLINK_START_DELAY_MS: u128 = 500;  // Start blinking after 500ms idle
-const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop blinking after 5s idle
-
-fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
-    let since_input = last_input.elapsed().as_millis();
-
-    // Typing: show solid cursor
-    if since_input < BLINK_START_DELAY_MS {
-        return true;
-    }
-
-    // Idle too long: show solid cursor
-    if since_input > BLINK_STOP_IDLE_MS {
-        return true;
-    }
-
-    // In between: blink
-    let elapsed = epoch.elapsed().as_millis() % (BLINK_ON_MS + BLINK_OFF_MS);
-    elapsed < BLINK_ON_MS
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -370,8 +341,9 @@ impl Rect {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Glyph {
-    /// X offset from the line's left content edge (rect.x + PADDING_LEFT)
-    pub x:         f32,
+    pub x: f32,           // x offset from the line's left content edge (rect.x + PADDING_LEFT)
+
+    pub byte_offset: u32, // Absolute byte offset into buffer
 
     pub color:     Color,
     pub char:      char,
@@ -480,6 +452,10 @@ pub struct TextLayout {
     pub lines:        Vec<LineLayout>,
     pub glyphs:       Vec<Glyph>,
     pub line_offsets: Vec<(usize, usize)>,
+
+    // 4 bits per glyph, packed: 0 = not animated, 1–15 = insertion index
+    // fits 16 glyphs per u64, ~63 bytes per 1000 visible glyphs
+    pub glyph_insertion_ids: Vec<u64>,
 }
 
 impl TextLayout {
@@ -571,6 +547,7 @@ fn rebuild_text_layout(
     rect: Rect, font_size: f32, line_h: f32,
 ) {
     let view = &editor.views[view_id];
+    let buffer_id = view.buffer_id;
 
     let should_snap = view.layout.as_ref().map(|l| {
         (l.rect.w - rect.w).abs() > 0.5
@@ -578,13 +555,15 @@ fn rebuild_text_layout(
     }).unwrap_or(true); // true = first build
 
     let t0 = Instant::now();
-    let layout = build_text_layout(
+    let mut layout = build_text_layout(
         editor,
         gpu,
         view_id,
         rect, font_size, line_h,
     );
     editor.build_us_acc += t0.elapsed().as_micros() as f32;
+
+    layout_update_currently_animated_insertion_ids(&mut layout, &editor.buffers[buffer_id].currently_animated_insertions);
 
     editor.views[view_id].layout = Some(layout);
 
@@ -792,7 +771,7 @@ fn build_text_layout(
 
             let advance = gpu_glyph.advance;
 
-            checked_push!(glyphs, Glyph { x: local_x, color, char: ch, gpu_glyph });
+            checked_push!(glyphs, Glyph { x: local_x, color, char: ch, gpu_glyph, byte_offset: abs_byte as _ });
 
             local_x  += advance;
             abs_byte += ch.len_utf8();
@@ -816,6 +795,7 @@ fn build_text_layout(
         lines,
         visible_glyph_count,
         line_offsets,
+        glyph_insertion_ids: Default::default(),
         view_scroll: view.scroll,
         first_buffer_line: first_line,
     }
@@ -823,7 +803,6 @@ fn build_text_layout(
 
 fn render_text_layout(
     gpu:         &mut Gpu,
-    layout:      &TextLayout,
     buffer:      &Buffer,
     view:        &View,
     active_view_id: ViewId,
@@ -834,6 +813,8 @@ fn render_text_layout(
     scratch_paren: &mut Vec<char>,
 ) {
     let _tracy = tracy::span!("render_text_layout");
+
+    let Some(layout) = &view.layout else { return };
 
     let line_y = |buffer_line: u32| -> f32 {
         layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim
@@ -1031,6 +1012,13 @@ fn render_text_layout(
         let verts = gpu.verts_mut();
 
         let cursor_color = palette().cursor_text.into();
+        let highlight = palette().paste_highlight.into();
+
+        // Precompute insertion ts
+        let mut insertion_ts = [1.0f32; PASTE_ANIMATION_MAX_ID];
+        for a in buffer.currently_animated_insertions.iter() {
+            insertion_ts[a.id as usize - 1] = a.t;
+        }
 
         for ll in &layout.lines {
             let glyphs = ll.glyphs(&layout.glyphs);
@@ -1057,6 +1045,10 @@ fn render_text_layout(
                 y,
                 cursor_col_glyph_index,
                 cursor_color,
+                highlight,
+                &layout.glyph_insertion_ids,
+                ll.glyph_start as usize,
+                insertion_ts
             );
         }
     }
@@ -1420,8 +1412,8 @@ pub struct Lister {
 
     pub set_selected_index_to_1_instead_of_0: bool,
 
-    pub on_confirm:     Vec<ListerSelectFn>,
-    pub pending_datas:  Vec<u64>,
+    pub on_confirm:    Vec<ListerSelectFn>,
+    pub pending_datas: Vec<u64>,
     pub items_update_frame_update_callback: Vec<Option<ListerFrameUpdateCallback>>,
 
     pub scroll:        f32,
@@ -1691,7 +1683,7 @@ impl Editor {
             kind: PanelKind::Leaf { view_id: root_view },
         });
 
-        let lister_query_buffer = buffers.push(Buffer::default());
+        let lister_query_buffer = buffers.push(Buffer::new());
         let lister_query_view   = views.next_key();  views.push(View::new(lister_query_view, lister_query_buffer));
         let lister_query_panel  = panels.next_key(); panels.push(Panel {
             id:   lister_query_panel,
@@ -2101,11 +2093,71 @@ impl Editor {
     }
 }
 
+const MIN_SCALE:  f32 = 0.75;
+const MAX_SCALE:  f32 = 5.00;
+const SCALE_STEP: f32 = 0.25;
+
+const SCROLL_ANIM_RATE: f32 = 46.67;
+const CURSOR_ANIM_RATE: f32 = 99.420;
+
+const BLINK_ON_MS:  u128 = 530;
+const BLINK_OFF_MS: u128 = 370;
+
+const BLINK_START_DELAY_MS: u128 = 500;  // Start blinking after 500ms idle
+const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop  blinking after 5s    idle
+
+const PASTE_ANIMATION_DURATION: f32 = 1.48; // nocheckin @Tune
+
+const PASTE_ANIMATION_BITS:     usize = 4;
+const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
+const PASTE_ANIMATION_MASK:     u64   = (1 << PASTE_ANIMATION_BITS) - 1;   // 0b1111
+const PASTE_ANIMATION_MAX_ID:   usize = PASTE_ANIMATION_MASK as usize;     // 15
+
+pub fn layout_update_currently_animated_insertion_ids(layout: &mut TextLayout, insertions: &[AnimatedInsertion]) {
+    layout.glyph_insertion_ids.clear();
+    if insertions.is_empty() { return; }
+
+    let n     = layout.glyphs.len();
+    let words = (n + PASTE_ANIMATION_PER_WORD - 1) / PASTE_ANIMATION_PER_WORD;
+
+    layout.glyph_insertion_ids.resize(words, 0u64);
+
+    for (i, g) in layout.glyphs.iter().enumerate() {
+        let byte = g.byte_offset as usize;
+        for a in insertions.iter().take(PASTE_ANIMATION_MAX_ID) {
+            if byte >= a.byte_start && byte < a.byte_start + a.byte_len as usize {
+                let word =  i / PASTE_ANIMATION_PER_WORD;
+                let bit  = (i % PASTE_ANIMATION_PER_WORD) * PASTE_ANIMATION_BITS;
+                layout.glyph_insertion_ids[word] |= (a.id as u64) << bit;
+                break;
+            }
+        }
+    }
+}
+
+fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
+    let since_input = last_input.elapsed().as_millis();
+
+    // Typing: show solid cursor
+    if since_input < BLINK_START_DELAY_MS {
+        return true;
+    }
+
+    // Idle too long: show solid cursor
+    if since_input > BLINK_STOP_IDLE_MS {
+        return true;
+    }
+
+    // In between: blink
+    let elapsed = epoch.elapsed().as_millis() % (BLINK_ON_MS + BLINK_OFF_MS);
+    elapsed < BLINK_ON_MS
+}
+
 fn animate(editor: &mut Editor, dt: f32) -> bool {
     let _tracy = tracy::span!("animate");
 
     let epsilon       = 0.5f32; // Stop animating when close enough
-    let mut animating = false;
+    let mut still_animating = false;
 
     let line_h    = editor.line_h();
 
@@ -2116,7 +2168,7 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
         let ds = view.scroll - view.scroll_anim;
         if ds.abs() > epsilon {
             view.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
-            animating = true;
+            still_animating = true;
         } else {
             view.scroll_anim = view.scroll;
         }
@@ -2139,7 +2191,7 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
                 view.cursor_anim_y = target_y;
             } else if dy.abs() > epsilon {
                 view.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
-                animating = true;
+                still_animating = true;
             } else {
                 view.cursor_anim_y = target_y;
             }
@@ -2148,15 +2200,35 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
         }
     }
 
+    //
+    // Advance insertion animations per buffer
+    //
+    for buffer in editor.buffers.values_mut() {
+        let before = buffer.currently_animated_insertions.len();
+        buffer.currently_animated_insertions.retain_mut(|a| {
+            a.t = (a.t + dt / PASTE_ANIMATION_DURATION).min(1.0);
+            a.t < 1.0
+        });
+        if buffer.currently_animated_insertions.len() < before {
+            buffer.is_dirty = true; // @Hack nocheckin @DocumentThis
+        }
+        if !buffer.currently_animated_insertions.is_empty() {
+            still_animating = true;
+        }
+    }
+
+    //
+    // Blink the cursor
+    //
     let ds = editor.lister.scroll - editor.lister.scroll_anim;
     if ds.abs() > epsilon {
         editor.lister.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
-        animating = true;
+        still_animating = true;
     } else {
         editor.lister.scroll_anim = editor.lister.scroll;
     }
 
-    animating
+    still_animating
 }
 
 fn find_matching_paren(
@@ -3026,11 +3098,10 @@ impl ApplicationHandler for App {
                         true
                     };
 
-                    let layout = editor.views[view_id].layout.as_ref().unwrap();
                     gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                     let t1 = Instant::now();
                     render_text_layout(
-                        gpu, layout,
+                        gpu,
                         &editor.buffers[buffer_id],
                         &editor.views[view_id],
                         editor.active_view_id(),
@@ -3089,11 +3160,10 @@ impl ApplicationHandler for App {
                         true
                     };
 
-                    let layout = editor.views[view_id].layout.as_ref().unwrap();
                     gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                     let t1 = Instant::now();
                     render_text_layout(
-                        gpu, layout,
+                        gpu,
                         &editor.buffers[buffer_id],
                         &editor.views[view_id],
                         editor.active_view_id(),

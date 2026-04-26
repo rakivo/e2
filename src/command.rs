@@ -260,7 +260,7 @@ command!(scale_reset |cx| {
 });
 
 command!(open_new_buffer |cx| {
-    let buffer  = Buffer::default();
+    let buffer  = Buffer::new();
     let buf_id  = cx.editor.buffers.push(buffer);
     let view_id = ViewId::new(cx.editor.views.len());
     cx.editor.views.push(View::new(view_id, buf_id));
@@ -342,13 +342,29 @@ fn lister_item_list_from_buffer_list(cx: &CommandContext) -> Vec<ListerItem> {
     }).collect()
 }
 
-command!(open_lister_test |cx| {
+command!(open_command_lister |cx| {
     let items = lister_item_list_from_command_table(cx);
     cx.editor.lister.is_query_dirty = true;
     cx.editor.lister.rebuild_filtered();
     cx.editor.open_lister(items, |cx, item_data| {
         (cx.command_table[item_data as usize].func)(cx);
     });
+});
+
+command!(paste_yarson_test |cx| {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    buf.insert_literal("\
+command!(open_command_lister |cx| {
+    let items = lister_item_list_from_command_table(cx);
+    cx.editor.lister.is_query_dirty = true;
+    cx.editor.lister.rebuild_filtered();
+    cx.editor.open_lister(items, |cx, item_data| {
+        (cx.command_table[item_data as usize].func)(cx);
+    });
+});", &mut view.cursor);
+    buf.append_last_insertion_to_currently_animated_insertions();
+    view.cursor.unset_anchor();
 });
 
 command!(switch_buffer |cx| {
@@ -677,6 +693,7 @@ impl Keymap {
         km.bind(KeyCombo::ctrl('k'), "delete_forward_until_newline");
         km.bind(KeyCombo::ctrl('d'), "delete_forward");
         km.bind(KeyCombo::ctrl('v'), "move_page_down");
+        km.bind(KeyCombo::ctrl('y'), "paste_yarson_test");
         km.bind(KeyCombo::named_mods(Space, Mods::ctrl()), "set_anchor");
         km.bind(KeyCombo::ctrl('g'), "unset_anchor");
         km.bind(KeyCombo::alt('v'),  "move_page_up");
@@ -699,7 +716,7 @@ impl Keymap {
         km.bind(KeyCombo::alt ('3'), "cycle_buffers_right");
 
         // nocheckin
-        km.bind(KeyCombo::alt ('x'), "open_lister_test");
+        km.bind(KeyCombo::alt ('x'), "open_command_lister");
         km.bind(KeyCombo::alt ('`'), "switch_buffer");
 
         km

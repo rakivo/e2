@@ -1,7 +1,7 @@
 #![allow(unused, dead_code)]
 
-use crate::color::{GpuColor, Color};
-use crate::{Glyph, palette, tracy};
+use crate::color::{Color, GpuColor, lerp_color};
+use crate::{Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, palette, tracy};
 use crate::util::{format_bytes, px};
 
 use std::ops::Range;
@@ -519,6 +519,7 @@ fn px_fast(x: f32, y: f32, inv_sw: f32, inv_sh: f32) -> ([f32; 2], [f32; 2]) {
     )
 }
 
+#[inline]
 pub fn draw_text_for_editor(
     verts:    &mut Vec<Vert>,
 
@@ -531,12 +532,20 @@ pub fn draw_text_for_editor(
     y:        f32,
 
     cursor_col_glyph_index: Option<usize>,  // None = not cursor line
-    cursor_color: GpuColor,
+
+    cursor_color:    GpuColor,
+    paste_highlight: GpuColor,
+
+    insertion_ids:   &[u64],
+    global_glyph_start: usize,   // ll.glyph_start
+    insertion_ts:    [f32; PASTE_ANIMATION_MAX_ID],
 ) {
-    // Reserve once for all glyphs on this line — no growth, no repeated capacity checks.
+    // Reserve once for all glyphs on this line
     // 6 verts per glyph (two tris).
     let needed = glyphs.len() * 6;
     verts.reserve(needed);
+
+    let animated = !insertion_ids.is_empty();
 
     // SAFETY: we just reserved exactly `needed` elements above.
     // We write exactly 6 Verts per non-zero-size glyph, all fields initialized.
@@ -551,13 +560,12 @@ pub fn draw_text_for_editor(
 
         // x is already the accumulated advance from layout - use g.x directly.
         let gx = (origin_x + g.x + gg.bearing_x as f32).round();
-        let gy = (y        - gg.bearing_y as f32 - gg.h as f32).round();
+        let gy = (y              - gg.bearing_y as f32 - gg.h as f32).round();
         let gw = gg.w as f32;
         let gh = gg.h as f32;
 
-        // 4 muls instead of 4 divides for the pixel→NDC conversion.
-        let x0 =  gx           * inv_sw * 2.0 - 1.0;
-        let x1 = (gx + gw)     * inv_sw * 2.0 - 1.0;
+        let x0 =  gx                 * inv_sw * 2.0 - 1.0;
+        let x1 = (gx + gw)           * inv_sw * 2.0 - 1.0;
         let y0 =  1.0 - gy           * inv_sh * 2.0;
         let y1 =  1.0 - (gy + gh)    * inv_sh * 2.0;
 
@@ -566,9 +574,25 @@ pub fn draw_text_for_editor(
         let u1 = (gg.uv_x + gg.uv_w) as f32;
         let v1 = (gg.uv_y + gg.uv_h) as f32;
 
-        let color: GpuColor = match cursor_col_glyph_index {
+        let base_color: GpuColor = match cursor_col_glyph_index {
             Some(ci) if ci == i => cursor_color,
             _                   => g.color.into(),
+        };
+
+        let color = {
+            let gi   = global_glyph_start + i;
+            let word =  gi / PASTE_ANIMATION_PER_WORD;
+            let bit  = (gi % PASTE_ANIMATION_PER_WORD) * PASTE_ANIMATION_BITS;
+            let id = if word < insertion_ids.len() {
+                ((insertion_ids[word] >> bit) & PASTE_ANIMATION_MASK) as usize
+            } else {
+                0
+            };
+
+            // id == 0 -> t_raw = 1.0 -> ease = 1.0 -> fully base_color
+            let t_raw = if id == 0 { 1.0f32 } else { insertion_ts[id - 1] };
+            let ease  = 1.0 - (1.0 - t_raw).powi(4);
+            lerp_color(paste_highlight, base_color, ease)
         };
 
         unsafe {

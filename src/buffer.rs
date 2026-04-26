@@ -1,8 +1,9 @@
-use crate::lexer::{LexState, Token, lex_from};
+use crate::{PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
 
 use std::path::Path;
 
 use ropey::Rope;
+use smallvec::SmallVec;
 
 #[derive(Default, Copy, Clone, Debug)]
 pub struct Cursor {
@@ -30,6 +31,14 @@ impl Cursor {
 }
 
 #[derive(Default)]
+pub struct AnimatedInsertion {
+    pub byte_start: usize,
+    pub byte_len:   u32,
+    pub t:          f32,   // 0.0 = just inserted (bright), 1.0 = fully faded
+    pub id:         u8,   // stable, never reused within a session (or wrap at 15)
+}
+
+#[derive(Default)]
 pub struct Buffer {
     pub text: Rope,
     pub path: Option<Box<Path>>,
@@ -41,16 +50,34 @@ pub struct Buffer {
 
     pub scratch_space_to_flatten_rope_into: String,
 
+    pub next_insertion_id: u8,  // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
+    pub currently_animated_insertions: SmallVec<[AnimatedInsertion; 4]>,
+
     pub visible_tokens: Vec<Token>,
     pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
 }
 
 impl Buffer {
+    pub fn new() -> Self {
+        Buffer {
+            next_insertion_id: 1,
+            ..Default::default()
+        }
+    }
+
     pub fn from_file(path: impl Into<Box<Path>>) -> std::io::Result<Self> {
         let path = path.into();
 
         let text = Rope::from_reader(std::fs::File::open(&path)?)?;
-        Ok(Self { text, path: Some(path), ..Default::default() })
+        Ok(Self { next_insertion_id: 1, text, path: Some(path), ..Default::default() })
+    }
+
+    pub fn append_last_insertion_to_currently_animated_insertions(&mut self) {
+        if let Some((byte_start, byte_len)) = self.last_insert {
+            let id = self.next_insertion_id;
+            self.next_insertion_id = (id % PASTE_ANIMATION_MAX_ID as u8) + 1; // stays in 1..=MAX_ID
+            self.currently_animated_insertions.push(AnimatedInsertion { byte_len, byte_start, t: 0.0, id });
+        }
     }
 
     pub fn set_cursor_line_col(&self, line: u32, col: u32, cursor: &mut Cursor) {
