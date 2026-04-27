@@ -183,8 +183,24 @@ command!(delete_backward |cx| {
 
 command!(delete_forward_until_newline |cx| {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
-    view.cursor.unset_anchor();
-    buf.delete_forward_until_newline(&mut view.cursor);
+
+    let len = buf.text.len_chars();
+    if view.cursor.char_index >= len { return; }
+
+    let line_slice = buf.text.slice(view.cursor.char_index..);
+    let chars_to_delete = line_slice  // @Speed: Use memchr?
+        .chars()
+        .position(|c| c == '\n')
+        .map(|p| p.max(1))
+        .unwrap_or(len - view.cursor.char_index);
+
+    if chars_to_delete == 0 { return; }
+
+    view.cursor.anchor_char_index = Some(view.cursor.char_index + chars_to_delete);
+    copy_impl(cx, false);
+
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.delete_selection_without_animation(&mut view.cursor);
 });
 
 command!(insert_newline |cx| {
@@ -365,9 +381,11 @@ command!(paste |cx| {
     buf.insert_literal(&clipboard, &mut view.cursor);
     buf.append_last_insertion_to_currently_animated_insertions();
     view.cursor.unset_anchor();
+
+    cx.editor.messager.push("pasted X bytes", cx.gpu);
 });
 
-fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) {
+fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     let Some(anchor_char_index) = view.cursor.anchor_char_index else {

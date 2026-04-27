@@ -1,4 +1,5 @@
 use crate::color::{Color, GpuColor, lerp_color};
+use crate::messager::MESSAGER_FONT_SIZE;
 use crate::{Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, palette, tracy};
 
 use std::ops::Range;
@@ -82,6 +83,11 @@ impl Gpu {
     #[inline]
     pub fn current_clip(&self) -> [f32; 4] {
         self.batch_pool[self.batch_count - 1].clip
+    }
+
+    #[inline]
+    pub fn measure_message(&mut self, s: &str) -> f32 {
+        measure_str(self, s, MESSAGER_FONT_SIZE)
     }
 }
 

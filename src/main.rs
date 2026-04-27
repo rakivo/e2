@@ -18,6 +18,8 @@
 // TODO: Auto-indentation (minor)
 // TODO: Automatic session save
 
+// TODO: [messages] buffer
+
 // TODO: Lexer support for HERE strings
 // TODO: Lexer support for raw  strings
 
@@ -27,6 +29,8 @@
 // `
 // But the actual reliable solution to this would involve going back/forward into the file,
 // searching for a matching quote with a "state machine".
+
+// TODO: Make buffer have distinct CANONICALIZED/RELATIVE path fields
 
 #[cfg(feature = "dhat")]
 #[global_allocator]
@@ -45,26 +49,27 @@ mod tracy;
 mod director;
 mod lexer;
 mod session;
+mod messager;
 
 use lexer::token_color;
+use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
 use util::format_bytes;
 use session::{apply_session, default_session_path, load_session, save_session};
+use buffer::{AnimatedInsertion, Buffer, Cursor};
+use color::{Color, GpuColor};
+use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
+use director::Director;
 
 use std::io::{BufWriter, Write};
+use std::num::NonZero;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::fmt::Write as _;
 use std::collections::VecDeque;
 
-use buffer::{AnimatedInsertion, Buffer, Cursor};
-use color::{Color, GpuColor};
-use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap};
-use director::Director;
-use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
-
 use memmap2::MmapOptions;
 use smallstr::SmallString;
 use smallvec::SmallVec;
@@ -74,6 +79,7 @@ use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
 
 #[cfg(debug_assertions)]
 fn vec_element_size<T>(_: &Vec<T>) -> usize {
@@ -90,7 +96,7 @@ macro_rules! checked_reserve {
             if _new_cap != _old_cap {
                 let _elem = vec_element_size(&$vec);
                 eprintln!(
-                    "[{}] grew {} -> {}",
+                    "[{} reallocated]: {} -> {}",
                     $name,
                     util::format_bytes(_old_cap * _elem),
                     util::format_bytes(_new_cap * _elem),
@@ -116,7 +122,7 @@ macro_rules! checked_push {
             $vec.push($val);
             if $vec.capacity() != cap_before {
                 eprintln!(
-                    "[scratch] {} reallocated: {} -> {}",
+                    "[{} reallocated]: {} -> {}",
                     $name, cap_before, $vec.capacity()
                 );
             }
@@ -179,9 +185,8 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
     const RELEX_GOOD:  f32 = 100.0;
     const RELEX_SLOW:  f32 = 500.0;
 
-    const HUD_Y: f32 = 14.0;
     const HUD_LINE_H: f32 = 14.0;
-    const PAD_RIGHT: f32 = 180.0;
+    const PAD_RIGHT: f32 = 150.0;
 
     fn heat(v: f32, good: f32, slow: f32) -> Color {
         let t = ((v - good) / (slow - good)).clamp(0.0, 1.0);
@@ -226,7 +231,8 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
     let render = editor.render_us;
     let frame  = build + relex + render;
 
-    let x_right = gpu.win_w - PAD_RIGHT;
+    let hud_y   = gpu.win_h - HUD_LINE_H * 5.0 - 10.0;
+    let x_right = (gpu.win_w - PAD_RIGHT).clamp(0.0, f32::MAX);
 
     let mut buf = SmallString::<[u8; 64]>::new();
 
@@ -236,7 +242,7 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
         gpu,
         &buf,
         x_right,
-        HUD_Y + 0.0 * HUD_LINE_H,
+        hud_y + 0.0 * HUD_LINE_H,
         12.0,
         Color::rgba(180, 180, 180, 255),
     );
@@ -247,7 +253,7 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
         gpu,
         &buf,
         x_right,
-        HUD_Y + 1.0 * HUD_LINE_H,
+        hud_y + 1.0 * HUD_LINE_H,
         12.0,
         heat(build, BUILD_GOOD, BUILD_SLOW),
     );
@@ -258,7 +264,7 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
         gpu,
         &buf,
         x_right,
-        HUD_Y + 2.0 * HUD_LINE_H,
+        hud_y + 2.0 * HUD_LINE_H,
         12.0,
         heat(relex, RELEX_GOOD, RELEX_SLOW),
     );
@@ -269,7 +275,7 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
         gpu,
         &buf,
         x_right,
-        HUD_Y + 3.0 * HUD_LINE_H,
+        hud_y + 3.0 * HUD_LINE_H,
         12.0,
         heat(render, RENDER_GOOD, RENDER_SLOW),
     );
@@ -280,7 +286,7 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
         gpu,
         &buf,
         x_right,
-        HUD_Y + 4.0 * HUD_LINE_H,
+        hud_y + 4.0 * HUD_LINE_H,
         12.0,
         heat(frame, frame_good, frame_slow),
     );
@@ -1327,6 +1333,53 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
     }
 }
 
+pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
+    let tick  = editor.messager.tick;
+    let head  = editor.messager.head  as usize;
+    let count = editor.messager.count as usize;
+    if count == 0 {
+        return
+    }
+
+    let screen_width = gpu.win_w;
+    let font_size    = MESSAGER_FONT_SIZE;
+    let line_height  = font_size + 4.0;
+    let margin_top   = 12.0;
+    let margin_right = 8.0;
+    let x = screen_width - editor.messager.column_width - margin_right;
+
+    for i in 0..count {
+        let idx = (head + i) % MAX_MESSAGE_COUNT;
+        let message = &mut editor.messager.entries[idx];
+
+        if message.started_at.is_none() {
+            message.started_at = Some(NonZero::new(tick.max(1)).unwrap());
+        }
+
+        let age    = tick.wrapping_sub(message.started_at.unwrap().get());
+        let offset = message.blob_offset() as usize;
+        let len    = message.len()         as usize;
+        let text   = &editor.messager.blob[offset..offset + len];
+
+        let t = (age as f32 / MESSAGE_DURATION_IN_MILLISECONDS as f32).clamp(0.0, 1.0);
+        let alpha = if t < 0.15 {
+            let x = (t / 0.15).clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        } else if t < 0.6 {
+            1.0
+        } else {
+            let x = ((1.0 - t) / 0.4).clamp(0.0, 1.0);
+            x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+        };
+        let alpha = (alpha * 0.85).min(0.85);
+
+        let stack_index = (count - 1 - i) as f32;
+        let y = margin_top + stack_index * line_height;
+
+        gpu::draw_text(gpu, text, x, y, font_size, Color::rgba(255, 255, 255, (alpha * 255.0) as u8));
+    }
+}
+
 #[derive(Hash, Ord, Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct PanelId(pub u32);
 cranelift_entity::entity_impl!(PanelId);
@@ -1754,6 +1807,8 @@ pub struct Editor {
     lister_query_panel:  PanelId,  // @Redundant?
     lister_split_panel:  PanelId,
 
+    pub clipboard:       Option<arboard::Clipboard>,
+
     pub last_input_time: Instant,
 
     pub frame_count:     u32,
@@ -1774,12 +1829,11 @@ pub struct Editor {
 
     pub lister:          Lister,
     pub director:        Director,
-
-    pub clipboard:       Option<arboard::Clipboard>,
+    pub messager:        Messager,
 }
 
 impl Editor {
-    pub fn new() -> Self {
+    pub fn new(gpu: &mut Gpu) -> Self {
         let mut buffers = PrimaryMap::with_capacity(32);
         let mut views   = PrimaryMap::with_capacity(32);
         let mut panels  = PrimaryMap::with_capacity(32);
@@ -1868,23 +1922,23 @@ impl Editor {
             lister_query_panel,
             lister_query_view,
             lister_query_buffer,
-            director: Director::new(),
             clipboard: arboard::Clipboard::new().ok(),
+            director: Director::new(),
+            messager: Messager::new()
         };
 
         //
         // Try to restore session first
         //
         let session_path = &default_session_path();
-        let _restored = if let Ok(file)      = std::fs::File::open(session_path)
-                        && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
-                        && let Some(session) = load_session(&mmap[..])
+        if let Ok(file)      = std::fs::File::open(session_path)
+        && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
+        && let Some(session) = load_session(&mmap[..])
         {
-            apply_session(&mut editor, session);
-            true
-        } else {
-            false
-        };
+            let time = apply_session(&mut editor, session);
+            let text = format!("Applied session in {time}us");
+            editor.messager.push(&text, gpu);
+        }
 
         // Open the file from argv if user provided it
         open_initial_buffer(&mut editor);
@@ -2903,12 +2957,12 @@ impl ApplicationHandler<UserEvent> for App {
         let size = win.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
-        let mut editor = Editor::new();
-        editor.layout_panels(Rect::full(w as f32, h as f32));
-        editor.director.kick_scan(PathBuf::from("."), true, true, false);
-
         let mut gpu = gpu::init(Arc::clone(&win));
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
+
+        let mut editor = Editor::new(&mut gpu);
+        editor.layout_panels(Rect::full(w as f32, h as f32));
+        editor.director.kick_scan(PathBuf::from("."), true, true, false);
 
         prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
 
@@ -3262,6 +3316,9 @@ impl ApplicationHandler<UserEvent> for App {
                 editor.last_frame_time = now;
                 editor.frame_count += 1;
 
+                editor.messager.tick(dt);
+                editor.messager.evict_expired(MESSAGE_DURATION_IN_MILLISECONDS);
+
                 let elapsed = editor.last_fps_time.elapsed().as_secs_f32();
                 if elapsed >= 0.5 {
                     editor.fps       = editor.frame_count as f32 / elapsed;
@@ -3425,6 +3482,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let t1 = Instant::now();
                 {
                     render_lister_foreground(gpu, editor);
+                    render_messager(gpu, editor);
                     draw_metrics(editor, gpu, self.refresh_rate_millihertz);
                 }
                 editor.render_us_acc += t1.elapsed().as_micros() as f32;

@@ -62,10 +62,10 @@ pub struct Buffer {
     pub visible_tokens: Vec<Token>,
     pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
 
-    pub next_insertion_id: u8,  // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
-    pub currently_animated_insertions: SmallVec<[AnimatedInsertion; 4]>, // @Memory: Make this a static array
-
     pub currently_animated_deletions:  SmallVec<[AnimatedDeletion;  4]>,
+
+    pub next_insertion_id: u8, // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
+    pub currently_animated_insertions: SmallVec<[AnimatedInsertion; 4]>,
 }
 
 impl Buffer {
@@ -90,8 +90,8 @@ impl Buffer {
         let byte_len   = (byte_end - byte_start) as u32;
 
         //
-        //
         // Shift existing animations for this insertion first
+        //
         self.adjust_animated_insertions_for_insert(byte_start, byte_len as usize);
 
         //
@@ -331,7 +331,7 @@ impl Buffer {
         if chars_to_delete == 0 { return; }
 
         cursor.anchor_char_index = Some(cursor.char_index + chars_to_delete);
-        self.delete_selection_with_animation(cursor);
+        self.delete_selection_without_animation(cursor);
     }
 
     pub fn delete_word_forward(&mut self, cursor: &mut Cursor) {

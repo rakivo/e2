@@ -232,7 +232,7 @@ pub fn load_session<'a>(data: &'a [u8]) -> Option<Session<'a>> {
     Some(Session { cwd, leaves, active_index, root })
 }
 
-pub fn apply_session(editor: &mut Editor, session: Session) {
+pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
     let t0 = Instant::now();
 
     editor.canonicalized_current_working_directory = session.cwd.into();
@@ -319,7 +319,9 @@ pub fn apply_session(editor: &mut Editor, session: Session) {
         editor.mru_focus(buf_id);
     }
 
-    println!("[Applied session in {time}us]", time = t0.elapsed().as_micros() as f32);
+    let time = t0.elapsed().as_micros() as f32;
+    println!("[Applied session in {time}us]");
+    time
 }
 
 fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) -> PanelId {
