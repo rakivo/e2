@@ -145,7 +145,7 @@ command!(delete_backward |cx| {
     // If there's a selection, always just delete the selection
     //
     if view.cursor.anchor_char_index.is_some() {
-        buf.delete_selection(&mut view.cursor);
+        buf.delete_selection_with_animation(&mut view.cursor);
         return;
     }
 
@@ -172,7 +172,7 @@ command!(delete_backward |cx| {
 
             view.cursor.anchor_char_index = Some(cursor_pos);
             view.cursor.char_index = target_start;
-            buf.delete_selection(&mut view.cursor);
+            buf.delete_selection_with_animation(&mut view.cursor);
             return;
         }
     }
@@ -403,7 +403,7 @@ command!(delete_selection_and_copy |cx| {
     copy_impl(cx, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
-    buf.delete_selection(&mut view.cursor);
+    buf.delete_selection_with_animation(&mut view.cursor);
 });
 
 command!(switch_buffer |cx| {

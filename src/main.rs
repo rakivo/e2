@@ -293,7 +293,8 @@ pub struct Palette {
     pub cursor:       Color,
     pub cursor_text:  Color,
     pub paste_highlight: Color,
-    pub paren_match:  Color
+    pub paren_match:  Color,
+    pub delete_highlight: Color,
 }
 
 #[inline]
@@ -306,6 +307,7 @@ pub const fn palette() -> Palette {
         cursor_text:  Color::rgba(13, 13, 13, 255),
         paren_match:  Color::rgba(190, 128, 133, 200),
         paste_highlight: Color::hex(0xe6c86a),
+        delete_highlight: Color::hex(0x8b3a1e)
     }
 }
 
@@ -1040,7 +1042,6 @@ fn render_text_layout(
     // Cursor (on the focused view (filled in rectangle))
     //
     //
-
     let cursor_rect = |cursor_glyph_w: f32| {
         let cursor_width = if is_this_view_into_query_buffer {
             scale_base_cursor_width(scale)
@@ -1055,13 +1056,48 @@ fn render_text_layout(
             h: line_h + cursor_h,
         }
     };
-
     if show_cursor && (is_this_view_into_query_buffer || is_this_view_focused)
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         let rect = cursor_rect(cursor_glyph_w);
         gpu::draw_rect(gpu, rect.x, rect.y, rect.w, rect.h, palette().cursor);
+    }
+
+    //
+    //
+    // Deletion animations
+    //
+    //
+    for anim in &buffer.currently_animated_deletions {
+        let alpha = ((1.0 - anim.t) * 160.0) as u8; // linear fade, less transparent
+        if alpha == 0 { continue; }
+        let color = Color::rgba(
+            palette().delete_highlight.r,
+            palette().delete_highlight.g,
+            palette().delete_highlight.b,
+            alpha
+        );
+
+        for line in anim.start_line..=anim.end_line {
+            if line == anim.end_line && anim.end_col == 0         { continue }
+            let Some(ll) = layout.line_for_buffer_line(line) else { continue };
+
+            let full_x0 = if line == anim.start_line { layout.x_for_col(origin_x, anim.start_col, ll) } else { rect.x };
+            let full_x1 = if line == anim.end_line   { layout.x_for_col(origin_x, anim.end_col,   ll) } else { rect.x + rect.w };
+            let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim;
+            if full_x1 <= full_x0 { continue; }
+
+            gpu::draw_rect(gpu, full_x0, y, full_x1 - full_x0, layout.line_h, color);
+
+            if line == anim.start_line
+                && anim.start_line != anim.end_line
+                && anim.start_col > 0
+                && full_x0 > rect.x + 1.0
+            {
+                gpu::draw_rect(gpu, rect.x, y, full_x0 - rect.x, layout.line_h, color);
+            }
+        }
     }
 
     //
@@ -2227,7 +2263,9 @@ const BLINK_OFF_MS: u128 = 370;
 const BLINK_START_DELAY_MS: u128 = 500;  // Start blinking after 500ms idle
 const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop  blinking after 5s    idle
 
-const PASTE_ANIMATION_DURATION: f32 = 1.48; // nocheckin @Tune
+const DELETE_ANIMATION_DURATION: f32 = 0.115; // nocheckin @Tune
+
+const  PASTE_ANIMATION_DURATION: f32 = 1.48; // nocheckin @Tune
 
 const PASTE_ANIMATION_BITS:     usize = 4;
 const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
@@ -2337,6 +2375,23 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
             buffer.is_dirty = true; // @Hack nocheckin @DocumentThis
         }
         if !buffer.currently_animated_insertions.is_empty() {
+            still_animating = true;
+        }
+    }
+
+    //
+    // Advance deletion animations per buffer
+    //
+    for buffer in editor.buffers.values_mut() {
+        let before = buffer.currently_animated_insertions.len();
+        buffer.currently_animated_deletions.retain_mut(|a| {
+            a.t = (a.t + dt / DELETE_ANIMATION_DURATION).min(1.0);
+            a.t < 1.0
+        });
+        if buffer.currently_animated_deletions.len() < before {
+            buffer.is_dirty = true; // @Hack nocheckin @DocumentThis
+        }
+        if !buffer.currently_animated_deletions.is_empty() {
             still_animating = true;
         }
     }

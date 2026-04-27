@@ -31,6 +31,15 @@ impl Cursor {
 }
 
 #[derive(Default)]
+pub struct AnimatedDeletion {
+    pub start_line: u32,
+    pub start_col:  u32,
+    pub end_line:   u32,
+    pub end_col:    u32,
+    pub t:          f32,
+}
+
+#[derive(Default)]
 pub struct AnimatedInsertion {
     pub byte_start: usize,
     pub byte_len:   u32,
@@ -50,11 +59,13 @@ pub struct Buffer {
 
     pub scratch_space_to_flatten_rope_into: String,
 
-    pub next_insertion_id: u8,  // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
-    pub currently_animated_insertions: SmallVec<[AnimatedInsertion; 4]>,
-
     pub visible_tokens: Vec<Token>,
     pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
+
+    pub next_insertion_id: u8,  // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
+    pub currently_animated_insertions: SmallVec<[AnimatedInsertion; 4]>, // @Memory: Make this a static array
+
+    pub currently_animated_deletions:  SmallVec<[AnimatedDeletion;  4]>,
 }
 
 impl Buffer {
@@ -73,30 +84,46 @@ impl Buffer {
     }
 
     pub fn append_last_insertion_to_currently_animated_insertions(&mut self) {
-        let Some((char_start, byte_len)) = self.last_insert else { return };
-
+        let Some((char_start, char_len)) = self.last_insert else { return };
         let byte_start = self.text.char_to_byte(char_start);
-        let byte_end   = byte_start + byte_len as usize;
+        let byte_end   = (byte_start + char_len as usize).min(self.text.len_bytes());
+        let byte_len   = (byte_end - byte_start) as u32;
+
+        //
+        //
+        // Shift existing animations for this insertion first
+        self.adjust_animated_insertions_for_insert(byte_start, byte_len as usize);
 
         //
         // Check for overlap with existing animations and merge
         //
         for existing in &mut self.currently_animated_insertions {
-            let ex_end = existing.byte_start + existing.byte_len as usize;
-            let overlaps = byte_start <= ex_end && byte_end >= existing.byte_start;
+            let ex_start = existing.byte_start;
+            let ex_end   = ex_start + existing.byte_len as usize;
+            let overlaps = byte_start < ex_end && byte_end > ex_start;
             if overlaps {
-                let merged_start = existing.byte_start.min(byte_start);
+                let merged_start = ex_start.min(byte_start);
                 let merged_end   = ex_end.max(byte_end);
+
                 existing.byte_start = merged_start;
                 existing.byte_len   = (merged_end - merged_start) as u32;
-                existing.t          = 0.0;  // Restart the animation
+
+                //
+                // Only restart if new paste is FULLY inside existing, meaning that user
+                // pasted within already-highlighted region
+                //
+                let fully_inside = byte_start >= ex_start && byte_end <= ex_end;
+                if fully_inside {
+                    existing.t = 0.0;
+                }
+
+                return;
             }
         }
 
         // @Robustness: No overlap - add new entry, evict oldest if full
         if self.currently_animated_insertions.len() == PASTE_ANIMATION_MAX_ID {
             self.currently_animated_insertions.remove(0);
-            // Rebase ids since we shifted
             for (i, a) in self.currently_animated_insertions.iter_mut().enumerate() {
                 a.id = (i + 1) as u8;
             }
@@ -110,6 +137,33 @@ impl Buffer {
             byte_len,
             t: 0.0,
             id,
+        });
+    }
+
+    pub fn adjust_animated_insertions_for_insert(&mut self, insert_byte: usize, insert_len: usize) {
+        for a in &mut self.currently_animated_insertions {
+            if insert_byte <= a.byte_start {
+                a.byte_start += insert_len;
+            } else if insert_byte < a.byte_start + a.byte_len as usize {
+                a.byte_len += insert_len as u32;
+            }
+        }
+    }
+
+    #[allow(unused, reason = "@Incomplete")]
+    pub fn adjust_animated_insertions_for_delete(&mut self, delete_byte: usize, delete_len: usize) {
+        let delete_end = delete_byte + delete_len;
+        self.currently_animated_insertions.retain_mut(|a| {
+            let a_end = a.byte_start + a.byte_len as usize;
+            if delete_end <= a.byte_start {
+                a.byte_start -= delete_len;
+                true
+            } else if delete_byte >= a_end {
+                true
+            } else {
+                // Deletion overlaps the animated range, just kill the animation
+                false
+            }
         });
     }
 
@@ -267,7 +321,6 @@ impl Buffer {
         let len = self.text.len_chars();
         if cursor.char_index >= len { return; }
 
-        // Find newline by walking chars from cursor position
         let line_slice = self.text.slice(cursor.char_index..);
         let chars_to_delete = line_slice
             .chars()
@@ -275,14 +328,10 @@ impl Buffer {
             .map(|p| p.max(1))
             .unwrap_or(len - cursor.char_index);
 
-        self.text.remove(cursor.char_index..cursor.char_index + chars_to_delete);
-        self.invalidate_cache_from_char(cursor.char_index);
+        if chars_to_delete == 0 { return; }
 
-        cursor.char_index = cursor.char_index.min(self.text.len_chars());
-        cursor.preferred_col = None;
-
-        self.is_dirty = true;
-        self.last_delete = Some((cursor.char_index, chars_to_delete as u32));
+        cursor.anchor_char_index = Some(cursor.char_index + chars_to_delete);
+        self.delete_selection_with_animation(cursor);
     }
 
     pub fn delete_word_forward(&mut self, cursor: &mut Cursor) {
@@ -329,7 +378,7 @@ impl Buffer {
         self.last_delete = Some((i, (end-i) as u32));
     }
 
-    pub fn delete_selection(&mut self, cursor: &mut Cursor) {
+    pub fn delete_selection_without_animation(&mut self, cursor: &mut Cursor) {
         let anchor = match cursor.anchor_char_index {
             Some(a) => a,
             None => return,
@@ -351,6 +400,24 @@ impl Buffer {
         // Always clear selection state
         cursor.anchor_char_index = None;
         cursor.preferred_col = None;
+    }
+
+    pub fn delete_selection_with_animation(&mut self, cursor: &mut Cursor) {
+        let anchor = cursor.anchor_char_index.unwrap_or(cursor.char_index);
+        let start  = anchor.min(cursor.char_index);
+        let end    = anchor.max(cursor.char_index);
+
+        if start != end {
+            let (start_line, start_col) = self.char_to_line_col(start);
+            let (end_line,   end_col)   = self.char_to_line_col(end);
+            self.currently_animated_deletions.push(AnimatedDeletion {
+                start_line, start_col,
+                end_line,   end_col,
+                t: 0.0,
+            });
+        }
+
+        self.delete_selection_without_animation(cursor);
     }
 
     pub fn clear(&mut self) {
