@@ -150,7 +150,6 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
     write_u32(&mut out, leaves.len() as u32);
 
     let active_view = editor.active_view();
-    // let active_buf = active_view.buffer_id;
 
     let mut active_index = u32::MAX;
 
@@ -161,12 +160,10 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
         let (line, col) = (view.cursor_target_line, view.cursor_target_col);
 
         if active_view.id == view_id && view.panel_id() == Some(panel_id) { active_index = i as u32; }
-        // if view.buffer_id == active_buf { active_index = i as u32; }
 
         write_str(&mut out, file_path);
         write_u32(&mut out, line);
         write_u32(&mut out, col);
-        dbg!(line, col);
         write_f32(&mut out, view.scroll_anim);
     }
 
@@ -242,8 +239,7 @@ pub fn apply_session(editor: &mut Editor, session: Session) {
 
     let mut leaf_views  = Vec::<ViewId>::with_capacity(session.leaves.len());
 
-    let root_buffer_id  = editor.views[VIEW_MAIN].buffer_id;
-    let root_view_id    = VIEW_MAIN;
+    let root_view_id = VIEW_MAIN;
 
     for (i, sl) in session.leaves.iter().enumerate() {
         let file_path = Path::new(&sl.path);
@@ -274,7 +270,7 @@ pub fn apply_session(editor: &mut Editor, session: Session) {
 
         let view_id = if i == 0 {
             let view_id = root_view_id;
-            editor.views[view_id].buffer_id = root_buffer_id;
+            editor.views[view_id].buffer_id = buffer_id;
             view_id
         } else {
             let view_id = editor.views.next_key();
