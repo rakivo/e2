@@ -7,7 +7,7 @@ use smallstr::SmallString;
 use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{BufferId, Editor, ListerItem, PanelKind, Rect, SCALE_STEP, View, ViewId, adjust_cursors_after_buffer_mutation, buffer::Buffer, director::{EntryKind, ScanState}, editor_save_buffer_onto_disk, gpu::Gpu, rescale, scroll_page, scroll_to_cursor};
+use crate::{BufferId, Editor, ListerItem, PanelKind, Rect, SCALE_STEP, View, ViewId, adjust_cursors_after_buffer_mutation, buffer::Buffer, director::{EntryKind, ScanState}, editor_save_buffer_onto_disk, gpu::Gpu, rescale, scroll_page, scroll_to_cursor, session::{default_session_path, pretty_path}};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut Editor,
@@ -181,16 +181,17 @@ command!(delete_backward |cx| {
     buf.delete_backward(&mut view.cursor);
 });
 
-command!(delete_forward_until_newline |cx| {
+command!(delete_forward_until_newline |cx| {  // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     let len = buf.text.len_chars();
     if view.cursor.char_index >= len { return; }
 
     let line_slice = buf.text.slice(view.cursor.char_index..);
-    let chars_to_delete = line_slice  // @Speed: Use memchr?
-        .chars()
-        .position(|c| c == '\n')
+
+    buf.scratch_space_to_flatten_rope_into.clear();
+    buf.scratch_space_to_flatten_rope_into.extend(line_slice.chars());  // :BufferScratch
+    let chars_to_delete = memchr::memchr(b'\n', buf.scratch_space_to_flatten_rope_into.as_bytes())
         .map(|p| p.max(1))
         .unwrap_or(len - view.cursor.char_index);
 
@@ -381,8 +382,6 @@ command!(paste |cx| {
     buf.insert_literal(&clipboard, &mut view.cursor);
     buf.append_last_insertion_to_currently_animated_insertions();
     view.cursor.unset_anchor();
-
-    cx.editor.messager.push("pasted X bytes", cx.gpu);
 });
 
 fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratch
@@ -612,6 +611,17 @@ command!(open_file |cx| {
     cx.editor.lister.is_query_dirty = true;
     cx.editor.lister.is_listing_file_entries = true;
     cx.editor.lister.last_seen_cached_dir_generation = u64::MAX;
+});
+
+command!(save_session |cx| {
+    let path = default_session_path();
+    let result = crate::session::save_session(cx.editor, &path);
+
+    if let Ok(time) = result {
+        let path = pretty_path(&path);
+        let message = format!("Saved session in {time}us at '{path}'");
+        cx.editor.messager.push(&message, cx.gpu);
+    }
 });
 
 #[derive(Copy, Clone, Debug)]

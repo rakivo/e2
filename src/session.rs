@@ -135,7 +135,7 @@ pub struct Session<'file> {
     pub root:         SessionPanel,
 }
 
-pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
+pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<f32> {
     let t0 = Instant::now();
 
     let mut out    = Vec::with_capacity(4096);                         // @Memory @Speed: Reuse that memory?
@@ -172,11 +172,12 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<()> {
 
     let result = std::fs::write(path, &out);
 
+    let time = t0.elapsed().as_micros() as f32;
     if result.is_ok() {
-        println!("[Saved session in {time}us]", time = t0.elapsed().as_micros() as f32);
+        println!("[Saved session in {time}us]");
     }
 
-    result
+    result.map(|_| time)
 }
 
 // Walk the panel tree and collect (panel_id, view_id) for every leaf
@@ -379,4 +380,14 @@ pub fn default_session_path() -> Box<Path> {
     let dir = base.join("naysayer");
     _ = std::fs::create_dir_all(&dir);
     dir.join("session.bin").into()
+}
+
+pub fn pretty_path(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+
+    path.display().to_string()
 }

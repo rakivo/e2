@@ -36,6 +36,7 @@ dirs = "6.0.0"
 memmap2 = "0.9.10"
 ctrlc = "3.5.2"
 arboard = "3.6.1"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
 
 [profile.release]
 debug = 1
@@ -44,6 +45,7 @@ debug = 1
 inherits = "release"
 opt-level = 3
 panic = "abort"
+lto = false
 codegen-units = 1
 debug = false
 strip = true

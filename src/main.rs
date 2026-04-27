@@ -30,7 +30,7 @@
 // But the actual reliable solution to this would involve going back/forward into the file,
 // searching for a matching quote with a "state machine".
 
-// TODO: Make buffer have distinct CANONICALIZED/RELATIVE path fields
+// TODO: Make Buffer have distinct CANONICALIZED/RELATIVE path fields
 
 #[cfg(feature = "dhat")]
 #[global_allocator]
@@ -49,12 +49,14 @@ mod tracy;
 mod director;
 mod lexer;
 mod session;
+mod audioer;
 mod messager;
 
+use audioer::Audioer;
 use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
 use util::format_bytes;
-use session::{apply_session, default_session_path, load_session, save_session};
+use session::{apply_session, default_session_path, load_session, pretty_path, save_session};
 use buffer::{AnimatedInsertion, Buffer, Cursor};
 use color::{Color, GpuColor};
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
@@ -153,6 +155,8 @@ fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mu
         let font_size = scale_base_font_size(scale);
         prewarm_glyphs(gpu, font_size);
     }
+
+    prewarm_glyphs(gpu, MESSAGER_FONT_SIZE);
 
     let vertex_batch_pool_allocation = gpu.batch_pool.iter()
         .map(|b| b.verts.capacity())
@@ -549,12 +553,12 @@ impl TextLayout {
         }
 
         let line_f   = (my - self.rect.y + scroll_anim) / self.line_h;
-        let line_idx = (line_f as u32).clamp(
+        let line_index = (line_f as u32).clamp(
             self.first_buffer_line,
             self.first_buffer_line + self.lines.len() as u32 - 1,
         );
-        let vis_idx  = (line_idx - self.first_buffer_line) as usize;
-        let ll       = &self.lines[vis_idx];
+        let vis_index  = (line_index - self.first_buffer_line) as usize;
+        let ll       = &self.lines[vis_index];
         let col      = ll.col_for_screen_x(self.rect.x + PADDING_LEFT, mx, &self.glyphs);
         (ll.buffer_line, col)
     }
@@ -596,7 +600,8 @@ fn rebuild_text_layout(
             || (l.rect.h - rect.h).abs() > 0.5
     }).unwrap_or(true); // true = first build
 
-    let should_snap_cursor_anim_to_buffer = view.cursor_anim_y.is_nan(); // @Note: See View::new and animate()
+    let should_snap_cursor_anim_to_buffer =
+        view.cursor_anim_x.is_nan() || view.cursor_anim_y.is_nan(); // @Note: See View::new and animate()
     should_snap |= should_snap_cursor_anim_to_buffer;
 
     let t0 = Instant::now();
@@ -1338,7 +1343,7 @@ pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
     let head  = editor.messager.head  as usize;
     let count = editor.messager.count as usize;
     if count == 0 {
-        return
+        return;
     }
 
     let screen_width = gpu.win_w;
@@ -1349,8 +1354,8 @@ pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
     let x = screen_width - editor.messager.column_width - margin_right;
 
     for i in 0..count {
-        let idx = (head + i) % MAX_MESSAGE_COUNT;
-        let message = &mut editor.messager.entries[idx];
+        let index = (head + i) % MAX_MESSAGE_COUNT;
+        let message = &mut editor.messager.entries[index];
 
         if message.started_at.is_none() {
             message.started_at = Some(NonZero::new(tick.max(1)).unwrap());
@@ -1362,16 +1367,20 @@ pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
         let text   = &editor.messager.blob[offset..offset + len];
 
         let t = (age as f32 / MESSAGE_DURATION_IN_MILLISECONDS as f32).clamp(0.0, 1.0);
-        let alpha = if t < 0.15 {
-            let x = (t / 0.15).clamp(0.0, 1.0);
+        let alpha = if t < 0.08 {
+            // Fade in: 0.0 - 0.08
+            // Smooth step (cubic) fade in
+            let x = (t / 0.08).clamp(0.0, 1.0);
             x * x * (3.0 - 2.0 * x)
         } else if t < 0.6 {
+            // Full opacity hold
             1.0
         } else {
+            // Smooth step (quintic) fade out: 0.6 - 1.0
             let x = ((1.0 - t) / 0.4).clamp(0.0, 1.0);
             x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
         };
-        let alpha = (alpha * 0.85).min(0.85);
+        let alpha = (alpha * 0.85).min(0.85);  // Cap at 85% opacity
 
         let stack_index = (count - 1 - i) as f32;
         let y = margin_top + stack_index * line_height;
@@ -1476,7 +1485,9 @@ impl View {
         let old = self.buffer_id;
         if old == new { return; }
 
+        //
         // Save old state
+        //
         self.persistent_state_per_buffer.insert(old, ViewState {
             cursor: self.cursor,
             scroll: self.scroll,
@@ -1484,11 +1495,15 @@ impl View {
             // @Incomplete ...
         });
 
+        //
         // Switch
+        //
         self.buffer_id = new;
         self.layout    = None;
 
+        //
         // Restore if exists
+        //
         if let Some(state) = self.persistent_state_per_buffer.get(&new) {
             self.cursor = state.cursor;
             self.scroll = state.scroll;
@@ -1797,6 +1812,9 @@ pub struct Editor {
     pub blink_epoch:         Instant,
     pub last_cursor_visible: bool,
 
+    pub last_is_lister_open: bool,
+    pub last_messager_count: u32,
+
     // Mouse
     pub mouse_pos:          (f32, f32),
     pub mouse_left_pressed: bool,
@@ -1809,12 +1827,12 @@ pub struct Editor {
 
     pub clipboard:       Option<arboard::Clipboard>,
 
-    pub last_input_time: Instant,
-
     pub frame_count:     u32,
+    pub fps:             f32,
+
     pub last_fps_time:   Instant,
     pub last_frame_time: Instant,
-    pub fps:             f32,
+    pub last_input_time: Instant,
 
     pub relex_us_acc:    f32,
     pub build_us_acc:    f32,
@@ -1824,16 +1842,19 @@ pub struct Editor {
     pub build_us:        f32,
     pub render_us:       f32,
 
+    pub session_apply_time_in_milliseconds: Option<f32>,
+
     pub canonicalized_current_working_directory: SmallString<[u8; 256]>,
     pub canonicalized_last_scanned_directory:    SmallString<[u8; 256]>,
 
     pub lister:          Lister,
     pub director:        Director,
     pub messager:        Messager,
+    pub audioer:         Audioer,
 }
 
 impl Editor {
-    pub fn new(gpu: &mut Gpu) -> Self {
+    pub fn new(audioer: Audioer) -> Self {
         let mut buffers = PrimaryMap::with_capacity(32);
         let mut views   = PrimaryMap::with_capacity(32);
         let mut panels  = PrimaryMap::with_capacity(32);
@@ -1898,6 +1919,8 @@ impl Editor {
             last_cursor_visible: false,
             is_cursor_visible: true,
             buffer_cycle_index: None,
+            last_messager_count: u32::MAX,
+            last_is_lister_open: false,
             scratch_paren: Vec::with_capacity(256),
             active_panel: root_panel,
             root_panel,
@@ -1923,24 +1946,28 @@ impl Editor {
             lister_query_view,
             lister_query_buffer,
             clipboard: arboard::Clipboard::new().ok(),
+            audioer,
             director: Director::new(),
-            messager: Messager::new()
+            messager: Messager::new(),
+            session_apply_time_in_milliseconds: None
         };
 
         //
         // Try to restore session first
         //
         let session_path = &default_session_path();
+
         if let Ok(file)      = std::fs::File::open(session_path)
         && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
         && let Some(session) = load_session(&mmap[..])
         {
             let time = apply_session(&mut editor, session);
-            let text = format!("Applied session in {time}us");
-            editor.messager.push(&text, gpu);
+            editor.session_apply_time_in_milliseconds = Some(time);
         }
 
+        //
         // Open the file from argv if user provided it
+        //
         open_initial_buffer(&mut editor);
 
         editor
@@ -1994,6 +2021,7 @@ impl Editor {
         self.open_lister_impl(items, on_confirm, Some(frame_callback))
     }
 
+    #[inline]
     pub fn open_lister_impl(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: Option<ListerFrameUpdateCallback>) {
         clear_buffer(self, self.lister_query_buffer);
 
@@ -2214,20 +2242,20 @@ impl Editor {
         let len = self.most_recently_used_buffers.len();
         if len <= 1 { return self.active_view().buffer_id; }
 
-        let idx = self.buffer_cycle_index.get_or_insert(0);
-        *idx = (*idx + 1) % len;
+        let index = self.buffer_cycle_index.get_or_insert(0);
+        *index = (*index + 1) % len;
 
-        self.most_recently_used_buffers[*idx]
+        self.most_recently_used_buffers[*index]
     }
 
     pub fn previous_buffer(&mut self) -> BufferId {
         let len = self.most_recently_used_buffers.len();
         if len <= 1 { return self.active_view().buffer_id; }
 
-        let idx = self.buffer_cycle_index.get_or_insert(0);
-        *idx = if *idx == 0 { len - 1 } else { *idx - 1 };
+        let index = self.buffer_cycle_index.get_or_insert(0);
+        *index = if *index == 0 { len - 1 } else { *index - 1 };
 
-        self.most_recently_used_buffers[*idx]
+        self.most_recently_used_buffers[*index]
     }
 
     pub fn commit_buffer_cycle(&mut self) {
@@ -2319,7 +2347,7 @@ const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop  blinking after 5s    idle
 
 const DELETE_ANIMATION_DURATION: f32 = 0.115; // nocheckin @Tune
 
-const  PASTE_ANIMATION_DURATION: f32 = 1.48; // nocheckin @Tune
+const  PASTE_ANIMATION_DURATION: f32 = 1.48;  // nocheckin @Tune
 
 const PASTE_ANIMATION_BITS:     usize = 4;
 const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
@@ -2394,13 +2422,16 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
         let (cursor_line, cursor_col) = (view.cursor_target_line, view.cursor_target_col);
 
         if let Some(target_x) = layout.cursor_x(cursor_line, cursor_col) {
+            //
             // Compute target Y from scroll_anim so cursor tracks the animated scroll,
             // not the settled scroll position
+            //
             let target_y = layout.rect.y + cursor_line as f32 * line_h - view.scroll_anim;
 
             let dy = target_y - view.cursor_anim_y;
             if view.cursor_anim_y.is_nan() {  // @Redundant
                 // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
+
             } else if dy.abs() > layout.rect.h {
                 view.cursor_anim_y = target_y;
 
@@ -2412,7 +2443,26 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
                 view.cursor_anim_y = target_y;
             }
 
+            //
+            // @Design: Don't animate cursor's horizontal movements.
+            //
+
             view.cursor_anim_x = target_x;
+
+            // let dx = target_x - view.cursor_anim_x;
+            // if view.cursor_anim_x.is_nan() {
+            //     // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
+            //
+            // } else if dx.abs() > layout.rect.w {
+            //     view.cursor_anim_x = target_x;
+            //
+            // } else if dx.abs() > epsilon {
+            //     view.cursor_anim_x += dx * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
+            //     still_animating = true;
+            //
+            // } else {
+            //     view.cursor_anim_x = target_x;
+            // }
         }
     }
 
@@ -2928,18 +2978,39 @@ fn open_initial_buffer(editor: &mut Editor) {
     }
 }
 
-#[derive(Default)]
 struct App {
     gpu:    Option<Gpu>,
-    editor: Option<Editor>,
     window: Option<Arc<Window>>,
     mods:   winit::event::Modifiers,
+
+    editor: Editor,
 
     is_our_window_focused: bool,
     refresh_rate_millihertz: u32,
 
     command_table: CommandTable,
     keymap: Keymap,
+}
+
+impl App {
+    fn new(audioer: Audioer) -> Self {
+        let mut editor = Editor::new(audioer);
+        editor.director.kick_scan(PathBuf::from("."), true, true, false);
+
+        App {
+            command_table: CommandTable::from_inventory(),
+            keymap: Keymap::default_keymap(),
+
+            editor,
+
+            gpu: None,
+            window: None,
+
+            is_our_window_focused: false,
+            refresh_rate_millihertz: u32::MAX,
+            mods: Default::default(),
+        }
+    }
 }
 
 enum UserEvent {
@@ -2960,9 +3031,8 @@ impl ApplicationHandler<UserEvent> for App {
         let mut gpu = gpu::init(Arc::clone(&win));
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
 
-        let mut editor = Editor::new(&mut gpu);
+        let editor = &mut self.editor;
         editor.layout_panels(Rect::full(w as f32, h as f32));
-        editor.director.kick_scan(PathBuf::from("."), true, true, false);
 
         prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
 
@@ -2970,14 +3040,22 @@ impl ApplicationHandler<UserEvent> for App {
             .and_then(|m| m.refresh_rate_millihertz())
             .unwrap_or(60*1000);
 
+        {
+            if let Some(time) = editor.session_apply_time_in_milliseconds {
+                let path = pretty_path(&default_session_path());
+                let message = format!("Applied session in {time}us from '{path}'");
+                editor.messager.push(&message, &mut gpu);
+            }
+        }
+
         self.gpu    = Some(gpu);
-        self.editor = Some(editor);
         self.window = Some(win);
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let Some(editor) = &self.editor else { return };
         let Some(win)    = &self.window else { return };
+
+        let editor = &self.editor;
 
         let since_input = editor.last_input_time.elapsed().as_millis();
 
@@ -3026,9 +3104,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
-        if let Some(editor) = &self.editor {
-            _ = save_session(editor, &default_session_path());
-        }
+        _ = save_session(&self.editor, &default_session_path());
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -3037,7 +3113,9 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        let (Some(gpu), Some(editor), Some(win)) = (&mut self.gpu, &mut self.editor, &self.window) else { return };
+        let (Some(gpu), Some(win)) = (&mut self.gpu, &self.window) else { return };
+
+        let editor = &mut self.editor;
 
         let ctrl  = self.mods.state().control_key();
         let shift = self.mods.state().shift_key();
@@ -3182,7 +3260,12 @@ impl ApplicationHandler<UserEvent> for App {
                         if my >= list_y {
                             let local_y = my - list_y + editor.lister.scroll;  // Use new scroll, not anim
                             let hovered = (local_y / editor.lister.item_h) as usize;
+                            let hovered_index_before = editor.lister.hovered_index;
                             editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
+                                if hovered_index_before != Some(hovered as u32) {
+                                    editor.audioer.play_lister_item_hover_sound();
+                                }
+
                                 Some(hovered as u32)
                             } else {
                                 None
@@ -3275,7 +3358,12 @@ impl ApplicationHandler<UserEvent> for App {
                     if lister.contains(mx, my) && my >= list_y {
                         let local_y = my - list_y + editor.lister.scroll_anim;
                         let hovered = (local_y / item_h) as usize;
+                        let hovered_index_before = editor.lister.hovered_index;
                         editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
+                            if hovered_index_before != Some(hovered as u32) {
+                                editor.audioer.play_lister_item_hover_sound();
+                            }
+
                             Some(hovered as u32)
                         } else {
                             None
@@ -3315,6 +3403,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
                 editor.last_frame_time = now;
                 editor.frame_count += 1;
+
+                editor.last_is_lister_open = editor.lister.is_open;
+                editor.last_messager_count = editor.messager.count;
 
                 editor.messager.tick(dt);
                 editor.messager.evict_expired(MESSAGE_DURATION_IN_MILLISECONDS);
@@ -3495,6 +3586,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                 should_request_redraw |= blink_changed;
 
+                should_request_redraw |= editor.lister.is_open != editor.last_is_lister_open;
+                should_request_redraw |= editor.messager.count != editor.last_messager_count;
+                should_request_redraw |= editor.messager.count != 0;
+
                 if should_request_redraw {
                     win.request_redraw();
                 } else {
@@ -3514,16 +3609,19 @@ impl ApplicationHandler<UserEvent> for App {
 fn main() {
     let _client = tracy_client::Client::start();
 
-    let el = EventLoop::<UserEvent>::with_user_event().build().unwrap();
+    // @Note: We want to start Audio initialization as soon as possible,
+    // because audio servers tend to be VERY slow when trying to initialize a connection,
+    // very sad ...
+    let audioer = Audioer::spawn();
+
+    let Ok(el) = EventLoop::<UserEvent>::with_user_event().build() else { return };
     el.set_control_flow(ControlFlow::Wait);
 
-    let proxy = el.create_proxy();
-    ctrlc::set_handler(move || {
-        _ = proxy.send_event(UserEvent::ExitRequested);
+    ctrlc::set_handler({
+        let proxy = el.create_proxy();
+        move || _ = proxy.send_event(UserEvent::ExitRequested)
     }).unwrap();
 
-    let command_table = CommandTable::from_inventory();
-    let keymap = Keymap::default_keymap();
-    let mut app = App { command_table, keymap, ..Default::default() };
+    let mut app = App::new(audioer);
     _ = el.run_app(&mut app);
 }

@@ -201,8 +201,8 @@ impl Buffer {
         );
     }
 
-    fn invalidate_cache_from_char(&mut self, char_idx: usize) {
-        let byte = self.text.char_to_byte(char_idx);
+    fn invalidate_cache_from_char(&mut self, char_index: usize) {
+        let byte = self.text.char_to_byte(char_index);
         let keep = self.comment_cache.partition_point(|(b, _)| *b < byte);
         self.comment_cache.truncate(keep);
     }
@@ -232,75 +232,75 @@ impl Buffer {
 
     fn state_at_byte(&mut self, target_byte: usize) -> LexState {
         self.extend_cache_to(target_byte);
-        let idx = self.comment_cache
+        let index = self.comment_cache
             .partition_point(|(b, _)| *b <= target_byte)
             .saturating_sub(1);
-        self.comment_cache[idx].1
+        self.comment_cache[index].1
     }
 
     pub fn cursor_line_col(&self, cursor: &Cursor) -> (u32, u32) {
         self.char_to_line_col(cursor.char_index)
     }
 
-    pub fn char_to_line_col(&self, idx: usize) -> (u32, u32) {
-        let idx = idx.min(self.text.len_chars());
-        let line = self.text.char_to_line(idx);
+    pub fn char_to_line_col(&self, index: usize) -> (u32, u32) {
+        let index = index.min(self.text.len_chars());
+        let line = self.text.char_to_line(index);
         let line_start = self.text.line_to_char(line);
-        (line as u32, (idx - line_start) as u32)
+        (line as u32, (index - line_start) as u32)
     }
 
     pub fn insert_char(&mut self, c: char, cursor: &mut Cursor) {
-        let idx = cursor.char_index.min(self.text.len_chars());
+        let index = cursor.char_index.min(self.text.len_chars());
 
-        self.text.insert_char(idx, c);
-        self.invalidate_cache_from_char(idx);
+        self.text.insert_char(index, c);
+        self.invalidate_cache_from_char(index);
 
-        cursor.char_index = idx + 1;
+        cursor.char_index = index + 1;
         cursor.preferred_col = None;
 
         self.is_dirty = true;
-        self.last_insert = Some((idx, 1));
+        self.last_insert = Some((index, 1));
     }
 
     pub fn insert_char_after(&mut self, c: char, cursor: &mut Cursor) {
-        let idx = cursor.char_index.min(self.text.len_chars());
+        let index = cursor.char_index.min(self.text.len_chars());
 
-        self.text.insert_char(idx, c);
-        self.invalidate_cache_from_char(idx);
+        self.text.insert_char(index, c);
+        self.invalidate_cache_from_char(index);
 
         self.is_dirty = true;
-        self.last_insert = Some((idx, 1));
+        self.last_insert = Some((index, 1));
     }
 
     pub fn insert_literal(&mut self, l: &str, cursor: &mut Cursor) {
-        let idx = cursor.char_index.min(self.text.len_chars());
-        self.invalidate_cache_from_char(idx);
+        let index = cursor.char_index.min(self.text.len_chars());
+        self.invalidate_cache_from_char(index);
 
         for c in l.chars() {
-            let idx = cursor.char_index.min(self.text.len_chars());
-            self.text.insert_char(idx, c);
-            cursor.char_index = idx + 1;
+            let index = cursor.char_index.min(self.text.len_chars());
+            self.text.insert_char(index, c);
+            cursor.char_index = index + 1;
             cursor.preferred_col = None;
         }
 
         self.is_dirty = true;
         let len: u32 = l.chars().map(|c| c.len_utf8() as u32).sum();
-        self.last_insert = Some((idx, len as u32));
+        self.last_insert = Some((index, len as u32));
     }
 
     pub fn delete_backward(&mut self, cursor: &mut Cursor) {
         if cursor.char_index == 0 { return; }
 
-        let idx = cursor.char_index - 1;
+        let index = cursor.char_index - 1;
 
-        self.text.remove(idx..cursor.char_index);
-        self.invalidate_cache_from_char(idx);
+        self.text.remove(index..cursor.char_index);
+        self.invalidate_cache_from_char(index);
 
-        cursor.char_index = idx;
+        cursor.char_index = index;
         cursor.preferred_col = None;
 
         self.is_dirty = true;
-        self.last_delete = Some((idx, 1));
+        self.last_delete = Some((index, 1));
     }
 
     pub fn delete_forward(&mut self, cursor: &mut Cursor) {
@@ -315,23 +315,6 @@ impl Buffer {
 
         self.is_dirty = true;
         self.last_delete = Some((cursor.char_index, 1));
-    }
-
-    pub fn delete_forward_until_newline(&mut self, cursor: &mut Cursor) {
-        let len = self.text.len_chars();
-        if cursor.char_index >= len { return; }
-
-        let line_slice = self.text.slice(cursor.char_index..);
-        let chars_to_delete = line_slice
-            .chars()
-            .position(|c| c == '\n')
-            .map(|p| p.max(1))
-            .unwrap_or(len - cursor.char_index);
-
-        if chars_to_delete == 0 { return; }
-
-        cursor.anchor_char_index = Some(cursor.char_index + chars_to_delete);
-        self.delete_selection_without_animation(cursor);
     }
 
     pub fn delete_word_forward(&mut self, cursor: &mut Cursor) {
