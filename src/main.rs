@@ -324,6 +324,15 @@ pub const fn palette() -> Palette {
 
 const LISTER_ITEMS_PADDING: f32 = 0.0;
 const PADDING_LEFT:         f32 = 0.0;
+const QUERY_BUFFER_PADDING_LEFT: f32 = 8.0;
+
+fn padding_left(is_view_into_query_buffer: bool) -> f32 {
+    if is_view_into_query_buffer {
+        QUERY_BUFFER_PADDING_LEFT
+    } else {
+        PADDING_LEFT
+    }
+}
 
 macro_rules! define_base_and_scale {
     ($(const $name:ident: f32 = $value:expr;)*) => {
@@ -483,6 +492,8 @@ impl LineLayout {
 pub struct TextLayout {
     pub buffer_id: BufferId,
 
+    pub is_view_into_query_buffer: bool, // @Memory @Speed
+
     pub view_scroll:       f32, // view.scroll
     pub line_h:            f32,
     pub font_size:         f32,
@@ -529,7 +540,7 @@ impl TextLayout {
     #[inline]
     pub fn cursor_x(&self, buffer_line: u32, col: u32) -> Option<f32> {
         let ll = self.line_for_buffer_line(buffer_line)?;
-        Some(ll.x_for_col(self.rect.x + PADDING_LEFT, col, &self.glyphs))
+        Some(ll.x_for_col(self.rect.x + padding_left(self.is_view_into_query_buffer), col, &self.glyphs))
     }
 
     /// Full glyph screen rect at (buffer_line, col): [x0, y0, x1, y1].
@@ -540,7 +551,7 @@ impl TextLayout {
             + (ll.buffer_line - self.first_buffer_line) as f32 * self.line_h
             - (scroll_anim % self.line_h);
 
-        let x0 = ll.x_for_col(self.rect.x + PADDING_LEFT, col, &self.glyphs);
+        let x0 = ll.x_for_col(self.rect.x + padding_left(self.is_view_into_query_buffer), col, &self.glyphs);
         let x1 = x0 + ll.glyph_width_at_col(col, fallback_w, &self.glyphs);
         Some([x0, y, x1, y + self.line_h])
     }
@@ -559,7 +570,7 @@ impl TextLayout {
         );
         let vis_index  = (line_index - self.first_buffer_line) as usize;
         let ll       = &self.lines[vis_index];
-        let col      = ll.col_for_screen_x(self.rect.x + PADDING_LEFT, mx, &self.glyphs);
+        let col      = ll.col_for_screen_x(self.rect.x + padding_left(self.is_view_into_query_buffer), mx, &self.glyphs);
         (ll.buffer_line, col)
     }
 
@@ -864,6 +875,7 @@ fn build_text_layout(
         lines,
         visible_glyph_count,
         line_offsets,
+        is_view_into_query_buffer: buffer_id == editor.lister_query_buffer,
         glyph_insertion_ids: Default::default(),
         view_scroll: view.scroll,
         first_buffer_line: first_line,
@@ -885,6 +897,9 @@ fn render_text_layout(
 
     let Some(layout) = &view.layout else { return };
 
+    let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
+    let is_this_view_into_query_buffer = lister_query_view_id == view.id;
+
     let line_y = |buffer_line: u32| -> f32 {
         layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim
     };
@@ -895,7 +910,8 @@ fn render_text_layout(
     let min_cursor_w = scale_base_cursor_width(scale);
     let cursor_h     = scale_base_cursor_height(scale);
     let cursor_outline_thickness = scale_base_cursor_outline_thickness(scale);
-    let origin_x     = rect.x + PADDING_LEFT;
+    let padding_left = padding_left(is_this_view_into_query_buffer);
+    let origin_x     = rect.x + padding_left;
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
 
@@ -907,9 +923,6 @@ fn render_text_layout(
         .unwrap_or(min_cursor_w * 4.0);
 
     let min_cursor_w = min_cursor_w.max(space_width);
-
-    let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
-    let is_this_view_into_query_buffer = lister_query_view_id == view.id;
 
     //
     //
@@ -1087,8 +1100,9 @@ fn render_text_layout(
     //
     //
     for anim in &buffer.currently_animated_deletions {
-        let alpha = ((1.0 - anim.t) * 160.0) as u8; // linear fade, less transparent
-        if alpha == 0 { continue; }
+        let alpha = ((1.0 - anim.t) * 160.0) as u8;  // Linear fade
+        if alpha == 0 { continue }
+
         let color = Color::rgba(
             palette().delete_highlight.r,
             palette().delete_highlight.g,
@@ -1187,52 +1201,80 @@ fn render_text_layout(
     }
 }
 
+fn lister_rect(win_w: f32, win_h: f32, open_anim: f32, scale: f32) -> Rect {
+    let t = 1.0 - (1.0 - open_anim).powi(4);
+
+    let panel_w = (win_w * 0.45).clamp(320.0, 720.0);
+    let panel_h = (win_h * 0.65).clamp(200.0, 600.0);
+
+    let cx = win_w * 0.50;
+    let cy = (win_h - panel_h) * 0.40 + panel_h * 0.50;
+
+    let min_w = 60.0 * scale;
+    let min_h = 40.0 * scale;
+
+    let w = (panel_w * t).max(min_w);
+    let h = (panel_h * t).max(min_h);
+
+    Rect {
+        x: cx - w * 0.5,
+        y: cy - h * 0.5,
+        w,
+        h,
+    }
+}
+
 // Frosted glass approximation - layered semi-transparent rects
 // with slight size variations to fake depth
-fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32) {
+fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32, open_anim: f32) {
+    let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
+
     // Base dark fill
     gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
-        Color::rgba(12, 9, 4, 200));
+        Color::rgba(12, 9, 4, a(200)));
 
     // Warm tint layer
     gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
-        Color::rgba(40, 25, 8, 40));
+        Color::rgba(40, 25, 8, a(40)));
 
     // Slightly inset lighter layer - gives illusion of depth/glass
     let i = scale * 1.0;
     gpu::draw_rect(gpu, lister.x + i, lister.y + i, lister.w - i*2.0, lister.h - i*2.0,
-        Color::rgba(255, 200, 120, 12));
+        Color::rgba(255, 200, 120, a(12)));
 
     // Top edge highlight - light catches the glass rim
     gpu::draw_rect(gpu, lister.x, lister.y, lister.w, scale,
-        Color::rgba(255, 210, 140, 60));
+        Color::rgba(255, 210, 140, a(60)));
 
     // Left edge highlight
     gpu::draw_rect(gpu, lister.x, lister.y, scale, lister.h,
-        Color::rgba(255, 210, 140, 30));
+        Color::rgba(255, 210, 140, a(30)));
 
     // Bottom edge shadow
     gpu::draw_rect(gpu, lister.x, lister.y + lister.h - scale, lister.w, scale,
-        Color::rgba(0, 0, 0, 80));
+        Color::rgba(0, 0, 0, a(80)));
 }
 
 fn render_lister_background(gpu: &mut Gpu, editor: &Editor) {
     if editor.active_panel != editor.lister_split_panel { return; }
 
-    if !editor.lister.is_open { return; }
+    if !editor.lister.renderer_is_open() { return; }
 
     // Dim the whole screen
     gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
 }
 
 fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
-    if !editor.lister.is_open { return; }
+    if !editor.lister.renderer_is_open() { return; }
+
+    let open_anim = editor.lister.open_anim;
+    let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
 
     let scale     = editor.scale;
     let font_size = editor.font_size();
     let line_h    = editor.line_h();
 
-    let lister = lister_rect(gpu.win_w, gpu.win_h);
+    let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
     let Rect { x: px, y: py, w: pw, h: ph } = lister;
 
     let pad     = (8.0 * scale).round();
@@ -1249,15 +1291,15 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
 
     // Outer border
     gpu::draw_rect_outline(gpu, px, py, pw, ph, sep,
-                           Color::rgba(180, 140, 80, 200));
+                           Color::rgba(180, 140, 80, a(200)));
 
     // Inner border
     gpu::draw_rect_outline(gpu, px + sep, py + sep, pw - sep*2.0, ph - sep*2.0, sep,
-                           Color::rgba(80, 60, 30, 80));
+                           Color::rgba(80, 60, 30, a(80)));
 
     // Separator
     gpu::draw_rect(gpu, px, py + input_h, pw, sep,
-                   Color::rgba(180, 140, 80, 160));
+                   Color::rgba(180, 140, 80, a(160)));
 
     // Item count
     editor.lister.scratch_str.clear();
@@ -1267,7 +1309,7 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
                    px + pw - pad - count_w,
                    py + input_h * 0.44 + line_h * 0.35,
                    font_size * 0.80,
-                   Color::rgba(160, 120, 60, 150));
+                   Color::rgba(160, 120, 60, a(150)));
 
     // Items
     let first   = (editor.lister.scroll_anim / item_h) as usize;
@@ -1290,26 +1332,28 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
 
         // Alternating row tint  very subtle, just enough to separate rows
         if index % 2 == 0 {
-            gpu::draw_rect(gpu, px, iy, pw, item_h, Color::rgba(255, 200, 100, 8));
+            gpu::draw_rect(gpu, px, iy, pw, item_h, Color::rgba(255, 200, 100, a(8)));
         }
 
 
         if is_mouse_cursor_hidden && is_hovered && !is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(60, 45, 15, 120));
+            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(60, 45, 15, a(120)));
         }
 
         if is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(80, 55, 20, 180));
-            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h, Color::hex(0xc3a983));
-            gpu::draw_rect(gpu, px, iy, pw, sep, Color::rgba(180, 140, 80, 60));
-            gpu::draw_rect(gpu, px, iy + item_h - sep, pw, sep, Color::rgba(180, 140, 80, 60));
+            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(80, 55, 20, a(180)));
+            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h, Color::rgba(195, 169, 131, a(255)));
+            gpu::draw_rect(gpu, px, iy, pw, sep, Color::rgba(180, 140, 80, a(60)));
+            gpu::draw_rect(gpu, px, iy + item_h - sep, pw, sep, Color::rgba(180, 140, 80, a(60)));
         }
 
         let label_x = px + pad + sep * 5.0;
         let label_y = iy + item_h * 0.5 + line_h * 0.35;
 
-        gpu::draw_text(gpu, &item.label, label_x, label_y, font_size,
-                       if is_selected { Color::hex(0xf0d090) } else { Color::rgba(200, 190, 165, 220) });
+        gpu::draw_text(
+            gpu, &item.label, label_x, label_y, font_size,
+            if is_selected { Color::rgba(240, 208, 144, a(255)) } else { Color::rgba(200, 190, 165, a(220)) }
+        );
 
         if !item.sublabel.is_empty() {
             let sub_w = gpu::measure_str(gpu, &item.sublabel, font_size * 0.82);
@@ -1318,8 +1362,8 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
                 px + pw - pad - sub_w,
                 label_y,
                 font_size * 0.82,
-                if is_selected { Color::rgba(180, 140, 80, 200) }
-                else           { Color::rgba(120, 100, 60, 120) }
+                if is_selected { Color::rgba(180, 140, 80, a(200)) }
+                else           { Color::rgba(120, 100, 60, a(120)) }
             );
         }
     }
@@ -1337,10 +1381,10 @@ fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
         let bar_y    = list_y + bar_frac * (list_h - bar_h);
 
         // Scrollbar track - very faint
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, Color::rgba(255, 200, 100, 15));
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, Color::rgba(255, 200, 100, a(15)));
 
         // Scrollbar thumb
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h, Color::rgba(180, 140, 80, 140));
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h, Color::rgba(180, 140, 80, a(140)));
     }
 }
 
@@ -1596,6 +1640,8 @@ pub struct Lister {
 
     pub scroll:        f32,
     pub scroll_anim:   f32,
+    pub open_anim:     f32,  // 0.0 = closed, 1.0 = fully open
+
     pub item_h:        f32,
     pub list_h:        f32,
 
@@ -1613,6 +1659,7 @@ impl Lister {
     pub fn new() -> Self {
         Self {
             is_open: false,
+            open_anim: 0.0,
             query: SmallString::new(),
             filtered: Default::default(),
             last_seen_cached_dir_generation: u64::MAX,
@@ -1632,6 +1679,14 @@ impl Lister {
             list_h: 0.0,
             item_h: 0.0
         }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.is_open
+    }
+
+    pub fn renderer_is_open(&self) -> bool {
+        self.open_anim > 0.10
     }
 
     pub fn rebuild_filtered(&mut self) {
@@ -2009,7 +2064,7 @@ impl Editor {
 
     #[inline]
     pub fn is_lister_open_and_is_it_listing_file_entries(&self) -> bool {
-        self.lister.is_open && self.lister.is_listing_file_entries
+        self.lister.is_open() && self.lister.is_listing_file_entries
     }
 
     #[inline]
@@ -2109,8 +2164,8 @@ impl Editor {
     /// (exactly two children, both Leaf).  N+2 panels max.
     pub fn layout_panels(&mut self, win_rect: Rect) {
         self.layout_panel(self.root_panel, win_rect);
-        self.layout_panel(self.lister_query_panel, lister_rect(win_rect.w, win_rect.h));
-        self.layout_panel(self.lister_split_panel, lister_rect(win_rect.w, win_rect.h));
+        self.layout_panel(self.lister_query_panel, lister_rect(win_rect.w, win_rect.h, 1.0, self.scale));
+        self.layout_panel(self.lister_split_panel, lister_rect(win_rect.w, win_rect.h, 1.0, self.scale));
     }
 
     fn layout_panel(&mut self, id: PanelId, rect: Rect) {
@@ -2517,6 +2572,22 @@ fn animate(editor: &mut Editor, dt: f32) -> bool {
         editor.lister.scroll_anim = editor.lister.scroll;
     }
 
+    //
+    // Lister opening animation
+    //
+    let target = if editor.lister.is_open { 1.0_f32 } else { 0.0 };
+    let speed = if editor.lister.open_anim > target { 25.0 } else { 25.0 }; // @Tune
+    let remaining = target - editor.lister.open_anim;
+    if remaining.abs() < 0.08 {
+        editor.lister.open_anim = target;
+    } else {
+        let step = (remaining * speed * dt).clamp(-0.15, 0.15);
+        editor.lister.open_anim += step;
+        editor.lister.open_anim = editor.lister.open_anim.clamp(0.0, 1.0);
+    }
+
+    still_animating |= editor.lister.open_anim != target;
+
     still_animating
 }
 
@@ -2600,7 +2671,7 @@ pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId
     let panels = &editor.panels;
 
     let mut stack = SmallVec::<[_; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
-    if editor.lister.is_open {
+    if editor.lister.is_open() {
         stack.push(editor.lister_split_panel);
     }
 
@@ -2683,18 +2754,6 @@ fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     editor.reset_blink();
 }
 
-const fn lister_rect(win_w: f32, win_h: f32) -> Rect {
-    let panel_w = (win_w * 0.45).clamp(320.0, 720.0);
-    let panel_h = (win_h * 0.65).clamp(200.0, 600.0);
-
-    Rect {
-        x: ((win_w - panel_w) * 0.50).round(),
-        y: ((win_h - panel_h) * 0.40).round(),
-        w: panel_w,
-        h: panel_h,
-    }
-}
-
 fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
     let index = cx.editor.lister.selected_index;
     let Some(index) = cx.editor.lister.filtered.get(index as usize) else { return };
@@ -2732,8 +2791,8 @@ pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) ->
 }
 
 fn editor_handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &CommandTable) -> bool {
-    if editor.lister.is_open {
-        let lister = lister_rect(gpu.win_w, gpu.win_h);
+    if editor.lister.is_open() {
+        let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
         let (mx, my) = editor.mouse_pos;
         if lister.contains(mx, my) {
             let line_h   = editor.line_h();
@@ -3063,6 +3122,11 @@ impl ApplicationHandler<UserEvent> for App {
 
         let editor = &self.editor;
 
+        if editor.lister.open_anim > 0.0 && !editor.lister.is_open {
+            win.request_redraw();
+            return;
+        }
+
         let since_input = editor.last_input_time.elapsed().as_millis();
 
         if since_input < BLINK_START_DELAY_MS {
@@ -3239,12 +3303,12 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p)   => p.y as f32,
                 };
 
-                if editor.lister.is_open { // @Refactor
+                if editor.lister.is_open() { // @Refactor
                     //
                     // Lister scroll takes priority if open and mouse is over it
                     //
 
-                    let lister = lister_rect(gpu.win_w, gpu.win_h);
+                    let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
                     let (mx, my) = editor.mouse_pos;
                     if lister.contains(mx, my) {
                         let max_scroll = (
@@ -3350,8 +3414,8 @@ impl ApplicationHandler<UserEvent> for App {
 
                 editor.mouse_pos = (position.x as f32, position.y as f32);
 
-                if editor.lister.is_open { // @Refactor
-                    let lister = lister_rect(gpu.win_w, gpu.win_h);
+                if editor.lister.is_open() { // @Refactor
+                    let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
                     let (mx, my) = editor.mouse_pos;
                     let line_h  = editor.line_h();
                     let scale   = editor.scale;
@@ -3410,7 +3474,7 @@ impl ApplicationHandler<UserEvent> for App {
                 editor.last_frame_time = now;
                 editor.frame_count += 1;
 
-                editor.last_is_lister_open = editor.lister.is_open;
+                editor.last_is_lister_open = editor.lister.is_open();
                 editor.last_messager_count = editor.messager.count;
 
                 editor.messager.tick(dt);
@@ -3507,7 +3571,7 @@ impl ApplicationHandler<UserEvent> for App {
                     gpu::pop_clip(gpu);
                 }
 
-                if editor.lister.is_open {
+                if editor.lister.is_open() {
                     //
                     // Prepare lister bg
                     //
@@ -3515,15 +3579,16 @@ impl ApplicationHandler<UserEvent> for App {
                     let t1 = Instant::now();
                     {
                         if active_panel == editor.lister_split_panel {
-                            let lister = lister_rect(gpu.win_w, gpu.win_h);
-                            render_lister_background_frosted(gpu, lister, editor.scale);
+                            let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
+                            let t = 1.0 - (1.0 - editor.lister.open_anim).powi(4);  // Same easing as lister_rect
+                            render_lister_background_frosted(gpu, lister, editor.scale, t);
                         }
                         render_lister_background(gpu, editor);
                     }
                     editor.render_us_acc += t1.elapsed().as_micros() as f32;
                 }
 
-                if editor.lister.is_open {
+                if editor.lister.is_open() {
                     // @Cutnpaste from above
 
                     //
@@ -3592,9 +3657,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                 should_request_redraw |= blink_changed;
 
-                should_request_redraw |= editor.lister.is_open != editor.last_is_lister_open;
+                should_request_redraw |= editor.lister.is_open() != editor.last_is_lister_open;
                 should_request_redraw |= editor.messager.count != editor.last_messager_count;
                 should_request_redraw |= editor.messager.count != 0;
+                should_request_redraw |= editor.lister.open_anim > 0.0 && !editor.lister.is_open;
 
                 if should_request_redraw {
                     win.request_redraw();
