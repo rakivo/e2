@@ -14,6 +14,7 @@
 // TODO: backward-list/forward-list
 // TODO: backward-list/forward-list
 // TODO: beginning-of-defun/end-of-defun
+// TODO: align-rexegp
 
 // TODO: Auto-indentation (minor)
 // TODO: Automatic session save
@@ -297,33 +298,32 @@ fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
 }
 
 pub struct Palette {
-    pub bg:           Color,
-    pub selection:    Color,
-    pub current_line: Color,
-    pub cursor:       Color,
-    pub cursor_text:  Color,
-    pub paste_highlight: Color,
-    pub paren_match:  Color,
+    pub bg:               Color,
+    pub selection:        Color,
+    pub current_line:     Color,
+    pub cursor:           Color,
+    pub cursor_text:      Color,
+    pub paste_highlight:  Color,
+    pub paren_match:      Color,
     pub delete_highlight: Color,
 }
 
 #[inline]
 pub const fn palette() -> Palette {
     Palette {
-        bg:           Color::hex(0x0f0b05),
-        selection:    Color::hex(0x112c4f),
-        cursor:       Color::hex(0xc3a983),
-        current_line: Color::hex(0x231b0e),
-        cursor_text:  Color::rgba(13, 13, 13, 255),
-        paren_match:  Color::rgba(190, 128, 133, 200),
-        paste_highlight: Color::hex(0xe6c86a),
+        bg:               Color::hex(0x0f0b05),
+        selection:        Color::hex(0x112c4f),
+        cursor:           Color::hex(0xc3a983),
+        current_line:     Color::hex(0x231b0e),
+        cursor_text:      Color::rgba(13, 13, 13, 255),
+        paren_match:      Color::rgba(190, 128, 133, 200),
+        paste_highlight:  Color::hex(0xe6c86a),
         delete_highlight: Color::hex(0x8b3a1e)
     }
 }
 
 const LISTER_ITEMS_PADDING: f32 = 0.0;
-
-const PADDING_LEFT: f32 = 8.0;
+const PADDING_LEFT:         f32 = 0.0;
 
 macro_rules! define_base_and_scale {
     ($(const $name:ident: f32 = $value:expr;)*) => {
@@ -916,6 +916,13 @@ fn render_text_layout(
     // Selection
     //
     //
+
+    // :FeelImprovement
+    //
+    // @Incomplete: Looks like selection doesn't go as much down the character,
+    // as it does go up, which is really bad.
+    //
+
     if let Some(anchor) = view.cursor.anchor_char_index {
         let _tracy = tracy::span!("render_text_layout::selection");
 
@@ -955,9 +962,9 @@ fn render_text_layout(
                 };
 
                 if x1 > x0 {
-                    gpu::draw_rect(gpu, x0, y, x1 - x0, line_h, palette().selection);
+                    gpu::draw_rect(gpu, x0,     y, x1 - x0, line_h + cursor_h, palette().selection);
                 } else {
-                    gpu::draw_rect(gpu, rect.x, y, 8.0, line_h, palette().selection);
+                    gpu::draw_rect(gpu, rect.x, y, 8.0,     line_h + cursor_h, palette().selection);
                 }
             }
         }
@@ -971,7 +978,7 @@ fn render_text_layout(
     if !is_this_view_into_query_buffer && let Some(ll) = layout.line_for_buffer_line(cursor_line) {
         let _tracy = tracy::span!("render_text_layout::current_line");
 
-        let y = view.cursor_anim_y + cursor_h;
+        let y = view.cursor_anim_y + cursor_h*2.0;
 
         let has_selection = view.cursor.anchor_char_index
             .map(|a| a != view.cursor.char_index)
@@ -1031,7 +1038,7 @@ fn render_text_layout(
             if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
                 let x = layout.x_for_col(origin_x, cursor_col, ll);
                 let w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll);
-                let y = line_y(cursor_line) + cursor_h;
+                let y = line_y(cursor_line);
                 gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
             }
         }
@@ -1041,12 +1048,11 @@ fn render_text_layout(
             if let Some(ll) = layout.line_for_buffer_line(m_line) {
                 let x = layout.x_for_col(origin_x, m_col, ll);
                 let w = layout.glyph_width_at_col(m_col, min_cursor_w, ll);
-                let y = line_y(m_line) + cursor_h;
+                let y = line_y(m_line);
                 gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
             }
         }
     }
-
 
     //
     //
@@ -2347,7 +2353,7 @@ const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop  blinking after 5s    idle
 
 const DELETE_ANIMATION_DURATION: f32 = 0.115; // nocheckin @Tune
 
-const  PASTE_ANIMATION_DURATION: f32 = 1.48;  // nocheckin @Tune
+const  PASTE_ANIMATION_DURATION: f32 = 2.48;  // nocheckin @Tune
 
 const PASTE_ANIMATION_BITS:     usize = 4;
 const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
@@ -2397,10 +2403,10 @@ fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
 fn animate(editor: &mut Editor, dt: f32) -> bool {
     let _tracy = tracy::span!("animate");
 
-    let epsilon       = 0.5f32; // Stop animating when close enough
     let mut still_animating = false;
 
-    let line_h    = editor.line_h();
+    let epsilon = 0.5f32;  // Stop animating when close enough
+    let line_h  = editor.line_h();
 
     for view in editor.views.values_mut() {
         //

@@ -579,7 +579,7 @@ pub fn draw_text_for_editor(
             let id   = ((insertion_ids[word] >> bit) & PASTE_ANIMATION_MASK) as usize;
 
             let t_raw = insertion_ts[id]; // id=0 -> 1.0 sentinel, id=1..=N -> actual t
-            let ease  = 1.0 - (1.0 - t_raw).powi(4);
+            let ease  = 1.0 - (1.0 - t_raw).powi(3);
             lerp_color(paste_highlight, base_color, ease)
         } else {
             base_color

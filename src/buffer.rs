@@ -47,6 +47,18 @@ pub struct AnimatedInsertion {
     pub id:         u8,    // stable, never reused within a session (or wrap at 15)
 }
 
+// :FeelImprovement
+//
+// @Incomplete @Note: All fields here related to char/byte positions, such as:
+// currently_animated_deletions, currently_animated_insertions and etc,
+// SHOULD GET PATCHED UP ON EVERY BUFFER MUTATION, i.e. methods like
+// insert_literal, insert_char_after, delete_backward and others should call
+// some sort of a function that would handle that.
+//
+// But yeah I dont feel like doing that right now.
+//
+// -rakivo, 28 April 2026
+//
 #[derive(Default)]
 pub struct Buffer {
     pub text: Rope,

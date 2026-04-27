@@ -198,7 +198,7 @@ command!(delete_forward_until_newline |cx| {  // :BufferScratch
     if chars_to_delete == 0 { return; }
 
     view.cursor.anchor_char_index = Some(view.cursor.char_index + chars_to_delete);
-    copy_impl(cx, false);
+    copy_impl(cx, false, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     buf.delete_selection_without_animation(&mut view.cursor);
@@ -384,7 +384,7 @@ command!(paste |cx| {
     view.cursor.unset_anchor();
 });
 
-fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratch
+fn copy_impl(cx: &mut CommandContext, unset_anchor: bool, animate: bool) { // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     let Some(anchor_char_index) = view.cursor.anchor_char_index else {
@@ -401,6 +401,18 @@ fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratch
     buf.scratch_space_to_flatten_rope_into.clear(); // :BufferScratch
     buf.scratch_space_to_flatten_rope_into.extend(slice.chars());
 
+    if anchor_char_index < char_index {
+        // @Hack nocheckin
+        buf.last_insert = Some((anchor_char_index, slice.chars().map(|c| c.len_utf8() as u32).sum()));
+        buf.append_last_insertion_to_currently_animated_insertions();
+        buf.last_insert = None;
+    } else {
+        // @Hack nocheckin
+        buf.last_insert = Some((char_index, slice.chars().map(|c| c.len_utf8() as u32).sum()));
+        buf.append_last_insertion_to_currently_animated_insertions();
+        buf.last_insert = None;
+    }
+
     if unset_anchor {
         view.cursor.unset_anchor();
     }
@@ -413,11 +425,11 @@ fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratch
 }
 
 command!(copy |cx| {
-    copy_impl(cx, true);
+    copy_impl(cx, true, true);
 });
 
 command!(delete_selection_and_copy |cx| {
-    copy_impl(cx, false);
+    copy_impl(cx, false, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     buf.delete_selection_with_animation(&mut view.cursor);
@@ -617,10 +629,20 @@ command!(save_session |cx| {
     let path = default_session_path();
     let result = crate::session::save_session(cx.editor, &path);
 
-    if let Ok(time) = result {
-        let path = pretty_path(&path);
-        let message = format!("Saved session in {time}us at '{path}'");
-        cx.editor.messager.push(&message, cx.gpu);
+    match result {
+        Ok(time) => {
+            let path = pretty_path(&path);
+            let message = format!("Saved session in {time}us at '{path}'");
+            cx.editor.messager.push(&message, cx.gpu);
+
+            cx.editor.audioer.play_startup_sound();
+        }
+
+        Err(e) => {
+            let path = pretty_path(&path);
+            let message = format!("Couldn't save session at '{path}': {e}");
+            cx.editor.messager.push(&message, cx.gpu);
+        }
     }
 });
 
