@@ -1,6 +1,6 @@
 use crate::{PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -92,6 +92,7 @@ impl Buffer {
         let path = path.into();
 
         let text = Rope::from_reader(std::fs::File::open(&path)?)?;
+
         Ok(Self { next_insertion_id: 1, text, path: Some(path), ..Default::default() })
     }
 

@@ -1,47 +1,72 @@
-#![allow(unused, dead_code)]
-
+// @Speed @Note: I really did try using custom allocators,
+// but they don't seem to work when there's a dynamic library (ABI?)
+// boundary involved.
+//
+// Worth looking into though.
+//
 // #[cfg(feature = "dhat")]
 // #[global_allocator]
 // static ALLOC: dhat::Alloc = dhat::Alloc;
-
+//
 // #[cfg(feature = "mimalloc")]
 // #[global_allocator]
 // static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use crossbeam_channel::Receiver;
 use editor::*;
 use editor::audioer::Audioer;
-use editor::lexer::token_color;
-use editor::messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
-use editor::util::format_bytes;
-use editor::session::{apply_session, default_session_path, load_session, pretty_path, save_session};
-use editor::buffer::{AnimatedInsertion, Buffer, Cursor};
-use editor::color::{Color, GpuColor};
-use editor::command::{CommandAtom, CommandContext, CommandEntry, CommandFn, CommandTable, Keymap, Mods};
-use editor::director::Director;
+use editor::messager::{MESSAGE_DURATION_IN_MILLISECONDS};
+use editor::session::{default_session_path, pretty_path, save_session};
+use editor::command::{CommandContext, CommandEntry, CommandFn, CommandTable, Keymap, Mods};
 use editor::{BLINK_START_DELAY_MS, Editor, ListerKeyDispatch, Rect, checked_reserve, gpu, prewarm_glyphs_and_print_preallocation_memory_usage};
-use editor::gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
+use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY};
+use libloading::Library;
 
-use std::io::{BufWriter, Write};
-use std::num::NonZero;
-use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::fmt::Write as _;
-use std::collections::VecDeque;
 
-use cranelift_entity::packed_option::ReservedValue;
-use cranelift_entity::{EntityRef, PrimaryMap};
-use memmap2::MmapOptions;
-use smallstr::SmallString;
-use smallvec::SmallVec;
-use wgpu::naga::FastHashMap;
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
-struct App<'a> {
+struct LoadedLib {
+    _lib:      Library,
+    commands:  &'static [CommandEntry],  // 'static is a @Hack, but lib keeps it alive
+    init:      CommandFn,
+}
+
+impl LoadedLib {
+    unsafe fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        //
+        // Copy to a unique path so dlopen is forced to map a fresh image
+        //
+        let tmp = tempfile::NamedTempFile::new()?;
+        let unique_path = tmp.into_temp_path();
+        std::fs::copy(path, &unique_path)?;
+
+        let _lib = unsafe { Library::new(&*unique_path.to_string_lossy())? };
+
+        let init = unsafe { *_lib.get::<CommandFn>(b"custom_layer_init")?.into_raw() };
+
+        let commands = unsafe { **_lib.get::<&&[CommandEntry]>(b"COMMANDS")? };
+        let commands = unsafe { core::mem::transmute(commands) };
+
+        Ok(LoadedLib { _lib, commands, init })
+    }
+}
+
+fn run_custom_layer_initialization(cx: &mut CommandContext, init: CommandFn) {
+    eprintln!("[Running custom_layer_init]");
+
+    let t0 = Instant::now();
+    init(cx);
+    eprintln!("[Ran custom_layer_init in {}us]", t0.elapsed().as_micros() as f32);
+}
+
+struct App {
     gpu:    Option<Gpu>,
     window: Option<Arc<Window>>,
     mods:   winit::event::Modifiers,
@@ -54,16 +79,18 @@ struct App<'a> {
     command_table: CommandTable,
     keymap:        Keymap,
 
-    commands: &'a [CommandEntry],
-    init: CommandFn
+    loaded:   Option<LoadedLib>,
+    lib_path: Box<Path>,
+    lib_rx:   Receiver<()>,
+    _watcher: RecommendedWatcher,  // must stay alive
 }
 
-impl<'a> App<'a> {
-    fn new(audioer: Audioer, commands: &'a [CommandEntry], init: CommandFn) -> Self {
-        let mut editor = Editor::new(audioer);
-        // editor.director.kick_scan(".".as_ref(), true, true, false); // nocheckin
+impl App {
+    fn new(audioer: Audioer, loaded: LoadedLib, lib_path: Box<Path>, lib_rx: Receiver<()>, _watcher: RecommendedWatcher) -> Self {
+        let mut editor = Editor::new(audioer, EditorLoggerConfig::new());
+        editor.director.kick_scan(".".as_ref(), true, true, false);
 
-        let mut command_table = CommandTable::from_commands(commands);
+        let mut command_table = CommandTable::from_commands(&loaded.commands);
         let keymap = Keymap::default_keymap(&mut command_table);
 
         App {
@@ -71,8 +98,11 @@ impl<'a> App<'a> {
             keymap,
 
             editor,
-            init,
-            commands,
+
+            _watcher,
+            lib_rx,
+            loaded: Some(loaded),
+            lib_path,
 
             gpu: None,
             window: None,
@@ -82,13 +112,57 @@ impl<'a> App<'a> {
             mods: Default::default(),
         }
     }
+
+    fn try_reload(&mut self) {
+        let mut triggered = self.lib_rx.try_recv().is_ok();
+        while self.lib_rx.try_recv().is_ok() {  // Drain the channel
+            triggered = true;
+        }
+
+        if !triggered {
+            return;
+        }
+
+        let result = unsafe { LoadedLib::load(&self.lib_path) };
+        match result {
+            Ok(new_lib) => {
+                let old = self.loaded.replace(new_lib);
+                drop(old);
+
+                let commands = self.loaded.as_ref().unwrap().commands;
+                self.command_table = CommandTable::from_commands(commands);
+                self.keymap = Keymap::default_keymap(&mut self.command_table);
+
+                if let Some(gpu) = &mut self.gpu {
+                    let loaded = self.loaded.as_ref().unwrap();
+                    let mut cx = CommandContext {
+                        editor: &mut self.editor,
+                        gpu,
+                        command_table: &mut self.command_table,
+                        event: None,
+                    };
+                    run_custom_layer_initialization(&mut cx, loaded.init);
+                }
+
+                if let Some(gpu) = &mut self.gpu {
+                    self.editor.messager.push("[Hot reloaded custom layer]", gpu);
+                }
+
+                println!("[Hot reloaded successfully]");
+            }
+
+            Err(e) => {
+                eprintln!("[Hot reload failed]: {e}");
+            }
+        }
+    }
 }
 
 enum UserEvent {
     ExitRequested,
 }
 
-impl ApplicationHandler<UserEvent> for App<'_> {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let win: Arc<_> = el.create_window(
             Window::default_attributes()
@@ -109,7 +183,7 @@ impl ApplicationHandler<UserEvent> for App<'_> {
 
         self.refresh_rate_millihertz = win.current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
-            .unwrap_or(60*1000);
+            .unwrap_or(60*1000); // 60Hz
 
         {
             if let Some(time) = editor.session_apply_time_in_milliseconds {
@@ -119,15 +193,14 @@ impl ApplicationHandler<UserEvent> for App<'_> {
             }
         }
 
-        {
+        if let Some(l) = &self.loaded {
             let mut cx = CommandContext {
                 editor,
                 gpu: &mut gpu,
                 command_table: &mut self.command_table,
                 event: None,
             };
-
-            (self.init)(&mut cx); // nocheckin
+            run_custom_layer_initialization(&mut cx, l.init);
         }
 
         self.gpu    = Some(gpu);
@@ -135,7 +208,9 @@ impl ApplicationHandler<UserEvent> for App<'_> {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        let Some(win)    = &self.window else { return };
+        self.try_reload();
+
+        let Some(win) = &self.window else { return };
 
         let editor = &self.editor;
 
@@ -706,36 +781,31 @@ fn main() {
     // very sad ...
     let audioer = Audioer::spawn();
 
-    let lib_path = Path::new("target/debug").join(libloading::library_filename("custom"));
+    let lib_path = Path::new("target/debug")
+        .join(libloading::library_filename("custom"));
 
-    let lib = unsafe {
-        libloading::Library::new(&lib_path)
-            .unwrap_or_else(|e| panic!("Error: Failed to load `{}`: {e}", lib_path.display()))
+    let (tx, lib_rx) = crossbeam_channel::unbounded();
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            use notify::EventKind::*;
+            match event.kind {
+                Create(_) | Modify(_) => { _ = tx.send(()); }
+                _ => {}
+            }
+        }
+    }).unwrap();
+
+    watcher.watch(&lib_path, RecursiveMode::NonRecursive).unwrap();
+
+    let loaded = unsafe {
+        LoadedLib::load(&lib_path)
+            .unwrap_or_else(|e| panic!("Failed to load `{}`: {e}", lib_path.display()))
     };
 
-    let init = unsafe {
-        *lib.get::<CommandFn>(b"custom_layer_init")
-            .expect("Error: No `custom_layer_init` symbol - did you annotate it with #[export]?")
-            .into_raw()
-    };
-
-    let commands = unsafe {
-        let Ok(sym) = lib.get::<&&[CommandEntry]>(b"COMMANDS") else {
-            eprintln!(
-                "Error: no `COMMANDS` symbol found in the custom layer\n\
-                 Hint:  did you forget to add this to the bottom of your file?\n\
-                 \n\
-                 \t+ #[unsafe(no_mangle)]\n\
-                 \t+ pub static COMMANDS: &[CommandEntry] = collect_commands!();\n"
-            );
-            return;
-        };
-        **sym
-    };
-
-    println!("Loaded {} commands:", commands.len());
-    for cmd in commands {
-        println!("  - {name}", name = cmd.name);
+    println!("Loaded {} commands:", loaded.commands.len());
+    for cmd in loaded.commands {
+        println!("  - {}", cmd.name);
     }
 
     let Ok(el) = EventLoop::<UserEvent>::with_user_event().build() else { return };
@@ -746,6 +816,6 @@ fn main() {
         move || _ = proxy.send_event(UserEvent::ExitRequested)
     }).unwrap();
 
-    let mut app = App::new(audioer, commands, init);
+    let mut app = App::new(audioer, loaded, lib_path.into(), lib_rx, watcher);
     _ = el.run_app(&mut app);
 }

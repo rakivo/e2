@@ -78,18 +78,19 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
 
 #[cfg(debug_assertions)]
-pub fn vec_element_size<T>(_: &Vec<T>) -> usize {
+#[inline(always)]
+pub const fn vec_element_size<T>(_: &Vec<T>) -> usize {
     size_of::<T>()
 }
 
 #[cfg(debug_assertions)]
 #[macro_export]
 macro_rules! checked_reserve {
-    ($vec:expr, $n:expr, $name:expr) => {
-        {
-            let _old_cap = $vec.capacity();
-            $vec.reserve($n);
-            let _new_cap = $vec.capacity();
+    ($vec:expr, $n:expr, $name:expr, $config:expr) => {
+        let _old_cap = $vec.capacity();
+        $vec.reserve($n);
+        let _new_cap = $vec.capacity();
+        if $config.log_checked_reserves {
             if _new_cap != _old_cap {
                 let _elem = vec_element_size(&$vec);
                 eprintln!(
@@ -101,6 +102,19 @@ macro_rules! checked_reserve {
             }
         }
     };
+
+    ($vec:expr, $n:expr, cfg=$config:expr) => {
+        checked_reserve!($vec, $n, stringify!($vec), $config)
+    };
+
+    ($vec:expr, $n:expr, $name:expr) => {
+        checked_reserve!($vec, $n, $name, EditorLoggerConfig::new())
+    };
+
+    ($vec:expr, $n:expr, $name:expr, cfg=$config:expr) => {
+        checked_reserve!($vec, $n, $name, $config)
+    };
+
     ($vec:expr, $n:expr) => {
         checked_reserve!($vec, $n, stringify!($vec))
     };
@@ -108,6 +122,7 @@ macro_rules! checked_reserve {
 #[cfg(not(debug_assertions))]
 #[macro_export]
 macro_rules! checked_reserve {
+    ($vec:expr, $n:expr, $name:expr, $config:expr) => { $vec.reserve($n); };
     ($vec:expr, $n:expr, $name:expr) => { $vec.reserve($n); };
     ($vec:expr, $n:expr) => { $vec.reserve($n); };
 }
@@ -115,10 +130,10 @@ macro_rules! checked_reserve {
 #[cfg(debug_assertions)]
 #[macro_export]
 macro_rules! checked_push {
-    ($vec:expr, $val:expr, $name:expr) => {
-        {
-            let cap_before = $vec.capacity();
-            $vec.push($val);
+    ($vec:expr, $val:expr, $name:expr, $config:expr) => {
+        let cap_before = $vec.capacity();
+        $vec.push($val);
+        if $config.log_checked_pushes {
             if $vec.capacity() != cap_before {
                 eprintln!(
                     "[{} reallocated]: {} -> {}",
@@ -128,6 +143,18 @@ macro_rules! checked_push {
         }
     };
 
+    ($vec:expr, $val:expr, cfg=$config:expr) => {
+        checked_push!($vec, $val, stringify!($vec), $config)
+    };
+
+    ($vec:expr, $val:expr, $name:expr) => {
+        checked_push!($vec, $val, $name, EditorLoggerConfig::new())
+    };
+
+    ($vec:expr, $val:expr, $name:expr, cfg=$config:expr) => {
+        checked_push!($vec, $val, $name, $config)
+    };
+
     ($vec:expr, $val:expr) => {
         checked_push!($vec, $val, stringify!($vec))
     };
@@ -135,12 +162,13 @@ macro_rules! checked_push {
 #[cfg(not(debug_assertions))]
 #[macro_export]
 macro_rules! checked_push {
+    ($vec:expr, $val:expr, $name:expr, $config:expr) => { $vec.push($val); };
     ($vec:expr, $val:expr, $name:expr) => { $vec.push($val); };
     ($vec:expr, $val:expr) => { $vec.push($val); };
 }
 
 pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
-    println!("[Prewarming glyphs...]");
+    eprintln!("[Prewarming glyphs...]");
     for scale in [
         editor.scale,
         editor.scale - SCALE_STEP,
@@ -160,16 +188,16 @@ pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu:
         .map(|b| b.verts.capacity())
         .sum::<usize>();
 
-    println!("[Vertex batch pool preallocation]: {}", format_bytes(vertex_batch_pool_allocation));
-    println!("[Vertex buffer size]:              {}", format_bytes(gpu.vertex_buffer.size() as _));
-    println!("[Glyph memory usage]:              {}", format_bytes(gpu.glyphs.allocation_size()));
+    eprintln!("[Vertex batch pool preallocation]: {}", format_bytes(vertex_batch_pool_allocation));
+    eprintln!("[Vertex buffer size]:              {}", format_bytes(gpu.vertex_buffer.size() as _));
+    eprintln!("[Glyph memory usage]:              {}", format_bytes(gpu.glyphs.allocation_size()));
 
     let used_pixels = gpu.atlas_cur_y as u32 * ATLAS_SIZE + gpu.atlas_cur_x as u32;
     let bytes_per_pixel = 4;
     let used_bytes = used_pixels * bytes_per_pixel;
     let total_bytes = ATLAS_SIZE * ATLAS_SIZE * bytes_per_pixel;
 
-    println!(
+    eprintln!(
         "[Atlas] used={} / {} bytes ({:.2}%)",
         format_bytes(used_bytes as _),
         format_bytes(total_bytes as _),
@@ -720,7 +748,7 @@ pub fn build_text_layout(
         Default::default()
     };
 
-    checked_reserve!(lines,  line_count as usize);
+    checked_reserve!(lines, line_count as usize, cfg=editor.logger_config);
 
     //
     //
@@ -732,12 +760,12 @@ pub fn build_text_layout(
     let scratch_str = &buffer.scratch_space_to_flatten_rope_into;
 
     let approximate_glyph_count = scratch_str.len();
-    checked_reserve!(glyphs, approximate_glyph_count);  // @Tune
+    checked_reserve!(glyphs, approximate_glyph_count, cfg=editor.logger_config);  // @Tune
 
     //
     // line_offsets[i] = (scratch_relative_start, scratch_relative_end_excl_nl)
     //
-    checked_reserve!(line_offsets, line_count as usize + 1);
+    checked_reserve!(line_offsets, line_count as usize + 1, cfg=editor.logger_config);
     {
         let mut pos = 0usize;
         let mut collected = 0u32;
@@ -749,7 +777,11 @@ pub fn build_text_layout(
                 None         => (scratch.len(), scratch.len()),
             };
 
-            checked_push!(line_offsets, (pos, line_end_excl_nl));
+            checked_push!(
+                line_offsets,
+                (pos, line_end_excl_nl),
+                cfg=editor.logger_config
+            );
             pos = next_pos;
             collected += 1;
 
@@ -761,7 +793,11 @@ pub fn build_text_layout(
         // (e.g. requesting past EOF). The loop below handles them gracefully.
         //
         while line_offsets.len() < line_count as usize {
-            checked_push!(line_offsets, (scratch.len(), scratch.len()));
+            checked_push!(
+                line_offsets,
+                (scratch.len(), scratch.len()),
+                cfg=editor.logger_config
+            );
         }
     }
 
@@ -803,7 +839,7 @@ pub fn build_text_layout(
         };
 
         if s_start == s_end {
-            checked_push!(lines, ll);
+            checked_push!(lines, ll, cfg=editor.logger_config);
             continue;
         }
 
@@ -843,7 +879,11 @@ pub fn build_text_layout(
 
             let advance = gpu_glyph.advance;
 
-            checked_push!(glyphs, Glyph { x: local_x, color, char: ch, gpu_glyph, byte_offset: abs_byte as _ });
+            checked_push!(
+                glyphs,
+                Glyph { x: local_x, color, char: ch, gpu_glyph, byte_offset: abs_byte as _ },
+                cfg=editor.logger_config
+            );
 
             local_x  += advance;
             abs_byte += ch.len_utf8();
@@ -855,13 +895,13 @@ pub fn build_text_layout(
 
         visible_glyph_count += ll.glyph_count;
 
-        checked_push!(lines, ll);
+        checked_push!(lines, ll, cfg=editor.logger_config);
     }
 
     // :Metrics
     // let actual_glyph_count = glyphs.len();
-    // println!("[Approximated glyph count]: {approximate_glyph_count}");
-    // println!("[Actual       glyph count]: {actual_glyph_count}");
+    // eprintln!("[Approximated glyph count]: {approximate_glyph_count}");
+    // eprintln!("[Actual       glyph count]: {actual_glyph_count}");
 
     TextLayout {
         buffer_id,
@@ -1842,6 +1882,23 @@ impl Lister {
     }
 }
 
+#[derive(Default)]
+pub struct EditorLoggerConfig {
+    pub log_checked_reserves: bool,
+    pub log_checked_pushes:   bool,
+}
+
+impl EditorLoggerConfig {
+    #[inline]
+    pub fn new() -> Self {
+        let debug = std::env::var("LOG_ALLOCATIONS").is_ok();
+        Self {
+            log_checked_reserves: debug,
+            log_checked_pushes:   debug,
+        }
+    }
+}
+
 pub struct Editor {
     // Storage
     pub buffers: PrimaryMap<BufferId, Buffer>,
@@ -1862,6 +1919,8 @@ pub struct Editor {
     pub buffer_cycle_index:          Option<usize>,
 
     pub panel_before_opening_lister: Option<PanelId>,
+
+    pub logger_config: EditorLoggerConfig,
 
     // Scale for font/line-height
     pub scale: f32,
@@ -1912,7 +1971,7 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(audioer: Audioer) -> Self {
+    pub fn new(audioer: Audioer, logger_config: EditorLoggerConfig) -> Self {
         let mut buffers = PrimaryMap::with_capacity(32);
         let mut views   = PrimaryMap::with_capacity(32);
         let mut panels  = PrimaryMap::with_capacity(32);
@@ -1972,6 +2031,7 @@ impl Editor {
             panels,
             lister_split_panel,
             canonicalized_path_to_buffer_id,
+            logger_config,
             lister: Lister::new(),
             last_input_time: Instant::now(),
             last_cursor_visible: false,

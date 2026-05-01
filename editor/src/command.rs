@@ -153,6 +153,8 @@ pub struct Keymap {
 
 impl Keymap {
     pub fn default_keymap(table: &mut CommandTable) -> Self {
+        use NamedKey::*;
+
         let mut km = Self {
             basic_character_atom:     table.intern("basic_character"),
             switch_buffer_atom:       table.intern("switch_buffer"),
@@ -160,7 +162,6 @@ impl Keymap {
             cycle_buffers_right_atom: table.intern("cycle_buffers_right"),
             bindings: Default::default()
         };
-        use NamedKey::*;
 
         // Movement
         km.bind(KeyCombo::named(ArrowLeft),  table.intern("move_left"));
