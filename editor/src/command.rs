@@ -204,6 +204,7 @@ impl Keymap {
         km.bind(KeyCombo::ctrl('g'), table.intern("unset_anchor"));
         km.bind(KeyCombo::alt('v'),  table.intern("move_page_up"));
         km.bind(KeyCombo::alt('q'),  table.intern("open_file"));
+        km.bind(KeyCombo::alt('m'),  table.intern("move_to_first_character_in_current_line"));
 
         // Splits - physical keys so they're layout-independent
         km.bind(KeyCombo::ctrl('3'), table.intern("split_vertically"));

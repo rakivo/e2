@@ -340,6 +340,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 if let Some(command_atom) = self.keymap.lookup(&event, mods) {
                     let Some(&command) = self.command_table.get(&command_atom) else {
+                        eprintln!("[Undefined command]: {}", self.command_table.resolve(command_atom));
                         return;
                     };
 

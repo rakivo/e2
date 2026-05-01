@@ -93,6 +93,23 @@ pub fn move_word_backward(cx: &mut CommandContext) {
 }
 
 #[command]
+pub fn move_to_first_character_in_current_line(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    let (line, _col) = buf.char_to_line_col(view.cursor.char_index);
+
+    let char_count_before_first_non_whitespace_in_line = buf.text.line(line as usize)
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+
+    let character_index_of_line = buf.text.line_to_char(line as usize);
+
+    view.cursor.char_index = character_index_of_line + char_count_before_first_non_whitespace_in_line;
+    view.cursor.preferred_col = None;
+}
+
+#[command]
 pub fn delete_word_forward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
