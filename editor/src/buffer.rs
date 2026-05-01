@@ -95,6 +95,15 @@ impl Buffer {
         Ok(Self { next_insertion_id: 1, text, path: Some(path), ..Default::default() })
     }
 
+    // nocheckin
+    // pub fn from_file(path: impl Into<Box<Path>>) -> std::io::Result<Self> {
+    //     let path = path.into();
+    //     let text = Rope::from_reader(std::fs::File::open(&path)?)?;
+    //     let mut s = Self { next_insertion_id: 1, text, path: Some(path), ..Default::default() };
+    //     s.extend_cache_to(s.text.len_bytes()); // full scan on load
+    //     Ok(s)
+    // }
+
     pub fn append_last_insertion_to_currently_animated_insertions(&mut self) {
         let Some((char_start, char_len)) = self.last_insert else { return };
         let byte_start = self.text.char_to_byte(char_start);
@@ -200,7 +209,10 @@ impl Buffer {
         let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes());
 
         // Determine block comment state at start_line
+        self.extend_cache_to(end_byte);
         let restart_state = self.state_at_byte(start_byte);
+
+        // eprintln!("lex_visible: lines {}..{} bytes {}..{} state={:?}", start_line, end_line, start_byte, end_byte, restart_state); // nocheckin
 
         self.flatten_rope_into_scratch(start_byte, end_byte);
 
@@ -219,6 +231,14 @@ impl Buffer {
         self.comment_cache.truncate(keep);
     }
 
+    // nocheckin
+    // fn invalidate_cache_from_char(&mut self, char_index: usize) {
+    //     let byte = self.text.char_to_byte(char_index);
+    //     let keep = self.comment_cache.partition_point(|(b, _)| *b < byte);
+    //     self.comment_cache.truncate(keep);
+    //     self.extend_cache_to(self.text.len_bytes()); // re-scan to EOF from invalidation point
+    // }
+
     fn extend_cache_to(&mut self, target_byte: usize) {
         let (resume_byte, resume_state) = self.comment_cache
             .last()
@@ -236,7 +256,8 @@ impl Buffer {
         for chunk in self.text.slice(char_start..char_end).chunks() {
             self.comment_cache.push((byte_pos, state));
             tmp.clear();
-            state = lex_from(chunk, byte_pos, state, &mut tmp);
+            let new_state = lex_from(chunk, byte_pos, state, &mut tmp);
+            state = new_state;
             byte_pos += chunk.len();
         }
         self.comment_cache.push((byte_pos, state));

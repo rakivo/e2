@@ -1,9 +1,9 @@
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::SystemTime;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use parking_lot::{Mutex, Condvar};
 use crossbeam_channel::{Receiver, Sender};
 use smallvec::SmallVec;
 use wgpu::naga::FastHashMap;
@@ -157,6 +157,7 @@ struct ScanRequest {
     is_user_initiated: bool,
 }
 
+#[derive(Debug)]
 struct ScanChunk {
     path:       Arc<Path>,
     entries:    DirEntries,
@@ -179,26 +180,16 @@ impl Director {
         let queue: Queue = Default::default();
         let queue_worker = queue.clone();
 
-        let (res_tx, res_rx) = crossbeam_channel::bounded(CHUNK_SIZE);
+        let (res_tx, res_rx) = crossbeam_channel::unbounded();
 
         std::thread::spawn(move || {
-            loop {
-                let req = {
-                    let (lock, cvar) = &*queue_worker;
-                    let mut q = lock.lock();
-                    cvar.wait_while(&mut q, |q| q.is_empty());
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                background_thread_code(res_tx, queue_worker);
+            }));
 
-                    //
-                    // Always take the newest request, discard the rest
-                    //
-
-                    let n = q.len() - 1;
-                    q.drain(..n).for_each(drop);
-                    q.pop().unwrap()
-                };
-
-                do_scan(req.path, req.is_recursive, req.is_user_initiated, req.generation, &res_tx);
-            }
+            eprintln!("========================================================================================");
+            eprintln!("WORKER THREAD PANICKED: {}", result.is_err());
+            eprintln!("========================================================================================");
         });
 
         Self {
@@ -210,7 +201,7 @@ impl Director {
 
     /// Drain completed chunks - call once per frame.
     /// Returns true if anything changed (caller should rebuild filtered list).
-    pub fn poll(&mut self) -> bool {
+    pub fn poll(&mut self, path_for_checking: &Path) -> bool {
         let mut any_new = false;
 
         while let Ok(chunk) = self.receiver.try_recv() {
@@ -250,7 +241,9 @@ impl Director {
                 entry.state      = ScanState::Ready;
             }
 
-            any_new = true;
+            any_new |= chunk.path.canonicalize().is_ok_and(|canon1| {
+                path_for_checking.canonicalize().is_ok_and(|canon2| canon1 == canon2)
+            });
         }
 
         any_new
@@ -297,21 +290,12 @@ impl Director {
         }).state = ScanState::Scanning;
 
         let (lock, cvar) = &*self.queue;
-        let mut q = lock.lock();
+        let mut q = lock.lock().unwrap();
+
         if is_high_priority {
-            //
-            // High priority: displace everything, go first
-            //
             q.clear();
-            q.push(ScanRequest { path, generation, is_recursive, is_user_initiated });
-        } else {
-            //
-            // Low priority: only queue if nothing else is pending
-            //
-            if q.is_empty() {
-                q.push(ScanRequest { path, generation, is_recursive, is_user_initiated });
-            }
         }
+        q.push(ScanRequest { path, generation, is_recursive, is_user_initiated });
 
         cvar.notify_one();
     }
@@ -329,7 +313,7 @@ fn do_scan(
 ) {
     let meta = match std::fs::metadata(&path) {
         Err(e) => {
-            _ = tx.try_send(ScanChunk {
+            _ = tx.send(ScanChunk {
                 path,
                 entries:    DirEntries::default(),
                 mtime:      SystemTime::UNIX_EPOCH,
@@ -371,7 +355,7 @@ fn do_scan(
             if should_skip_dir(name_str)                                     { continue };
 
             entry_count += 1;
-            if user_initiated && entry_count > MAX_ENTRIES_PER_DIR_IF_ITS_NOT_A_USER_INITIATED_SCAN {
+            if !user_initiated && entry_count > MAX_ENTRIES_PER_DIR_IF_ITS_NOT_A_USER_INITIATED_SCAN {
                 //
                 // Directory is huge - emit what we have and don't recurse into it.
                 // (Only if the search isn't user initiated)
@@ -400,7 +384,7 @@ fn do_scan(
             }
 
             if chunk.len() >= CHUNK_SIZE {
-                _ = tx.try_send(ScanChunk {
+                _ = tx.send(ScanChunk {
                     path:    path.clone(),
                     entries: std::mem::take(&mut chunk),
                     mtime,
@@ -414,7 +398,7 @@ fn do_scan(
 
         let is_done = stack.is_empty();
         if !chunk.is_empty() || is_done {
-            _ = tx.try_send(ScanChunk {
+            _ = tx.send(ScanChunk {
                 path:    path.clone(),
                 entries: chunk,
                 mtime,
@@ -424,5 +408,27 @@ fn do_scan(
                 error:   None,
             });
         }
+    }
+}
+
+fn background_thread_code(res_tx: Sender<ScanChunk>, queue: Queue) {
+    loop {
+        let req = {
+            let (lock, cvar) = &*queue;
+            let mut q = lock.lock().unwrap();
+            while q.is_empty() {
+                q = cvar.wait(q).unwrap();
+            }
+
+            //
+            // Always take the newest request, discard the rest
+            //
+
+            let n = q.len() - 1;
+            q.drain(..n).for_each(drop);
+            q.pop().unwrap()
+        };
+
+        do_scan(req.path, req.is_recursive, req.is_user_initiated, req.generation, &res_tx);
     }
 }

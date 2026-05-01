@@ -109,7 +109,9 @@ static CHAR_CLASSES: [u8; 256] = {
 pub enum LexState {
     #[default]
     Normal,
+    InString,
     InBlockComment,
+    InRustRawString(u8) // Hash count
 }
 
 /// Returns the lexer state at end of input (for incremental relex).
@@ -157,6 +159,57 @@ pub fn lex_from(
                 return LexState::InBlockComment;
             }
         }
+
+        cur_state = LexState::Normal;
+    }
+
+    if cur_state == LexState::InString {
+        let start = 0;
+        let mut closed = false;
+        while i < len {
+            if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
+                i += hit;
+                if bytes[i] == b'\\' {
+                    i += 2; // Skip \ and the next char
+                } else {
+                    i += 1; // Closing "
+                    closed = true;
+                    break;
+                }
+            } else {
+                i = len; break;
+            }
+        }
+
+        push!(TokenKind::String, start, i);
+        if !closed { return LexState::InString; }
+        cur_state = LexState::Normal;
+    }
+
+    if let LexState::InRustRawString(hashes) = cur_state {
+        let start = 0;
+        loop {
+            match memchr::memchr(b'"', &bytes[i..]) {
+                None => {
+                    i = len;
+                    push!(TokenKind::String, start, i);
+                    return LexState::InRustRawString(hashes);
+                }
+
+                Some(hit) => {
+                    i += hit + 1;
+                    let mut h = 0u8;
+                    while h < hashes && i < len && bytes[i] == b'#' {
+                        i += 1; h += 1;
+                    }
+                    if h == hashes {
+                        push!(TokenKind::String, start, i);
+                        cur_state = LexState::Normal;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     while i < len {
@@ -196,6 +249,48 @@ pub fn lex_from(
                     push!(TokenKind::Macro, start, i);
                 } else {
                     let word = &src[start..i];
+
+                    if word == "r" && i < len && (bytes[i] == b'"' || bytes[i] == b'#') {
+                        //
+                        // Raw string!
+                        //
+
+                        // count leading #
+                        let mut hashes: u8 = 0;
+                        while i < len && bytes[i] == b'#' { i += 1; hashes += 1; }
+                        if i < len && bytes[i] == b'"' {
+                            i += 1; // "
+
+                            //
+                            // Scan for closing " followed by exactly `hashes` #
+                            //
+                            loop {
+                                match memchr::memchr(b'"', &bytes[i..]) {
+                                    None => {
+                                        i = len;
+                                        push!(TokenKind::String, start, i);
+                                        return LexState::InRustRawString(hashes);
+                                    }
+                                    Some(hit) => {
+                                        i += hit + 1;
+                                        let mut h = 0u8;
+                                        while h < hashes && i < len && bytes[i] == b'#' {
+                                            i += 1; h += 1;
+                                        }
+                                        if h == hashes {
+                                            push!(TokenKind::String, start, i);
+                                            break;  // Closed
+                                        }
+
+                                        // Wrong number of #, keep scanning
+                                    }
+                                }
+                            }
+                        } else {
+                            // Just the identifier `r`, no raw string
+                            push!(TokenKind::Default, start, i);
+                        }
+                    }
 
                     let mut kind = match word.len() {
                         2 => if matches!(word, "fn" | "if" | "as" | "in" | "do" | "is" | "go" | "to") {
@@ -302,6 +397,7 @@ pub fn lex_from(
             C_QUOTE => {
                 // String literal
                 i += 1;
+                let mut closed = false;
                 while i < len {
                     if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
                         i += hit;
@@ -309,13 +405,16 @@ pub fn lex_from(
                             i += 2; // Skip \ and the next char
                         } else {
                             i += 1; // Closing "
+                            closed = true;
                             break;
                         }
                     } else {
                         i = len; break;
                     }
                 }
+
                 push!(TokenKind::String, start, i);
+                if !closed { return LexState::InString; }
             }
 
             C_TICK => {

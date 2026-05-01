@@ -1,0 +1,17 @@
+[package]
+name = "custom"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+editor = { path = "../editor" }
+editor-macros = { path = "../editor-macros" }
+
+memchr = "2.8.0"
+winit = { version = "0.30.13", features = ["wayland", "x11"] }
+cranelift-entity = "0.129.1"
+smallstr = { version = "0.3", features = ["union"] }
+wgpu = { version = "28.0.0", default-features = false, features = ["vulkan", "wgsl", "std"] }
