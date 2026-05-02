@@ -126,10 +126,14 @@ impl Buffer {
             }
         }
 
+        // @Robustness: No overlap - add new entry, evict oldest if full
         if vec.len() == (id_max - id_min + 1) as usize {
             vec.remove(0);
             let mut id = id_min;
-            for a in vec.iter_mut() { a.id = id; id += 1; }
+            for a in vec.iter_mut() {
+                a.id = id;
+                id += 1;
+            }
             *next_id = id;
         }
 
@@ -237,10 +241,11 @@ impl Buffer {
         let start_byte = self.text.try_line_to_byte(start_line).unwrap_or(0);
         let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes());
 
-        // Determine block comment state at start_line
         self.extend_cache_to(end_byte);
+
         let restart_state = self.state_at_byte(start_byte);
 
+        // :LexerDebug
         // eprintln!("lex_visible: lines {}..{} bytes {}..{} state={:?}", start_line, end_line, start_byte, end_byte, restart_state); // nocheckin
 
         self.flatten_rope_into_scratch(start_byte, end_byte);
@@ -274,7 +279,7 @@ impl Buffer {
             .copied()
             .unwrap_or((0, LexState::Normal));
 
-        if resume_byte > target_byte { return; }
+        if resume_byte >= target_byte { return; }
 
         let char_start = self.text.byte_to_char(resume_byte);
         let char_end   = self.text.byte_to_char(target_byte);
@@ -283,12 +288,13 @@ impl Buffer {
         let mut tmp      = Vec::new();
 
         for chunk in self.text.slice(char_start..char_end).chunks() {
-            self.comment_cache.push((byte_pos, state));
             tmp.clear();
             let new_state = lex_from(chunk, byte_pos, state, &mut tmp);
             state = new_state;
             byte_pos += chunk.len();
+            self.comment_cache.push((byte_pos, state));
         }
+
         self.comment_cache.push((byte_pos, state));
     }
 

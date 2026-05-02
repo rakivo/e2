@@ -985,7 +985,7 @@ pub fn render_text_layout(
 
             for line_index in draw_start..=draw_end {
                 let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
-                let y = line_y(line_index) + cursor_h;
+                let y = line_y(line_index) + cursor_h*2.0;
 
                 let (x0, x1) = if start_line == end_line {
                     (layout.x_for_col(origin_x, start_col, ll), layout.x_for_col(origin_x, end_col, ll))
@@ -1549,7 +1549,7 @@ impl View {
             cursor_anim_x: f32::NAN,
             cursor_anim_y: f32::NAN,
             cursor_target_line: 0, cursor_target_col: 0,
-            scroll_anim: 0.0,
+            scroll_anim: scroll,
             persistent_state_per_buffer: Default::default(),
             panel_id: PanelId::reserved_value()  // Set on first layout
         }

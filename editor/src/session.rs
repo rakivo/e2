@@ -279,11 +279,6 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
             view_id
         };
 
-        editor.buffers[buffer_id].set_cursor_line_col(
-            sl.line, sl.col,
-            &mut editor.views[view_id].cursor,
-        );
-
         let total_line_count = editor.buffers[buffer_id].text.len_lines() as u32;
 
         let line = sl.line.clamp(0, total_line_count as _);
@@ -291,11 +286,18 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
         editor.views[view_id].cursor_target_col  = sl.col;
         editor.views[view_id].scroll             = sl.scroll_anim;
         editor.views[view_id].scroll_anim        = sl.scroll_anim;
+        editor.views[view_id].cursor_anim_x      = f32::NAN;
+        editor.views[view_id].cursor_anim_y      = f32::NAN;
+        editor.buffers[buffer_id].is_dirty       = true;  // Force rebuild
 
-        let mut cursor = Cursor::new();
-        cursor.char_index = editor.buffers[buffer_id].text.line_to_char(line as _);
-        editor.views[view_id].cursor = cursor;
+        editor.buffers[buffer_id].set_cursor_line_col(
+            sl.line, sl.col,
+            &mut editor.views[view_id].cursor,
+        );
+        editor.views[view_id].cursor_target_line = sl.line.clamp(0, total_line_count);
+        editor.views[view_id].cursor_target_col  = sl.col;
 
+        let cursor = editor.views[view_id].cursor.clone();
         editor.views[view_id].persistent_state_per_buffer.insert(buffer_id, ViewState {
             cursor,
             scroll:      sl.scroll_anim,
