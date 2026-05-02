@@ -9,7 +9,7 @@
 use editor::buffer::Buffer;
 use editor::director::{EntryKind, ScanState};
 use editor::session::{default_session_path, pretty_path};
-use editor::command::{CommandContext, CommandEntry};
+use editor::command::{CommandContext, CommandEntry, CommandTable, Keymap, LoadedLib};
 use editor::*;
 
 use editor_macros::{collect_commands, command, export};
@@ -186,18 +186,27 @@ pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratc
     let len = buf.text.len_chars();
     if view.cursor.char_index >= len { return; }
 
-    let line_slice = buf.text.slice(view.cursor.char_index..);
+    buf.flatten_rope_into_scratch(
+        buf.text.char_to_byte(view.cursor.char_index),
+        buf.text.len_bytes(),
+    );
 
-    buf.scratch_space_to_flatten_rope_into.clear();
-    buf.scratch_space_to_flatten_rope_into.extend(line_slice.chars());  // :BufferScratch
-    let chars_to_delete = memchr::memchr(b'\n', buf.scratch_space_to_flatten_rope_into.as_bytes())
-        .map(|p| p.max(1))
-        .unwrap_or(len - view.cursor.char_index);
+    let chars_to_delete = match memchr::memchr(b'\n', buf.scratch_space_to_flatten_rope_into.as_bytes()) {
+        Some(0) => 1,  // On the newline, delete just it
+
+        Some(p) => {
+            // Check if everything before \n is whitespace, if so, include the \n
+            let all_ws = buf.scratch_space_to_flatten_rope_into[..p].bytes().all(|b| b == b' ' || b == b'\t');
+            if all_ws { p + 1 } else { p }
+        }
+
+        None => len - view.cursor.char_index,
+    };
 
     if chars_to_delete == 0 { return; }
 
     view.cursor.anchor_char_index = Some(view.cursor.char_index + chars_to_delete);
-    copy_impl(cx, false);
+    copy_impl(cx, false, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     buf.delete_selection_without_animation(&mut view.cursor);
@@ -207,7 +216,37 @@ pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratc
 pub fn insert_newline(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
+
+    let (line, col) = buf.cursor_line_col(&view.cursor);
+    let line_str = buf.text.line(line as usize);
+
+    //
+    // Count leading whitespace bytes (all spaces/tabs are single-byte)
+    //
+    let indent_len = line_str.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+
+    //
+    // Last meaningful char before cursor
+    //
+    let last_meaningful = line_str.chars().take(col as usize).filter(|c| !c.is_whitespace()).last();
+    let open = matches!(last_meaningful, Some('{') | Some('(') | Some('['));
+
+    let mut indent = SmallString::<[u8; 128]>::new();
+
+    //
+    // Preserve tabs vs spaces
+    //
+    indent.extend(line_str.chars().take(indent_len));
+    if open {
+        // :Configuration
+        // Fill the extra 4 with spaces
+        for _ in 0..4 { indent.push(' '); }
+    }
+
     buf.insert_char('\n', &mut view.cursor);
+    if !indent.is_empty() {
+        buf.insert_literal(&indent, &mut view.cursor);
+    }
 }
 
 #[command]
@@ -398,11 +437,11 @@ pub fn paste(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     buf.insert_literal(&clipboard, &mut view.cursor);
-    buf.append_last_insertion_to_currently_animated_insertions();
+    buf.append_last_insertion_to_currently_animated_pastes();
     view.cursor.unset_anchor();
 }
 
-pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratch
+pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool, animate: bool) { // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     let Some(anchor_char_index) = view.cursor.anchor_char_index else {
@@ -419,16 +458,15 @@ pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratc
     buf.scratch_space_to_flatten_rope_into.clear(); // :BufferScratch
     buf.scratch_space_to_flatten_rope_into.extend(slice.chars());
 
-    if anchor_char_index < char_index {
-        // @Hack nocheckin
-        buf.last_insert = Some((anchor_char_index, slice.chars().map(|c| c.len_utf8() as u32).sum()));
-        buf.append_last_insertion_to_currently_animated_insertions();
-        buf.last_insert = None;
-    } else {
-        // @Hack nocheckin
-        buf.last_insert = Some((char_index, slice.chars().map(|c| c.len_utf8() as u32).sum()));
-        buf.append_last_insertion_to_currently_animated_insertions();
-        buf.last_insert = None;
+    if animate {
+        let (start, end) = if anchor_char_index < char_index {
+            (anchor_char_index, char_index)
+        } else {
+            (char_index, anchor_char_index)
+        };
+        let byte_start = buf.text.char_to_byte(start);
+        let byte_end   = buf.text.char_to_byte(end);
+        buf.animate_copy(byte_start as _, (byte_end - byte_start) as _);
     }
 
     if unset_anchor {
@@ -444,12 +482,12 @@ pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool) { // :BufferScratc
 
 #[command]
 pub fn copy(cx: &mut CommandContext) {
-    copy_impl(cx, true);
+    copy_impl(cx, true, true);
 }
 
 #[command]
 pub fn delete_selection_and_copy(cx: &mut CommandContext) {
-    copy_impl(cx, false);
+    copy_impl(cx, false, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     buf.delete_selection_with_animation(&mut view.cursor);
@@ -676,6 +714,9 @@ pub fn save_session(cx: &mut CommandContext) {
 pub static COMMANDS: &[CommandEntry] = collect_commands!();
 
 #[export]
-pub fn custom_layer_init(_cx: &mut CommandContext) {
-    // ...
+pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
+    println!("[Loaded commands count]: {}", loaded.commands.len());
+
+    *cx.command_table = CommandTable::from_commands(loaded.commands);
+    *cx.keymap = Keymap::default_keymap(&mut cx.command_table);
 }

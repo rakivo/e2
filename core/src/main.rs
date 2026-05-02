@@ -17,10 +17,10 @@ use editor::*;
 use editor::audioer::Audioer;
 use editor::messager::{MESSAGE_DURATION_IN_MILLISECONDS};
 use editor::session::{default_session_path, pretty_path, save_session};
-use editor::command::{CommandContext, CommandEntry, CommandFn, CommandTable, Keymap, Mods};
+use editor::command::{CommandContext, CommandTable, Keymap, LoadedLib, Mods};
 use editor::{BLINK_START_DELAY_MS, Editor, ListerKeyDispatch, Rect, checked_reserve, gpu, prewarm_glyphs_and_print_preallocation_memory_usage};
 use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY};
-use libloading::Library;
+use winit::keyboard::{Key, NamedKey};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,37 +32,12 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
-struct LoadedLib {
-    _lib:      Library,
-    commands:  &'static [CommandEntry],  // 'static is a @Hack, but lib keeps it alive
-    init:      CommandFn,
-}
-
-impl LoadedLib {
-    unsafe fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        //
-        // Copy to a unique path so dlopen is forced to map a fresh image
-        //
-        let tmp = tempfile::NamedTempFile::new()?;
-        let unique_path = tmp.into_temp_path();
-        std::fs::copy(path, &unique_path)?;
-
-        let _lib = unsafe { Library::new(&*unique_path.to_string_lossy())? };
-
-        let init = unsafe { *_lib.get::<CommandFn>(b"custom_layer_init")?.into_raw() };
-
-        let commands = unsafe { **_lib.get::<&&[CommandEntry]>(b"COMMANDS")? };
-        let commands = unsafe { core::mem::transmute(commands) };
-
-        Ok(LoadedLib { _lib, commands, init })
-    }
-}
-
-fn run_custom_layer_initialization(cx: &mut CommandContext, init: CommandFn) {
+fn run_custom_layer_initialization(cx: &mut CommandContext, loaded: &LoadedLib) {
     eprintln!("[Running custom_layer_init]");
 
     let t0 = Instant::now();
-    init(cx);
+    (loaded.init)(cx, loaded);
+
     eprintln!("[Ran custom_layer_init in {}us]", t0.elapsed().as_micros() as f32);
 }
 
@@ -90,13 +65,9 @@ impl App {
         let mut editor = Editor::new(audioer, EditorLoggerConfig::new());
         editor.director.kick_scan(".".as_ref(), true, true, false);
 
-        let mut command_table = CommandTable::from_commands(&loaded.commands);
-        let keymap = Keymap::default_keymap(&mut command_table);
+        let mut command_table = Default::default();
 
         App {
-            command_table,
-            keymap,
-
             editor,
 
             _watcher,
@@ -106,6 +77,9 @@ impl App {
 
             gpu: None,
             window: None,
+
+            keymap: Keymap::empty(&mut command_table),
+            command_table,
 
             is_our_window_focused: false,
             refresh_rate_millihertz: u32::MAX,
@@ -123,6 +97,10 @@ impl App {
             return;
         }
 
+        self.force_try_reload();
+    }
+
+    fn force_try_reload(&mut self) {
         let result = unsafe { LoadedLib::load(&self.lib_path) };
         match result {
             Ok(new_lib) => {
@@ -140,8 +118,9 @@ impl App {
                         gpu,
                         command_table: &mut self.command_table,
                         event: None,
+                        keymap: &mut self.keymap
                     };
-                    run_custom_layer_initialization(&mut cx, loaded.init);
+                    run_custom_layer_initialization(&mut cx, loaded);
                 }
 
                 if let Some(gpu) = &mut self.gpu {
@@ -198,9 +177,10 @@ impl ApplicationHandler<UserEvent> for App {
                 editor,
                 gpu: &mut gpu,
                 command_table: &mut self.command_table,
+                keymap: &mut self.keymap,
                 event: None,
             };
-            run_custom_layer_initialization(&mut cx, l.init);
+            run_custom_layer_initialization(&mut cx, l);
         }
 
         self.gpu    = Some(gpu);
@@ -287,7 +267,9 @@ impl ApplicationHandler<UserEvent> for App {
             ($event: expr) => {
                 CommandContext {
                     editor, gpu,
-                    event: $event, command_table: &mut self.command_table,
+                    event: $event,
+                    command_table: &mut self.command_table,
+                    keymap: &mut self.keymap,
                 }
             };
         }
@@ -299,6 +281,13 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
+                    return;
+                }
+
+                if ctrl && shift && matches!(&event.logical_key, Key::Named(NamedKey::F12)) {
+                    win.request_redraw();
+                    println!("[Trying to Hot reload]");
+                    self.force_try_reload();
                     return;
                 }
 
@@ -498,7 +487,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 editor.show_cursor(win);
 
-                if editor_handle_left_mouse_click(editor, gpu, &mut self.command_table) {
+                if editor_handle_left_mouse_click(editor, gpu, &mut self.command_table, &mut self.keymap) {
                     win.request_redraw();
                 }
 
@@ -543,7 +532,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if editor.mouse_left_pressed {
-                    if editor_handle_left_mouse_click(editor, gpu, &mut self.command_table) {
+                    if editor_handle_left_mouse_click(editor, gpu, &mut self.command_table, &mut self.keymap) {
                         win.request_redraw();
                     }
                 }
@@ -782,13 +771,24 @@ fn main() {
     // very sad ...
     let audioer = Audioer::spawn();
 
-    let lib_path = Path::new("target/debug")
-        .join(libloading::library_filename("custom"));
+    let lib_filename = libloading::library_filename("custom");
+    let path_to_this_crate      = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path_to_dir_with_target = path_to_this_crate.parent().unwrap_or(path_to_this_crate);
+
+    let profile = std::env::args()
+        .skip_while(|a| a != "--profile")
+        .nth(1)
+        .unwrap_or_else(|| env!("CARGO_PROFILE").into());
+
+    let lib_dir_path = path_to_dir_with_target.join("target").join(profile);
+    let lib_path = lib_dir_path.join(&lib_filename);
 
     let (tx, lib_rx) = crossbeam_channel::unbounded();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
+            let relevant = event.paths.iter().any(|p| p.file_name() == Some(lib_filename.as_os_str()));
+            if !relevant { return; }
             use notify::EventKind::*;
             match event.kind {
                 Create(_) | Modify(_) => { _ = tx.send(()); }
@@ -797,17 +797,13 @@ fn main() {
         }
     }).unwrap();
 
-    watcher.watch(&lib_path, RecursiveMode::NonRecursive).unwrap();
+    println!("[Watching '{lib_path}' for automatic Hot reload]", lib_path = pretty_path(&lib_path));
+    watcher.watch(&lib_dir_path, RecursiveMode::NonRecursive).unwrap();
 
     let loaded = unsafe {
         LoadedLib::load(&lib_path)
             .unwrap_or_else(|e| panic!("Failed to load `{}`: {e}", lib_path.display()))
     };
-
-    println!("Loaded {} commands:", loaded.commands.len());
-    for cmd in loaded.commands {
-        println!("  - {}", cmd.name);
-    }
 
     let Ok(el) = EventLoop::<UserEvent>::with_user_event().build() else { return };
     el.set_control_flow(ControlFlow::Wait);

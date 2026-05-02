@@ -524,10 +524,11 @@ pub fn draw_text_for_editor(
 
     cursor_color:    GpuColor,
     paste_highlight: GpuColor,
+    copy_highlight:  GpuColor,
 
     insertion_ids:     &[u64],
     global_glyph_start: usize,   // ll.glyph_start
-    insertion_ts:       [f32; PASTE_ANIMATION_MAX_ID + 1],
+    insertion_ts:       [f32; PASTE_ANIMATION_MAX_ID * 2 + 2],
 ) {
     let animated = !insertion_ids.is_empty();
     let cursor_ci = cursor_col_glyph_index.unwrap_or(usize::MAX);
@@ -580,7 +581,14 @@ pub fn draw_text_for_editor(
 
             let t_raw = insertion_ts[id]; // id=0 -> 1.0 sentinel, id=1..=N -> actual t
             let ease  = 1.0 - (1.0 - t_raw).powi(3);
-            lerp_color(paste_highlight, base_color, ease)
+
+            let highlight_color = if id <= PASTE_ANIMATION_MAX_ID {
+                paste_highlight
+            } else {
+                copy_highlight
+            };
+
+            lerp_color(highlight_color, base_color, ease)
         } else {
             base_color
         };

@@ -1,4 +1,4 @@
-use crate::{PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
+use crate::{COPY_ANIMATION_MAX_ID, PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
 
 use std::{path::Path, time::Instant};
 
@@ -40,24 +40,17 @@ pub struct AnimatedDeletion {
 }
 
 #[derive(Default)]
-pub struct AnimatedInsertion {
-    pub byte_start: usize,
+pub struct AnimatedRegion {
+    pub byte_start: u32,
     pub byte_len:   u32,
     pub t:          f32,   // 0.0 = just inserted (bright), 1.0 = fully faded
     pub id:         u8,    // stable, never reused within a session (or wrap at 15)
 }
 
-// :FeelImprovement
+// :FeelImprovement @Incomplete:
 //
-// @Incomplete @Note: All fields here related to char/byte positions, such as:
-// currently_animated_deletions, currently_animated_insertions and etc,
-// SHOULD GET PATCHED UP ON EVERY BUFFER MUTATION, i.e. methods like
-// insert_literal, insert_char_after, delete_backward and others should call
-// some sort of a function that would handle that.
-//
-// But yeah I dont feel like doing that right now.
-//
-// -rakivo, 28 April 2026
+// For whatever reason if user pastes something into a freshly copied region, the paste
+// doesn't get animated. Which isn't really good.
 //
 #[derive(Default)]
 pub struct Buffer {
@@ -74,16 +67,20 @@ pub struct Buffer {
     pub visible_tokens: Vec<Token>,
     pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
 
-    pub currently_animated_deletions:  SmallVec<[AnimatedDeletion;  4]>,
+    pub currently_animated_deletions:  SmallVec<[AnimatedDeletion;  2]>,
 
-    pub next_insertion_id: u8, // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
-    pub currently_animated_insertions: SmallVec<[AnimatedInsertion; 4]>,
+    pub next_copy_id:  u8, // Starts at 8, wraps at  COPY_ANIMATION_MAX_ID+1
+    pub next_paste_id: u8, // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
+
+    pub currently_animated_copies: SmallVec<[AnimatedRegion; 4]>, // copy,  ids 9..=15
+    pub currently_animated_pastes: SmallVec<[AnimatedRegion; 4]>, // paste, ids 1..=8
 }
 
 impl Buffer {
     pub fn new() -> Self {
         Buffer {
-            next_insertion_id: 1,
+            next_paste_id: 1,
+            next_copy_id:  PASTE_ANIMATION_MAX_ID as u8 + 1, // starts at 8
             ..Default::default()
         }
     }
@@ -93,98 +90,129 @@ impl Buffer {
 
         let text = Rope::from_reader(std::fs::File::open(&path)?)?;
 
-        Ok(Self { next_insertion_id: 1, text, path: Some(path), ..Default::default() })
+        Ok(Self { text, path: Some(path), ..Self::new() })
     }
 
-    // nocheckin
-    // pub fn from_file(path: impl Into<Box<Path>>) -> std::io::Result<Self> {
-    //     let path = path.into();
-    //     let text = Rope::from_reader(std::fs::File::open(&path)?)?;
-    //     let mut s = Self { next_insertion_id: 1, text, path: Some(path), ..Default::default() };
-    //     s.extend_cache_to(s.text.len_bytes()); // full scan on load
-    //     Ok(s)
-    // }
-
-    pub fn append_last_insertion_to_currently_animated_insertions(&mut self) {
+    pub fn append_last_insertion_to_currently_animated_pastes(&mut self) {
         let Some((char_start, char_len)) = self.last_insert else { return };
         let byte_start = self.text.char_to_byte(char_start);
         let byte_end   = (byte_start + char_len as usize).min(self.text.len_bytes());
-        let byte_len   = (byte_end - byte_start) as u32;
+        let byte_len   = byte_end - byte_start;
 
-        //
-        // Shift existing animations for this insertion first
-        //
-        self.adjust_animated_insertions_for_insert(byte_start, byte_len as usize);
+        self.animate_paste(byte_start as _, byte_len as _);
+    }
 
-        //
-        // Check for overlap with existing animations and merge
-        //
-        for existing in &mut self.currently_animated_insertions {
+    fn animate_region(
+        vec:     &mut SmallVec<[AnimatedRegion; 4]>,
+        next_id: &mut u8,
+
+        id_min:  u8,
+        id_max:  u8,
+
+        byte_start: u32,
+        byte_len:   u32,
+    ) {
+        if byte_len == 0 { return; }
+        let byte_end = byte_start + byte_len;
+
+        for existing in vec.iter_mut() {
             let ex_start = existing.byte_start;
-            let ex_end   = ex_start + existing.byte_len as usize;
-            let overlaps = byte_start < ex_end && byte_end > ex_start;
-            if overlaps {
-                let merged_start = ex_start.min(byte_start);
-                let merged_end   = ex_end.max(byte_end);
-
-                existing.byte_start = merged_start;
-                existing.byte_len   = (merged_end - merged_start) as u32;
-
-                //
-                // Only restart if new paste is FULLY inside existing, meaning that user
-                // pasted within already-highlighted region
-                //
-                let fully_inside = byte_start >= ex_start && byte_end <= ex_end;
-                if fully_inside {
-                    existing.t = 0.0;
-                }
-
+            let ex_end   = ex_start + existing.byte_len;
+            if byte_start < ex_end && byte_end > ex_start {
+                existing.byte_start = ex_start.min(byte_start);
+                existing.byte_len   = (ex_end.max(byte_end) - existing.byte_start) as u32;
+                existing.t = 0.0;
                 return;
             }
         }
 
-        // @Robustness: No overlap - add new entry, evict oldest if full
-        if self.currently_animated_insertions.len() == PASTE_ANIMATION_MAX_ID {
-            self.currently_animated_insertions.remove(0);
-            for (i, a) in self.currently_animated_insertions.iter_mut().enumerate() {
-                a.id = (i + 1) as u8;
-            }
-            self.next_insertion_id = self.currently_animated_insertions.len() as u8 + 1;
+        if vec.len() == (id_max - id_min + 1) as usize {
+            vec.remove(0);
+            let mut id = id_min;
+            for a in vec.iter_mut() { a.id = id; id += 1; }
+            *next_id = id;
         }
 
-        let id = self.next_insertion_id;
-        self.next_insertion_id = (self.next_insertion_id % PASTE_ANIMATION_MAX_ID as u8) + 1;
-        self.currently_animated_insertions.push(AnimatedInsertion {
-            byte_start,
-            byte_len,
-            t: 0.0,
-            id,
-        });
+        let id = *next_id;
+        *next_id = if *next_id >= id_max { id_min } else { *next_id + 1 };
+        vec.push(AnimatedRegion { byte_start, byte_len, t: 0.0, id });
     }
 
-    pub fn adjust_animated_insertions_for_insert(&mut self, insert_byte: usize, insert_len: usize) {
-        for a in &mut self.currently_animated_insertions {
-            if insert_byte <= a.byte_start {
-                a.byte_start += insert_len;
-            } else if insert_byte < a.byte_start + a.byte_len as usize {
+    pub fn animate_paste(&mut self, byte_start: u32, byte_len: u32) {
+        Self::animate_region(
+            &mut self.currently_animated_pastes,
+            &mut self.next_paste_id,
+            1,
+            PASTE_ANIMATION_MAX_ID as u8,
+            byte_start, byte_len,
+        );
+        self.is_dirty = true;
+    }
+
+    pub fn animate_copy(&mut self, byte_start: u32, byte_len: u32) {
+        Self::animate_region(
+            &mut self.currently_animated_copies,
+            &mut self.next_copy_id,
+            PASTE_ANIMATION_MAX_ID as u8 + 1,
+             COPY_ANIMATION_MAX_ID as u8,        // 15
+            byte_start, byte_len,
+        );
+        self.is_dirty = true;
+    }
+
+    pub fn adjust_animated_regions_for_insert(&mut self, insert_byte: usize, insert_len: usize) {
+        Self::adjust_animated_regions_for_insert_impl(&mut self.currently_animated_copies, insert_byte, insert_len);
+        Self::adjust_animated_regions_for_insert_impl(&mut self.currently_animated_pastes, insert_byte, insert_len);
+    }
+
+    pub fn adjust_animated_regions_for_insert_impl(regions: &mut SmallVec<[AnimatedRegion; 4]>, insert_byte: usize, insert_len: usize) {
+        for a in regions {
+            if insert_byte < a.byte_start as usize {
+                // Insert strictly before             -> shift right
+                a.byte_start += insert_len as u32;
+            } else if insert_byte < a.byte_start as usize + a.byte_len as usize {
+                // Insert at start, inside, or at end -> grow
                 a.byte_len += insert_len as u32;
             }
+
+            // else: strictly after                   -> no-op
         }
     }
 
-    #[allow(unused, reason = "@Incomplete")]
-    pub fn adjust_animated_insertions_for_delete(&mut self, delete_byte: usize, delete_len: usize) {
+    pub fn adjust_animated_regions_for_delete(&mut self, delete_byte: usize, delete_len: usize) {
+        Self::adjust_animated_regions_for_delete_impl(&mut self.currently_animated_copies, delete_byte, delete_len);
+        Self::adjust_animated_regions_for_delete_impl(&mut self.currently_animated_pastes, delete_byte, delete_len);
+    }
+
+    pub fn adjust_animated_regions_for_delete_impl(regions: &mut SmallVec<[AnimatedRegion; 4]>, delete_byte: usize, delete_len: usize) {
         let delete_end = delete_byte + delete_len;
-        self.currently_animated_insertions.retain_mut(|a| {
-            let a_end = a.byte_start + a.byte_len as usize;
-            if delete_end <= a.byte_start {
-                a.byte_start -= delete_len;
+        regions.retain_mut(|a| {
+            let a_end = (a.byte_start + a.byte_len) as usize;
+
+            if delete_end <= a.byte_start as usize {
+                // Deletion entirely before        -> shift left
+                a.byte_start -= delete_len as u32;
                 true
             } else if delete_byte >= a_end {
+                // Deletion entirely after         -> no-op
+                true
+            } else if delete_byte <= a.byte_start as usize && delete_end >= a_end {
+                // Deletion swallows entire region -> kill
+                false
+            } else if delete_byte <= a.byte_start as usize {
+                // Clips the start                 -> delete_end is inside the region
+                let clipped = delete_end - a.byte_start as usize;
+                a.byte_start = delete_byte as u32;
+                a.byte_len  -= clipped as u32;
+                true
+            } else if delete_end >= a_end {
+                // Clips the end                   -> delete_byte is inside the region
+                a.byte_len = (delete_byte - a.byte_start as usize) as u32;
                 true
             } else {
-                // Deletion overlaps the animated range, just kill the animation
-                false
+                // Fully interior                  -> just shrink
+                a.byte_len -= delete_len as u32;
+                true
             }
         });
     }
@@ -285,9 +313,11 @@ impl Buffer {
 
     pub fn insert_char(&mut self, c: char, cursor: &mut Cursor) {
         let index = cursor.char_index.min(self.text.len_chars());
+        let byte  = self.text.char_to_byte(index);
 
         self.text.insert_char(index, c);
         self.invalidate_cache_from_char(index);
+        self.adjust_animated_regions_for_insert(byte, c.len_utf8());
 
         cursor.char_index = index + 1;
         cursor.preferred_col = None;
@@ -298,9 +328,11 @@ impl Buffer {
 
     pub fn insert_char_after(&mut self, c: char, cursor: &mut Cursor) {
         let index = cursor.char_index.min(self.text.len_chars());
+        let byte  = self.text.char_to_byte(index);
 
         self.text.insert_char(index, c);
         self.invalidate_cache_from_char(index);
+        self.adjust_animated_regions_for_insert(byte, c.len_utf8());
 
         self.is_dirty = true;
         self.last_insert = Some((index, 1));
@@ -308,6 +340,10 @@ impl Buffer {
 
     pub fn insert_literal(&mut self, l: &str, cursor: &mut Cursor) {
         let index = cursor.char_index.min(self.text.len_chars());
+
+        let byte     = self.text.char_to_byte(index);
+        let byte_len = l.len();
+
         self.invalidate_cache_from_char(index);
 
         for c in l.chars() {
@@ -316,6 +352,8 @@ impl Buffer {
             cursor.char_index = index + 1;
             cursor.preferred_col = None;
         }
+
+        self.adjust_animated_regions_for_insert(byte, byte_len);
 
         self.is_dirty = true;
         let len: u32 = l.chars().map(|c| c.len_utf8() as u32).sum();
@@ -327,8 +365,12 @@ impl Buffer {
 
         let index = cursor.char_index - 1;
 
+        let byte_start = self.text.char_to_byte(index);
+        let byte_len   = self.text.char(index).len_utf8();
+
         self.text.remove(index..cursor.char_index);
         self.invalidate_cache_from_char(index);
+        self.adjust_animated_regions_for_delete(byte_start, byte_len);
 
         cursor.char_index = index;
         cursor.preferred_col = None;
@@ -341,8 +383,12 @@ impl Buffer {
         let len = self.text.len_chars();
         if cursor.char_index >= len { return; }
 
+        let byte_start = self.text.char_to_byte(cursor.char_index);
+        let byte_len   = self.text.char(cursor.char_index).len_utf8();
+
         self.text.remove(cursor.char_index..cursor.char_index + 1);
         self.invalidate_cache_from_char(cursor.char_index);
+        self.adjust_animated_regions_for_delete(byte_start, byte_len);
 
         cursor.char_index = cursor.char_index.min(self.text.len_chars());
         cursor.preferred_col = None;
@@ -363,8 +409,12 @@ impl Buffer {
 
         if i == start { return; }
 
+        let byte_start = self.text.char_to_byte(start);
+        let byte_end   = self.text.char_to_byte(i);
+
         self.text.remove(start..i);
         self.invalidate_cache_from_char(start);
+        self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
 
         cursor.char_index    = start.min(self.text.len_chars());
         cursor.preferred_col = None;
@@ -385,8 +435,12 @@ impl Buffer {
 
         if i == end { return; }
 
+        let byte_start = self.text.char_to_byte(i);
+        let byte_end   = self.text.char_to_byte(end);
+
         self.text.remove(i..end);
         self.invalidate_cache_from_char(i);
+        self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
 
         cursor.char_index    = i.min(self.text.len_chars());
         cursor.preferred_col = None;
@@ -405,11 +459,16 @@ impl Buffer {
         let end = anchor.max(cursor.char_index);
 
         if start != end {
+            let byte_start = self.text.char_to_byte(start);
+            let byte_end   = self.text.char_to_byte(end);
+
             self.text.remove(start..end);
             self.invalidate_cache_from_char(start);
+            self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
 
             // Move cursor to the start of the deleted range
             cursor.char_index = start;
+
             self.is_dirty = true;
             self.last_delete = Some((start, (end-start) as u32));
         }

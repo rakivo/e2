@@ -51,7 +51,7 @@ use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
 use util::format_bytes;
 use session::{apply_session, default_session_path, load_session, pretty_path, save_session};
-use buffer::{AnimatedInsertion, Buffer, Cursor};
+use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
 use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
 use director::Director;
@@ -328,8 +328,9 @@ pub struct Palette {
     pub current_line:     Color,
     pub cursor:           Color,
     pub cursor_text:      Color,
-    pub paste_highlight:  Color,
     pub paren_match:      Color,
+    pub paste_highlight:  Color,
+    pub copy_highlight:   Color,
     pub delete_highlight: Color,
 }
 
@@ -343,7 +344,8 @@ pub const fn palette() -> Palette {
         cursor_text:      Color::rgba(13, 13, 13, 255),
         paren_match:      Color::rgba(190, 128, 133, 200),
         paste_highlight:  Color::hex(0xe6c86a),
-        delete_highlight: Color::hex(0x8b3a1e)
+        delete_highlight: Color::hex(0x8b3a1e),
+        copy_highlight:   Color::hex(0x3a8fb5),
     }
 }
 
@@ -649,9 +651,10 @@ pub fn rebuild_text_layout(
     );
     editor.build_us_acc += t0.elapsed().as_micros() as f32;
 
-    layout_update_currently_animated_insertions(
+    layout_update_currently_animated_regions(
         &mut layout,
-        &editor.buffers[buffer_id].currently_animated_insertions
+        &editor.buffers[buffer_id].currently_animated_pastes,
+        &editor.buffers[buffer_id].currently_animated_copies,
     );
 
     editor.views[view_id].layout = Some(layout);
@@ -1028,7 +1031,7 @@ pub fn render_text_layout(
     if !is_this_view_into_query_buffer && let Some(ll) = layout.line_for_buffer_line(cursor_line) {
         let _tracy = tracy::span!("render_text_layout::current_line");
 
-        let y = view.cursor_anim_y + cursor_h*2.0;
+        let y = view.cursor_y() + cursor_h*2.0;
 
         let has_selection = view.cursor.anchor_char_index
             .map(|a| a != view.cursor.char_index)
@@ -1118,7 +1121,7 @@ pub fn render_text_layout(
 
         Rect {
             x: view.cursor_anim_x,
-            y: view.cursor_anim_y + cursor_h,
+            y: view.cursor_y() + cursor_h,
             w: cursor_width,
             h: line_h + cursor_h,
         }
@@ -1182,13 +1185,14 @@ pub fn render_text_layout(
 
         let verts = gpu.verts_mut();
 
-        let cursor_color = palette().cursor_text.into();
-        let highlight = palette().paste_highlight.into();
+        let cursor_color    = palette().cursor_text.into();
+        let paste_highlight = palette().paste_highlight.into();
+        let copy_highlight  = palette().copy_highlight.into();
 
         // Precompute insertion ts
-        let mut insertion_ts = [1.0f32; PASTE_ANIMATION_MAX_ID + 1]; // [0] = 1.0 sentinel
-        for a in buffer.currently_animated_insertions.iter() {
-            insertion_ts[a.id as usize] = a.t; // a.id is 1-based, fits in [1..=PASTE_ANIMATION_MAX_ID]
+        let mut animated_regions_ts = [1.0f32; PASTE_ANIMATION_MAX_ID * 2 + 2]; // [0] = 1.0 sentinel
+        for a in buffer.currently_animated_pastes.iter().chain(buffer.currently_animated_copies.iter()) {
+            animated_regions_ts[a.id as usize] = a.t;
         }
 
         for ll in &layout.lines {
@@ -1216,10 +1220,11 @@ pub fn render_text_layout(
                 y,
                 cursor_col_glyph_index,
                 cursor_color,
-                highlight,
+                paste_highlight,
+                copy_highlight,
                 &layout.glyph_insertion_ids,
                 ll.glyph_start as usize,
-                insertion_ts
+                animated_regions_ts
             );
         }
     }
@@ -1556,6 +1561,11 @@ impl View {
 
     pub fn new(id: ViewId, buffer_id: BufferId) -> Self {
         Self::new_with_scroll(id, buffer_id, 0.0)
+    }
+
+    #[inline]
+    pub fn cursor_y(&self) -> f32 {
+        self.cursor_anim_y - self.scroll_anim
     }
 
     #[inline]
@@ -2093,7 +2103,6 @@ impl Editor {
 
     #[inline]
     pub fn get_clipboard(&mut self) -> Option<String> {
-        dbg!(self.clipboard.as_mut()?.get_text().ok());
         self.clipboard.as_mut()?.get_text().ok()
     }
 
@@ -2471,11 +2480,18 @@ pub const  PASTE_ANIMATION_DURATION: f32 = 2.48;  // nocheckin @Tune
 pub const PASTE_ANIMATION_BITS:     usize = 4;
 pub const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
 pub const PASTE_ANIMATION_MASK:     u64   = (1 << PASTE_ANIMATION_BITS) - 1;   // 0b1111
-pub const PASTE_ANIMATION_MAX_ID:   usize = PASTE_ANIMATION_MASK as usize;     // 15
 
-pub fn layout_update_currently_animated_insertions(layout: &mut TextLayout, insertions: &[AnimatedInsertion]) {
+pub const PASTE_ANIMATION_MAX_ID: usize = 7;  // pastes: 1..=7
+pub const COPY_ANIMATION_MAX_ID:  usize = 15; // copies: 8..=15
+
+pub fn layout_update_currently_animated_regions(
+    layout: &mut TextLayout,
+
+    pastes: &[AnimatedRegion],
+    copies: &[AnimatedRegion],
+) {
     layout.glyph_insertion_ids.clear();
-    if insertions.is_empty() { return; }
+    if pastes.is_empty() && copies.is_empty() { return; }
 
     let n     = layout.glyphs.len();
     let words = (n + PASTE_ANIMATION_PER_WORD - 1) / PASTE_ANIMATION_PER_WORD;
@@ -2484,8 +2500,9 @@ pub fn layout_update_currently_animated_insertions(layout: &mut TextLayout, inse
 
     for (i, g) in layout.glyphs.iter().enumerate() {
         let byte = g.byte_offset as usize;
-        for a in insertions.iter().take(PASTE_ANIMATION_MAX_ID) {
-            if byte >= a.byte_start && byte < a.byte_start + a.byte_len as usize {
+        let anims = copies.iter().chain(pastes.iter());  // Copies take priority!
+        for a in anims {
+            if byte >= a.byte_start as usize && byte < a.byte_start as usize + a.byte_len as usize {
                 let word =  i / PASTE_ANIMATION_PER_WORD;
                 let bit  = (i % PASTE_ANIMATION_PER_WORD) * PASTE_ANIMATION_BITS;
                 layout.glyph_insertion_ids[word] |= (a.id as u64) << bit;
@@ -2545,11 +2562,16 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
             // Compute target Y from scroll_anim so cursor tracks the animated scroll,
             // not the settled scroll position
             //
-            let target_y = layout.rect.y + cursor_line as f32 * line_h - view.scroll_anim;
 
+            let target_y = layout.rect.y + cursor_line as f32 * line_h;
             let dy = target_y - view.cursor_anim_y;
+
             if view.cursor_anim_y.is_nan() {  // @Redundant
                 // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
+
+            } else if dy.abs() < line_h * 1.5 {
+                // Single line down, just snap don't animate
+                view.cursor_anim_y = target_y;
 
             } else if dy.abs() > layout.rect.h {
                 view.cursor_anim_y = target_y;
@@ -2586,18 +2608,25 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
     }
 
     //
-    // Advance insertion animations per buffer
+    // Advance animations regions in every buffer
     //
     for buffer in editor.buffers.values_mut() {
-        let before = buffer.currently_animated_insertions.len();
-        buffer.currently_animated_insertions.retain_mut(|a| {
-            a.t = (a.t + dt / PASTE_ANIMATION_DURATION).min(1.0);
-            a.t < 1.0
-        });
-        if buffer.currently_animated_insertions.len() < before {
-            buffer.is_dirty = true; // @Hack nocheckin @DocumentThis
+        let before = buffer.currently_animated_pastes.len() + buffer.currently_animated_copies.len();
+        for vec in [&mut buffer.currently_animated_pastes, &mut buffer.currently_animated_copies] {
+            vec.retain_mut(|a| {
+                a.t = (a.t + dt / PASTE_ANIMATION_DURATION).min(1.0);
+                a.t < 1.0
+            });
         }
-        if !buffer.currently_animated_insertions.is_empty() {
+
+        let after = buffer.currently_animated_pastes.len() + buffer.currently_animated_copies.len();
+        if after < before {
+            buffer.is_dirty = true;  // @Hack nocheckin @DocumentThis
+        }
+
+        if !buffer.currently_animated_pastes.is_empty()
+        || !buffer.currently_animated_copies.is_empty()
+        {
             still_animating = true;
         }
     }
@@ -2606,7 +2635,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
     // Advance deletion animations per buffer
     //
     for buffer in editor.buffers.values_mut() {
-        let before = buffer.currently_animated_insertions.len();
+        let before = buffer.currently_animated_deletions.len();
         buffer.currently_animated_deletions.retain_mut(|a| {
             a.t = (a.t + dt / DELETE_ANIMATION_DURATION).min(1.0);
             a.t < 1.0
@@ -2848,7 +2877,10 @@ pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) ->
     Ok(())
 }
 
-pub fn editor_handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandTable) -> bool {
+pub fn editor_handle_left_mouse_click(
+    editor: &mut Editor, gpu: &mut Gpu,
+    command_table: &mut CommandTable, keymap: &mut Keymap
+) -> bool {
     if editor.lister.is_open() {
         let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
         let (mx, my) = editor.mouse_pos;
@@ -2873,7 +2905,9 @@ pub fn editor_handle_left_mouse_click(editor: &mut Editor, gpu: &mut Gpu, comman
                     editor.set_active_panel(panel);
                     editor.reset_blink();
 
-                    editor_dispatch_lister_confirm(&mut CommandContext { editor, gpu, command_table, event: None });
+                    editor_dispatch_lister_confirm(&mut CommandContext {
+                        editor, gpu, command_table, keymap, event: None
+                    });
                 }
             }
 
@@ -2996,7 +3030,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
         // Force anim y in case the line wasn't in the layout
         let line_h = editor.line_h();
         if let Some(layout) = &editor.views[view_id].layout {
-            let target_y = layout.rect.y + line as f32 * line_h - editor.views[view_id].scroll_anim;
+            let target_y = layout.rect.y + line as f32 * line_h;
             editor.views[view_id].cursor_anim_y = target_y;
         }
     }

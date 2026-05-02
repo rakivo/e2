@@ -32,4 +32,3 @@ arboard = "3.6.1"
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
 libloading = "0.9.0"
 notify = "8.2.0"
-tempfile = "3.27.0"

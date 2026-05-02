@@ -3,6 +3,7 @@
 use std::{hash::Hash, ops::Deref, path::{MAIN_SEPARATOR, Path, PathBuf}};
 
 use cranelift_entity::{EntityRef, PrimaryMap, entity_impl};
+use libloading::Library;
 use smallstr::SmallString;
 use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
@@ -14,6 +15,7 @@ pub struct CommandContext<'a> {
     pub gpu:    &'a mut Gpu,
 
     pub command_table: &'a mut CommandTable,
+    pub keymap:        &'a mut Keymap,
 
     pub event:  Option<&'a KeyEvent>,
 }
@@ -32,7 +34,35 @@ impl<'a> Drop for CommandContext<'a> {
     }
 }
 
-pub type CommandFn = extern "C" fn(&mut CommandContext);
+pub type CommandFn   = extern "C" fn(&mut CommandContext);
+
+pub type InitLayerFn = extern "C" fn(&mut CommandContext, &LoadedLib);
+
+pub struct LoadedLib {
+    _lib:          Library,
+    pub commands:  &'static [CommandEntry],  // 'static is a @Hack, but lib keeps it alive
+    pub init:      InitLayerFn,
+}
+
+impl LoadedLib {
+    pub unsafe fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        //
+        // Copy to a unique path so dlopen is forced to map a fresh image
+        //
+        let tmp = tempfile::NamedTempFile::new()?;
+        let unique_path = tmp.into_temp_path();
+        std::fs::copy(path, &unique_path)?;
+
+        let _lib = unsafe { Library::new(&*unique_path.to_string_lossy())? };
+
+        let init = unsafe { *_lib.get::<InitLayerFn>(b"custom_layer_init")?.into_raw() };
+
+        let commands = unsafe { **_lib.get::<&&[CommandEntry]>(b"COMMANDS")? };
+        let commands = unsafe { core::mem::transmute(commands) };
+
+        Ok(LoadedLib { _lib, commands, init })
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct CommandEntry {
@@ -152,16 +182,20 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    pub fn default_keymap(table: &mut CommandTable) -> Self {
-        use NamedKey::*;
-
-        let mut km = Self {
+    pub fn empty(table: &mut CommandTable) -> Self {
+        Self {
             basic_character_atom:     table.intern("basic_character"),
             switch_buffer_atom:       table.intern("switch_buffer"),
             cycle_buffers_left_atom:  table.intern("cycle_buffers_left"),
             cycle_buffers_right_atom: table.intern("cycle_buffers_right"),
             bindings: Default::default()
-        };
+        }
+    }
+
+    pub fn default_keymap(table: &mut CommandTable) -> Self {
+        use NamedKey::*;
+
+        let mut km = Self::empty(table);
 
         // Movement
         km.bind(KeyCombo::named(ArrowLeft),  table.intern("move_left"));
