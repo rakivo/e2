@@ -596,30 +596,28 @@ impl ApplicationHandler<UserEvent> for App {
                     checked_reserve!(verts, reserve as usize, "vertex buffer");
                 }
 
-                let still_animating = animate(editor, dt);
-
                 let font_size    = editor.font_size();
                 let line_h       = editor.line_h();
-                let show_cursor  = editor.cursor_visible();
+                let is_cursor_visible_due_to_blinking = editor.cursor_visible();
                 let active_panel = editor.active_panel;
 
                 let mut leaf_panels = Default::default();
                 collect_leaves(editor, editor.root_panel, &mut leaf_panels);
 
                 let mut should_request_redraw = false;
-                should_request_redraw |= still_animating;
 
                 if let Some(Some(callback)) = editor.lister.items_update_frame_update_callback.last().copied() {
                     let mut cx = make_command_context!(None);
                     should_request_redraw |= callback(&mut cx);
                 }
 
-                for &(panel_id, view_id, rect) in &leaf_panels {
-                    if view_id == editor.lister_query_view {
-                        // Lister buffer is drawn below
-                        continue;
-                    }
+                //
+                //
+                // Rebuild all dirty layouts
+                //
+                //
 
+                for &(_panel_id, view_id, rect) in &leaf_panels {
                     let buffer_id = editor.views[view_id].buffer_id;
 
                     let is_dirty = does_panel_need_rebuild(editor, view_id, buffer_id, rect, font_size, line_h);
@@ -629,17 +627,36 @@ impl ApplicationHandler<UserEvent> for App {
                     if is_dirty {
                         rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
                     }
+                }
+
+                //
+                //
+                // Animate
+                //
+                //
+
+                should_request_redraw |= animate(editor, dt);
+
+                //
+                //
+                // Draw
+                //
+                //
+
+                for &(panel_id, view_id, rect) in &leaf_panels {
+                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+
+                    let buffer_id = editor.views[view_id].buffer_id;
 
                     let show_cursor = if panel_id == active_panel {
                         //
                         // Only make cursor blink on the active panel.
                         //
-                        show_cursor
+                        is_cursor_visible_due_to_blinking
                     } else {
                         true
                     };
 
-                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                     let t1 = Instant::now();
                     render_text_layout(
                         gpu,
@@ -674,30 +691,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if editor.lister.is_open() {
-                    // @Cutnpaste from above
-
                     //
                     // Render lister query buffer
                     //
+
+                    // @Cutnpaste from above
 
                     let view_id = editor.lister_query_view;
                     let panel_id = editor.lister_query_panel;
                     let rect = editor.panels[editor.lister_query_panel].rect;
                     let buffer_id = editor.views[view_id].buffer_id;
 
-                    let is_dirty = does_panel_need_rebuild(editor, view_id, buffer_id, rect, font_size, line_h);
-
-                    should_request_redraw |= is_dirty;
-
-                    if is_dirty {
-                        rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
-                    }
-
                     let show_cursor = if panel_id == active_panel {
                         //
                         // Only make cursor blink on the active panel.
                         //
-                        show_cursor
+                        is_cursor_visible_due_to_blinking
                     } else {
                         true
                     };

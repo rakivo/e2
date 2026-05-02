@@ -970,12 +970,6 @@ pub fn render_text_layout(
     //
     //
 
-    // :FeelImprovement
-    //
-    // @Incomplete: Looks like selection doesn't go as much down the character,
-    // as it does go up, which is really bad.
-    //
-
     if let Some(anchor) = view.cursor.anchor_char_index {
         let _tracy = tracy::span!("render_text_layout::selection");
 
@@ -1009,6 +1003,8 @@ pub fn render_text_layout(
 
                     (layout.x_for_col(origin_x, start_col, ll), rect.x + rect.w)
                 } else if line_index == end_line {
+                    if end_col == 0 { continue }  // Don't draw newline characters
+
                     (rect.x,                                    layout.x_for_col(origin_x, end_col, ll))
                 } else {
                     (rect.x,                                    rect.x + rect.w)
@@ -1031,7 +1027,7 @@ pub fn render_text_layout(
     if !is_this_view_into_query_buffer && let Some(ll) = layout.line_for_buffer_line(cursor_line) {
         let _tracy = tracy::span!("render_text_layout::current_line");
 
-        let y = view.cursor_y() + cursor_h*2.0;
+        let y = view.cursor_anim_y + cursor_h*2.0;
 
         let has_selection = view.cursor.anchor_char_index
             .map(|a| a != view.cursor.char_index)
@@ -1121,7 +1117,7 @@ pub fn render_text_layout(
 
         Rect {
             x: view.cursor_anim_x,
-            y: view.cursor_y() + cursor_h,
+            y: view.cursor_anim_y + cursor_h,
             w: cursor_width,
             h: line_h + cursor_h,
         }
@@ -1561,11 +1557,6 @@ impl View {
 
     pub fn new(id: ViewId, buffer_id: BufferId) -> Self {
         Self::new_with_scroll(id, buffer_id, 0.0)
-    }
-
-    #[inline]
-    pub fn cursor_y(&self) -> f32 {
-        self.cursor_anim_y - self.scroll_anim
     }
 
     #[inline]
@@ -2563,7 +2554,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
             // not the settled scroll position
             //
 
-            let target_y = layout.rect.y + cursor_line as f32 * line_h;
+            let target_y = layout.rect.y + cursor_line as f32 * line_h - view.scroll_anim;
             let dy = target_y - view.cursor_anim_y;
 
             if view.cursor_anim_y.is_nan() {  // @Redundant
@@ -2663,7 +2654,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
     // Lister opening animation
     //
     let target = if editor.lister.is_open { 1.0_f32 } else { 0.0 };
-    let speed = if editor.lister.open_anim > target { 25.0 } else { 25.0 }; // @Tune
+    let speed = if editor.lister.open_anim > target { 55.0 } else { 25.0 }; // @Tune
     let remaining = target - editor.lister.open_anim;
     if remaining.abs() < 0.08 {
         editor.lister.open_anim = target;

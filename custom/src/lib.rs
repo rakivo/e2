@@ -217,26 +217,60 @@ pub fn insert_newline(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
 
-    let (line, col) = buf.cursor_line_col(&view.cursor);
-    let line_str = buf.text.line(line as usize);
+    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
+
+    // Cap context line search to 4KB
+    let start_byte = cursor_byte.saturating_sub(4096); // :Configuration
+    buf.flatten_rope_into_scratch(start_byte, cursor_byte);
+
+    let flat = buf.scratch_space_to_flatten_rope_into.as_bytes();
+
+    // Walk backwards to find last non-blank line
+    let context_start = {
+        let mut pos = flat.len();
+        loop {
+            let line_end = pos;
+            match memchr::memrchr(b'\n', &flat[..pos]) {
+                None => break 0,  // No newline found, start of buffer
+
+                Some(nl) => {
+                    let line_bytes = &flat[nl + 1..line_end];
+                    if line_bytes.iter().any(|&b| b != b' ' && b != b'\t') {
+                        break nl + 1;  // Start of the non-blank line, after the \n
+                    }
+
+                    pos = nl;  // Step back past this \n
+                    if pos == 0 { break 0; }
+                }
+            }
+        }
+    };
+
+    // Find indent of context line
+    let line_end = memchr::memchr(b'\n', &flat[context_start..])
+        .map(|p| context_start + p)
+        .unwrap_or(flat.len());
+
+    let line_bytes = &flat[context_start..line_end];
 
     //
     // Count leading whitespace bytes (all spaces/tabs are single-byte)
     //
-    let indent_len = line_str.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let indent_len = line_bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
 
     //
     // Last meaningful char before cursor
     //
-    let last_meaningful = line_str.chars().take(col as usize).filter(|c| !c.is_whitespace()).last();
-    let open = matches!(last_meaningful, Some('{') | Some('(') | Some('['));
+    let last_meaningful = line_bytes.iter().filter(|&&b| b != b' ' && b != b'\t').last().copied();
+
+    let open = matches!(last_meaningful, Some(b'{') | Some(b'(') | Some(b'['));
 
     let mut indent = SmallString::<[u8; 128]>::new();
 
     //
     // Preserve tabs vs spaces
     //
-    indent.extend(line_str.chars().take(indent_len));
+    indent.push_str(unsafe { std::str::from_utf8_unchecked(&line_bytes[..indent_len]) });
     if open {
         // :Configuration
         // Fill the extra 4 with spaces
@@ -281,6 +315,18 @@ pub fn basic_character(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     let cursor = &mut view.cursor;
     cursor.unset_anchor();
+
+    if matches!(c, '}' | ')' | ']') {  // :Configuration
+        let (line, col) = buf.cursor_line_col(cursor);
+        let line_str = buf.text.line(line as usize);
+        let only_ws = col > 0 && line_str.chars().take(col as usize).all(|c| c == ' ' || c == '\t');
+        if only_ws && col >= 4 {
+            for _ in 0..4 {
+                buf.delete_backward(cursor);
+            }
+        }
+    }
+
     buf.insert_char(c, cursor);
 }
 
