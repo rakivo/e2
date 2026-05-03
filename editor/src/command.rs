@@ -1,14 +1,11 @@
-#![allow(unused, dead_code)]
+use std::{hash::Hash, ops::Deref, path::Path};
 
-use std::{hash::Hash, ops::Deref, path::{MAIN_SEPARATOR, Path, PathBuf}};
-
-use cranelift_entity::{EntityRef, PrimaryMap, entity_impl};
+use cranelift_entity::{PrimaryMap, entity_impl};
 use libloading::Library;
-use smallstr::SmallString;
 use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{BufferId, Editor, ListerItem, PanelKind, Rect, SCALE_STEP, View, ViewId, adjust_cursors_after_buffer_mutation, buffer::Buffer, director::{EntryKind, ScanState}, editor_save_buffer_onto_disk, gpu::Gpu, rescale, scroll_page, scroll_to_cursor, session::{default_session_path, pretty_path}};
+use crate::{Editor, Hooks, adjust_cursors_after_buffer_mutation, gpu::Gpu, scroll_to_cursor};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut Editor,
@@ -17,7 +14,8 @@ pub struct CommandContext<'a> {
     pub command_table: &'a mut CommandTable,
     pub keymap:        &'a mut Keymap,
 
-    pub event:  Option<&'a KeyEvent>,
+    // @Cleanup: This shouldn't take in KeyEvent, make our own thing
+    pub event_and_mods: Option<(&'a KeyEvent, Mods)>,
 }
 
 impl<'a> CommandContext<'a> {
@@ -34,14 +32,18 @@ impl<'a> Drop for CommandContext<'a> {
     }
 }
 
-pub type CommandFn   = extern "C" fn(&mut CommandContext);
+pub type CommandFn = extern "C" fn(&mut CommandContext);
 
 pub type InitLayerFn = extern "C" fn(&mut CommandContext, &LoadedLib);
 
 pub struct LoadedLib {
-    _lib:          Library,
-    pub commands:  &'static [CommandEntry],  // 'static is a @Hack, but lib keeps it alive
-    pub init:      InitLayerFn,
+    _lib: Library,
+
+    pub commands: &'static [CommandEntry],  // 'static is a @Hack, but lib keeps it alive
+
+    pub init: InitLayerFn,
+
+    pub hooks: Hooks
 }
 
 impl LoadedLib {
@@ -60,7 +62,7 @@ impl LoadedLib {
         let commands = unsafe { **_lib.get::<&&[CommandEntry]>(b"COMMANDS")? };
         let commands = unsafe { core::mem::transmute(commands) };
 
-        Ok(LoadedLib { _lib, commands, init })
+        Ok(LoadedLib { _lib, commands, init, hooks: Default::default() })
     }
 }
 
@@ -150,7 +152,7 @@ pub enum KeyCombo {
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Default)]
-pub struct Mods {
+pub struct Mods {  // @Memory: Make Mods bitflags
     pub ctrl:  bool,
     pub alt:   bool,
     pub shift: bool,

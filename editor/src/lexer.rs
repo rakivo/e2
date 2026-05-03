@@ -44,6 +44,8 @@ impl Token {
     }
 }
 
+// @Incomplete: Highlight :Notes and @Notes and potentially stuff like TODO, IMPORTANT, etc
+
 // base16-charcoal-dark
 // base00 #0f0b05  bg
 // base01 #231b0e  bg highlight
@@ -147,7 +149,6 @@ pub fn lex_from(
                 i += next_star;
                 if i + 1 < len && bytes[i + 1] == MAIN_SEPARATOR as u8 {
                     i += 2;
-                    cur_state = LexState::Normal;
                     push!(TokenKind::Comment, start, i);
                     break;
                 }

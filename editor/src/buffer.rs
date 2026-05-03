@@ -1,6 +1,6 @@
 use crate::{COPY_ANIMATION_MAX_ID, PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
 
-use std::{path::Path, time::Instant};
+use std::path::Path;
 
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -279,7 +279,7 @@ impl Buffer {
             .copied()
             .unwrap_or((0, LexState::Normal));
 
-        if resume_byte >= target_byte { return; }
+        if resume_byte > target_byte { return; }
 
         let char_start = self.text.byte_to_char(resume_byte);
         let char_end   = self.text.byte_to_char(target_byte);
@@ -303,6 +303,7 @@ impl Buffer {
         let index = self.comment_cache
             .partition_point(|(b, _)| *b <= target_byte)
             .saturating_sub(1);
+
         self.comment_cache[index].1
     }
 

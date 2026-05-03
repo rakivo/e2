@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-use crate::buffer::{Buffer, Cursor};
+use crate::buffer::Buffer;
 use crate::{Editor, Panel, PanelId, PanelKind, PanelSplit, Rect, VIEW_MAIN, View, ViewId, ViewState};
 
 const MAGIC:   u32 = 0x4E455353; // "SSEN"
@@ -61,7 +61,8 @@ fn write_panel(out: &mut Vec<u8>, editor: &Editor, panel_id: PanelId, leaves: &[
             write_panel(out, editor, s.right_id, leaves);
         }
 
-        PanelKind::ListerSplit => {}
+        // :Hook @Incomplete: write_panel hook
+        PanelKind::Custom(_) => {}
     }
 }
 
@@ -123,6 +124,7 @@ pub struct SessionLeaf<'a> {
     pub scroll_anim: f32,
 }
 
+// :Configuration: Custom Data in SessionPanel
 pub enum SessionPanel {
     Leaf  { leaf_index: u32 },
     Split { vertical: bool, ratio: f32, left: Box<SessionPanel>, right: Box<SessionPanel> }, // @Memory @Speed
@@ -186,13 +188,15 @@ fn collect_leaves(editor: &Editor, root: PanelId, out: &mut Vec<(PanelId, ViewId
     let mut stack = SmallVec::<[_; 48]>::with_capacity((editor.panels.len() as f32 * 1.5) as usize);
     stack.push(root);
 
-    while let Some(panel_id) = stack.pop() {
-        match editor.panels[panel_id].kind {
+    while let Some(id) = stack.pop() {
+        match editor.panels[id].kind {
             PanelKind::Leaf { view_id } => {
-                let buffer_id = editor.views[view_id].buffer_id;
-                if buffer_id != editor.lister_query_buffer {
-                    out.push((panel_id, view_id));
-                }
+                // nocheckin @Incomplete
+                // let buffer_id = editor.views[view_id].buffer_id;
+                // if buffer_id != editor.lister_query_buffer {
+                //     out.push((id, view_id));
+                // }
+                out.push((id, view_id));
             }
 
             PanelKind::Split(s) => {
@@ -200,7 +204,12 @@ fn collect_leaves(editor: &Editor, root: PanelId, out: &mut Vec<(PanelId, ViewId
                 stack.push(s.left_id);
             }
 
-            PanelKind::ListerSplit => {}
+            PanelKind::Custom(c) => {
+                if let Some(collect_leaf_panels_hook) = editor.hooks.collect_leaf_panels_for_session_saving {
+                    let leaves = collect_leaf_panels_hook(editor, id, c, &mut stack);
+                    out.extend(leaves);
+                }
+            }
         }
     }
 }
@@ -236,11 +245,13 @@ pub fn load_session<'a>(data: &'a [u8]) -> Option<Session<'a>> {
 pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
     let t0 = Instant::now();
 
+
     editor.canonicalized_current_working_directory = session.cwd.into();
 
     let mut leaf_views  = Vec::<ViewId>::with_capacity(session.leaves.len());
 
     let root_view_id = VIEW_MAIN;
+    let line_h = editor.line_h();
 
     for (i, sl) in session.leaves.iter().enumerate() {
         let file_path = Path::new(&sl.path);
@@ -284,11 +295,22 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
         let line = sl.line.clamp(0, total_line_count as _);
         editor.views[view_id].cursor_target_line = line;
         editor.views[view_id].cursor_target_col  = sl.col;
-        editor.views[view_id].scroll             = sl.scroll_anim;
-        editor.views[view_id].scroll_anim        = sl.scroll_anim;
         editor.views[view_id].cursor_anim_x      = f32::NAN;
         editor.views[view_id].cursor_anim_y      = f32::NAN;
         editor.buffers[buffer_id].is_dirty       = true;  // Force rebuild
+
+        let mut scroll = (sl.scroll_anim / line_h).round() * line_h;
+
+        {
+            let rect  = editor.panels[editor.active_panel].rect;
+            let max_scroll = ((total_line_count as f32 * line_h) - rect.h).max(0.0);
+
+            scroll = scroll.clamp(0.0, max_scroll);
+
+            editor.views[view_id].scroll      = scroll;
+            editor.views[view_id].scroll_anim = scroll;
+            editor.views[view_id].scroll_vel  = 0.0;
+        }
 
         editor.buffers[buffer_id].set_cursor_line_col(
             sl.line, sl.col,
@@ -370,6 +392,8 @@ fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) 
 
             panel_id
         }
+
+        // :Hook @Incomplete: apply_panel hook
     }
 }
 

@@ -8,24 +8,24 @@ edition = "2024"
 tracy = ["tracy-client/enable"]
 
 [dependencies]
-winit = { version = "0.30.13", features = ["wayland", "x11"] }
-wgpu = { version = "28.0.0", default-features = false, features = ["vulkan", "wgsl", "std"] }
+memchr             .workspace = true
+smallstr           .workspace = true
+smallvec           .workspace = true
+cranelift-entity   .workspace = true
+paste              .workspace = true
+winit              .workspace = true
+wgpu               .workspace = true
+
 pollster = "0.3"
 fontdue = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
-smallstr = { version = "0.3", features = ["union"] }
-cranelift-entity = "0.129.1"
 bitflags = "2.11.0"
-smallvec = "1.15.1"
 ropey = "1.6.1"
-paste = "1.0.15"
 tracy-client = { version = "0.17.3", default-features = false }
-memchr = "2.8.0"
-rustc-edit-distance = "0.1.0"
 crossbeam-channel = "0.5.15"
 dirs = "6.0.0"
-memmap2 = "0.9.10"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
 libloading = "0.9.0"
 tempfile = "3.27.0"
+memmap2 = "0.9.10"

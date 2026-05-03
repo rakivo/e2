@@ -1,4 +1,3 @@
-#![allow(unused, dead_code)]
 #![feature(likely_unlikely)]
 
 // TODO: Paste animation continuation threshold
@@ -50,17 +49,19 @@ use audioer::Audioer;
 use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
 use util::format_bytes;
-use session::{apply_session, default_session_path, load_session, pretty_path, save_session};
+use session::{apply_session, default_session_path, load_session};
 use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
-use command::{CommandAtom, CommandContext, CommandTable, Keymap, Mods};
+use command::{CommandContext, CommandAtom};
 use director::Director;
 
+use std::any::Any;
 use std::io::{BufWriter, Write};
 use std::num::NonZero;
-use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::fmt::Write as _;
 use std::collections::VecDeque;
 
@@ -68,14 +69,106 @@ use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap};
 use memmap2::MmapOptions;
 use smallstr::SmallString;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use wgpu::naga::FastHashMap;
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
-use winit::application::ApplicationHandler;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, INITIAL_VERTEX_BUFFER_CAPACITY, draw_text_for_editor, prewarm_glyphs, reset_atlas};
+use winit::window::Window;
+use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, draw_text_for_editor, prewarm_glyphs, reset_atlas};
+
+macro_rules! hooks {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                    $hook_vis:vis $hook:ident: $ty:ty
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $name {
+            $(
+                $(#[$field_meta])*
+                $hook_vis $hook: Option<$ty>,
+            )*
+        }
+    };
+}
+
+hooks! {
+    #[derive(Default)]
+    pub struct Hooks {
+        pub additional_font_sizes_to_prewarm: fn (&Editor) -> SmallVec<[f32; 8]>,
+
+        pub layout_panels:  fn (&mut Editor, win_rect: Rect),
+        pub layout_panel:   fn (&mut Editor, id: PanelId, rect: Rect),
+
+        pub animate:        fn (&mut Editor, dt: f32, still_animating: &mut bool),
+
+        pub text_layout_render_settings: fn (&Editor, ViewId) -> TextLayoutRenderSettings,
+
+        pub active_view_id: fn (&Editor, CustomPanel) -> ViewId,
+
+        /// Called at the start of [`Editor::set_active_panel`].
+        ///
+        /// Returns `true` if should [`Editor::set_active_panel`] should short-circuit
+        /// and give full control to the custom layer.
+        pub set_active_panel: fn (&mut Editor, PanelId) -> bool,
+
+        /// Called at the start of [`Editor::mru_register_new_buffer`].
+        ///
+        /// Returns: Same as set_active_panel
+        pub register_new_buffer_in_most_recently_used_list: fn (&mut Editor, BufferId) -> bool,
+
+        pub does_view_need_layout_rebuild: fn (&Editor, ViewId, BufferId, Rect) -> bool,
+
+        pub inside_about_to_wait_should_request_redraw: fn (&Editor) -> bool,
+        pub        inside_redraw_should_request_redraw: fn (&Editor) -> bool,
+
+        /// You usually wanna do your ticks here.
+        pub about_to_redraw_a_frame:        fn (&mut CommandContext, dt: f32) -> bool,
+
+        /// Returns whether should request a redraw.
+        pub about_to_rebuild_dirty_layouts: fn (&mut CommandContext)          -> bool,
+
+        /// Rebuilt all dirty layouts, about to animate()!
+        pub rebuilt_all_dirty_layouts:      fn (&mut CommandContext)          -> bool,
+
+        /// Animated all animations,   about to draw!
+        pub animated_all_animations:        fn (&mut CommandContext)          -> bool,
+
+        /// Returns `true` if should skip rendering this specific panel.
+        pub about_to_draw_this_panel:       fn (&mut CommandContext, PanelId, ViewId, Rect) -> bool,
+
+        pub drew_all_leaf_panels:           fn (&mut CommandContext)          -> bool,
+
+        /// Returns:
+        ///
+        /// First  bool corresponds to whether we should request a window redraw.
+        ///
+        /// Second bool corresponds to whether mouse click handler should short-circuit
+        /// out of the function and let the custom layer have full control over the user input.
+        pub left_mouse_clicked:     fn (&mut CommandContext)               -> (bool, bool),
+
+        /// Returns: Same as left_mouse_clicked
+        pub mouse_wheel_scrolled:   fn (&mut CommandContext, delta_y: f32) -> (bool, bool),
+
+        /// Returns: Same as left_mouse_clicked
+        pub mouse_moved:            fn (&mut CommandContext)               -> (bool, bool),
+
+        /// Returns: Same as left_mouse_clicked
+        pub key_pressed:            fn (&mut CommandContext)               -> (bool, bool),
+
+        /// Returns: Same as left_mouse_clicked
+        pub pre_command_execution:  fn (&mut CommandContext, CommandAtom)  -> (bool, bool),
+
+        /// Returns: Same as left_mouse_clicked
+        pub post_command_execution: fn (&mut CommandContext, CommandAtom)  -> (bool, bool),
+
+        pub collect_leaf_panels_init_stack:         fn (&Editor, root: PanelId,              stack: &mut SmallVec<[PanelId; 48]>),
+        pub collect_leaf_panels:                    fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId, Rect); 2]>,
+        pub collect_leaf_panels_for_session_saving: fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId); 2]>,
+    }
+}
 
 #[cfg(debug_assertions)]
 #[inline(always)]
@@ -168,6 +261,40 @@ macro_rules! checked_push {
 }
 
 pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
+    let mut builtin_prewarmed_font_sizes: SmallVec<[f32; 16]> = smallvec![
+        editor.scale,
+        editor.scale - SCALE_STEP,
+        editor.scale + SCALE_STEP,
+        editor.scale - 2.0 * SCALE_STEP,
+        editor.scale + 2.0 * SCALE_STEP,
+        editor.scale - 3.0 * SCALE_STEP,
+        editor.scale + 3.0 * SCALE_STEP,
+    ];
+
+    if let Some(additional_font_sizes_to_prewarm_hook) = editor.hooks.additional_font_sizes_to_prewarm {
+        for value in additional_font_sizes_to_prewarm_hook(editor) {
+            if builtin_prewarmed_font_sizes.iter().any(|&x| x == value) {
+                continue;
+            }
+
+            let d = (value - editor.scale).abs();
+
+            // Find insertion point: after last element with <= distance
+            let mut insert_at = builtin_prewarmed_font_sizes.len();
+
+            for (i, &existing) in builtin_prewarmed_font_sizes.iter().enumerate() {
+                let ed = (existing - editor.scale).abs();
+
+                if ed > d {
+                    insert_at = i;
+                    break;
+                }
+            }
+
+            builtin_prewarmed_font_sizes.insert(insert_at, value);
+        }
+    }
+
     eprintln!("[Prewarming glyphs...]");
     for scale in [
         editor.scale,
@@ -349,15 +476,13 @@ pub const fn palette() -> Palette {
     }
 }
 
-pub const LISTER_ITEMS_PADDING: f32 = 0.0;
-pub const PADDING_LEFT:         f32 = 0.0;
-pub const QUERY_BUFFER_PADDING_LEFT: f32 = 8.0;
+pub const PADDING_LEFT: f32 = 8.0;
 
-pub fn padding_left(is_view_into_query_buffer: bool) -> f32 {
-    if is_view_into_query_buffer {
-        QUERY_BUFFER_PADDING_LEFT
-    } else {
+pub fn padding_left(should_pad_left_when_rendering: bool) -> f32 {
+    if should_pad_left_when_rendering {
         PADDING_LEFT
+    } else {
+        0.0
     }
 }
 
@@ -515,11 +640,35 @@ impl LineLayout {
     }
 }
 
+#[derive(Eq, PartialEq, Copy, Clone, Debug, Default)]
+pub enum CursorStyle {
+    #[default] Block,
+    Stick
+}
+
+#[derive(Clone, Debug)]
+pub struct TextLayoutRenderSettings {
+    pub should_pad_left_when_rendering: bool, // @Memory @Speed
+    pub should_highlight_current_line_when_rendering: bool, // @Memory @Speed
+
+    pub cursor_style: CursorStyle, // @Memory @Speed
+}
+
+impl Default for TextLayoutRenderSettings {
+    fn default() -> Self {
+        Self {
+            should_highlight_current_line_when_rendering: true,
+            should_pad_left_when_rendering: false,
+            cursor_style: CursorStyle::Block,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TextLayout {
     pub buffer_id: BufferId,
 
-    pub is_view_into_query_buffer: bool, // @Memory @Speed
+    pub render_settings: TextLayoutRenderSettings,
 
     pub view_scroll:       f32, // view.scroll
     pub line_h:            f32,
@@ -540,6 +689,15 @@ pub struct TextLayout {
     // 4 bits per glyph, packed: 0 = not animated, 1–15 = insertion index
     // fits 16 glyphs per u64, ~63 bytes per 1000 visible glyphs
     pub glyph_insertion_ids: Vec<u64>,
+}
+
+impl Deref for TextLayout {
+    type Target = TextLayoutRenderSettings;
+    fn deref(&self) -> &Self::Target { &self.render_settings}
+}
+
+impl DerefMut for TextLayout {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.render_settings}
 }
 
 impl TextLayout {
@@ -567,7 +725,7 @@ impl TextLayout {
     #[inline]
     pub fn cursor_x(&self, buffer_line: u32, col: u32) -> Option<f32> {
         let ll = self.line_for_buffer_line(buffer_line)?;
-        Some(ll.x_for_col(self.rect.x + padding_left(self.is_view_into_query_buffer), col, &self.glyphs))
+        Some(ll.x_for_col(self.rect.x + padding_left(self.should_pad_left_when_rendering), col, &self.glyphs))
     }
 
     /// Full glyph screen rect at (buffer_line, col): [x0, y0, x1, y1].
@@ -578,7 +736,7 @@ impl TextLayout {
             + (ll.buffer_line - self.first_buffer_line) as f32 * self.line_h
             - (scroll_anim % self.line_h);
 
-        let x0 = ll.x_for_col(self.rect.x + padding_left(self.is_view_into_query_buffer), col, &self.glyphs);
+        let x0 = ll.x_for_col(self.rect.x + padding_left(self.should_pad_left_when_rendering), col, &self.glyphs);
         let x1 = x0 + ll.glyph_width_at_col(col, fallback_w, &self.glyphs);
         Some([x0, y, x1, y + self.line_h])
     }
@@ -597,7 +755,7 @@ impl TextLayout {
         );
         let vis_index  = (line_index - self.first_buffer_line) as usize;
         let ll       = &self.lines[vis_index];
-        let col      = ll.col_for_screen_x(self.rect.x + padding_left(self.is_view_into_query_buffer), mx, &self.glyphs);
+        let col      = ll.col_for_screen_x(self.rect.x + padding_left(self.should_pad_left_when_rendering), mx, &self.glyphs);
         (ll.buffer_line, col)
     }
 
@@ -649,6 +807,7 @@ pub fn rebuild_text_layout(
         view_id,
         rect, font_size, line_h,
     );
+
     editor.build_us_acc += t0.elapsed().as_micros() as f32;
 
     layout_update_currently_animated_regions(
@@ -710,15 +869,16 @@ pub fn build_text_layout(
     // If the animation is moving DOWN, pad the BOTTOM more.
     // If the animation is moving UP,   pad the TOP    more.
     //
-    let diff = view.scroll - view.scroll_anim;
-    if diff > 0.0 {
+    let speed = view.scroll_vel.abs();
+    let prelex_line_count = (speed * 0.017).clamp(20.0, 200.0) as u32;
+    if view.scroll_vel > 0.0 {
         // We are scrolling DOWN (target is below current anim)
-        // Add 40 lines of lookahead to the bottom
-        last_line  = last_line.saturating_add(40);
-    } else if diff < 0.0 {
+        // Add prelex_line_count lines of lookahead to the bottom
+        last_line  = last_line.saturating_add(prelex_line_count);
+    } else if view.scroll_vel < 0.0 {
         // We are scrolling UP   (target is above current anim)
-        // Add 40 lines of lookahead to the top
-        first_line = first_line.saturating_sub(40);
+        // Add prelex_line_count lines of lookahead to the top
+        first_line = first_line.saturating_sub(prelex_line_count);
     }
 
     let line_count = last_line - first_line;
@@ -906,6 +1066,10 @@ pub fn build_text_layout(
     // eprintln!("[Approximated glyph count]: {approximate_glyph_count}");
     // eprintln!("[Actual       glyph count]: {actual_glyph_count}");
 
+    let render_settings = editor.hooks.text_layout_render_settings.map(
+        |f| f(editor, view_id)
+    ).unwrap_or_default();
+
     TextLayout {
         buffer_id,
         rect,
@@ -915,7 +1079,7 @@ pub fn build_text_layout(
         lines,
         visible_glyph_count,
         line_offsets,
-        is_view_into_query_buffer: buffer_id == editor.lister_query_buffer,
+        render_settings,
         glyph_insertion_ids: Default::default(),
         view_scroll: view.scroll,
         first_buffer_line: first_line,
@@ -927,7 +1091,6 @@ pub fn render_text_layout(
     buffer:      &Buffer,
     view:        &View,
     active_view_id: ViewId,
-    lister_query_view_id: ViewId,
     scale:       f32,
     show_cursor: bool,
     is_our_window_focused: bool,
@@ -938,7 +1101,6 @@ pub fn render_text_layout(
     let Some(layout) = &view.layout else { return };
 
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
-    let is_this_view_into_query_buffer = lister_query_view_id == view.id;
 
     let line_y = |buffer_line: u32| -> f32 {
         layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim
@@ -950,7 +1112,7 @@ pub fn render_text_layout(
     let min_cursor_w = scale_base_cursor_width(scale);
     let cursor_h     = scale_base_cursor_height(scale);
     let cursor_outline_thickness = scale_base_cursor_outline_thickness(scale);
-    let padding_left = padding_left(is_this_view_into_query_buffer);
+    let padding_left = padding_left(layout.should_pad_left_when_rendering);
     let origin_x     = rect.x + padding_left;
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
@@ -1024,7 +1186,9 @@ pub fn render_text_layout(
     // Current-line highlight
     //
     //
-    if !is_this_view_into_query_buffer && let Some(ll) = layout.line_for_buffer_line(cursor_line) {
+    if layout.should_highlight_current_line_when_rendering
+        && let Some(ll) = layout.line_for_buffer_line(cursor_line)
+    {
         let _tracy = tracy::span!("render_text_layout::current_line");
 
         let y = view.cursor_anim_y + cursor_h*2.0;
@@ -1109,7 +1273,7 @@ pub fn render_text_layout(
     //
     //
     let cursor_rect = |cursor_glyph_w: f32| {
-        let cursor_width = if is_this_view_into_query_buffer {
+        let cursor_width = if layout.cursor_style == CursorStyle::Stick {
             scale_base_cursor_width(scale)
         } else {
             cursor_glyph_w
@@ -1122,7 +1286,7 @@ pub fn render_text_layout(
             h: line_h + cursor_h,
         }
     };
-    if show_cursor && (is_this_view_into_query_buffer || is_this_view_focused)
+    if show_cursor && is_this_view_focused
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
@@ -1199,7 +1363,7 @@ pub fn render_text_layout(
 
             let cursor_col_glyph_index = if ll.buffer_line == cursor_line
                 && is_this_view_focused
-                && !is_this_view_into_query_buffer
+                && layout.cursor_style == CursorStyle::Block
                 && show_cursor
             {
                 Some(cursor_col as usize)
@@ -1230,199 +1394,12 @@ pub fn render_text_layout(
     // Cursor (on the UNfocused view (outlined rectangle))
     //
     //
-    if show_cursor && !is_this_view_focused && !is_this_view_into_query_buffer
+    if show_cursor && !is_this_view_focused && layout.cursor_style == CursorStyle::Block
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         let rect = cursor_rect(cursor_glyph_w);
         gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
-    }
-}
-
-pub fn lister_rect(win_w: f32, win_h: f32, open_anim: f32, scale: f32) -> Rect {
-    let t = 1.0 - (1.0 - open_anim).powi(4);
-
-    let panel_w = (win_w * 0.45).clamp(320.0, 720.0);
-    let panel_h = (win_h * 0.65).clamp(200.0, 600.0);
-
-    let cx = win_w * 0.50;
-    let cy = (win_h - panel_h) * 0.40 + panel_h * 0.50;
-
-    let min_w = 60.0 * scale;
-    let min_h = 40.0 * scale;
-
-    let w = (panel_w * t).max(min_w);
-    let h = (panel_h * t).max(min_h);
-
-    Rect {
-        x: cx - w * 0.5,
-        y: cy - h * 0.5,
-        w,
-        h,
-    }
-}
-
-// Frosted glass approximation - layered semi-transparent rects
-// with slight size variations to fake depth
-pub fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32, open_anim: f32) {
-    let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
-
-    // Base dark fill
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
-        Color::rgba(12, 9, 4, a(200)));
-
-    // Warm tint layer
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
-        Color::rgba(40, 25, 8, a(40)));
-
-    // Slightly inset lighter layer - gives illusion of depth/glass
-    let i = scale * 1.0;
-    gpu::draw_rect(gpu, lister.x + i, lister.y + i, lister.w - i*2.0, lister.h - i*2.0,
-        Color::rgba(255, 200, 120, a(12)));
-
-    // Top edge highlight - light catches the glass rim
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, scale,
-        Color::rgba(255, 210, 140, a(60)));
-
-    // Left edge highlight
-    gpu::draw_rect(gpu, lister.x, lister.y, scale, lister.h,
-        Color::rgba(255, 210, 140, a(30)));
-
-    // Bottom edge shadow
-    gpu::draw_rect(gpu, lister.x, lister.y + lister.h - scale, lister.w, scale,
-        Color::rgba(0, 0, 0, a(80)));
-}
-
-pub fn render_lister_background(gpu: &mut Gpu, editor: &Editor) {
-    if editor.active_panel != editor.lister_split_panel { return; }
-
-    if !editor.lister.renderer_is_open() { return; }
-
-    // Dim the whole screen
-    gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
-}
-
-pub fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
-    if !editor.lister.renderer_is_open() { return; }
-
-    let open_anim = editor.lister.open_anim;
-    let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
-
-    let scale     = editor.scale;
-    let font_size = editor.font_size();
-    let line_h    = editor.line_h();
-
-    let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
-    let Rect { x: px, y: py, w: pw, h: ph } = lister;
-
-    let pad     = (8.0 * scale).round();
-    let item_h  = (line_h + pad).round();
-    let input_h = (line_h + pad).round();
-    let sep     = scale.max(1.0);
-    let list_y  = py + input_h + sep;
-    let list_h  = ph - input_h - sep;
-
-    let is_mouse_cursor_hidden = editor.is_cursor_visible;
-
-    editor.lister.item_h = item_h;
-    editor.lister.list_h = list_h;
-
-    // Outer border
-    gpu::draw_rect_outline(gpu, px, py, pw, ph, sep,
-                           Color::rgba(180, 140, 80, a(200)));
-
-    // Inner border
-    gpu::draw_rect_outline(gpu, px + sep, py + sep, pw - sep*2.0, ph - sep*2.0, sep,
-                           Color::rgba(80, 60, 30, a(80)));
-
-    // Separator
-    gpu::draw_rect(gpu, px, py + input_h, pw, sep,
-                   Color::rgba(180, 140, 80, a(160)));
-
-    // Item count
-    editor.lister.scratch_str.clear();
-    _ = write!(&mut editor.lister.scratch_str, "{} results", editor.lister.filtered.len());
-    let count_w = gpu::measure_str(gpu, &editor.lister.scratch_str, font_size * 0.80);
-    gpu::draw_text(gpu, &editor.lister.scratch_str,
-                   px + pw - pad - count_w,
-                   py + input_h * 0.44 + line_h * 0.35,
-                   font_size * 0.80,
-                   Color::rgba(160, 120, 60, a(150)));
-
-    // Items
-    let first   = (editor.lister.scroll_anim / item_h) as usize;
-    let visible = (list_h / item_h) as usize + 2;
-    let frac    = editor.lister.scroll_anim % item_h;
-
-    gpu::push_clip(gpu, px, list_y, pw, list_h);
-
-    for slot in 0..visible {
-        let index      = first + slot;
-        let Some(&item_index) = editor.lister.filtered.get(index)            else { break };
-        let Some(item)        = editor.lister.items.get(item_index as usize) else { break };
-
-        let iy       = list_y + slot as f32 * item_h - frac;
-
-        let is_selected = index == editor.lister.selected_index as usize;
-        let is_hovered  = editor.lister.hovered_index == Some(index as u32);
-
-        if iy > list_y + list_h { break; }
-
-        // Alternating row tint  very subtle, just enough to separate rows
-        if index % 2 == 0 {
-            gpu::draw_rect(gpu, px, iy, pw, item_h, Color::rgba(255, 200, 100, a(8)));
-        }
-
-
-        if is_mouse_cursor_hidden && is_hovered && !is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(60, 45, 15, a(120)));
-        }
-
-        if is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(80, 55, 20, a(180)));
-            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h, Color::rgba(195, 169, 131, a(255)));
-            gpu::draw_rect(gpu, px, iy, pw, sep, Color::rgba(180, 140, 80, a(60)));
-            gpu::draw_rect(gpu, px, iy + item_h - sep, pw, sep, Color::rgba(180, 140, 80, a(60)));
-        }
-
-        let label_x = px + pad + sep * 5.0;
-        let label_y = iy + item_h * 0.5 + line_h * 0.35;
-
-        gpu::draw_text(
-            gpu, &item.label, label_x, label_y, font_size,
-            if is_selected { Color::rgba(240, 208, 144, a(255)) } else { Color::rgba(200, 190, 165, a(220)) }
-        );
-
-        if !item.sublabel.is_empty() {
-            let sub_w = gpu::measure_str(gpu, &item.sublabel, font_size * 0.82);
-            gpu::draw_text(
-                gpu, &item.sublabel,
-                px + pw - pad - sub_w,
-                label_y,
-                font_size * 0.82,
-                if is_selected { Color::rgba(180, 140, 80, a(200)) }
-                else           { Color::rgba(120, 100, 60, a(120)) }
-            );
-        }
-    }
-
-    gpu::pop_clip(gpu);
-
-    //
-    // Scrollbar
-    //
-    let total_items = editor.lister.filtered.len();
-    if total_items > 0 {
-        let total_h = total_items as f32 * item_h + item_h * LISTER_ITEMS_PADDING;
-        let bar_h    = (list_h * (list_h / total_h).min(1.0)).max(sep * 4.0);
-        let bar_frac = (editor.lister.scroll_anim / (total_h - list_h).max(1.0)).clamp(0.0, 1.0);
-        let bar_y    = list_y + bar_frac * (list_h - bar_h);
-
-        // Scrollbar track - very faint
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, Color::rgba(255, 200, 100, a(15)));
-
-        // Scrollbar thumb
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h, Color::rgba(180, 140, 80, a(140)));
     }
 }
 
@@ -1500,11 +1477,32 @@ pub struct PanelSplit {
     pub right_id: PanelId,
 }
 
+#[derive(Eq, PartialEq, PartialOrd, Ord, Debug, Copy, Clone, Default)]
+pub struct CustomPanel {
+    pub extra0: u32, pub extra1: u32, pub extra2: u32,
+}
+
+impl CustomPanel {
+    pub const UNIT: Self = unsafe { core::mem::zeroed() };
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum PanelKind {
     Leaf { view_id: ViewId },
-    ListerSplit,
     Split(PanelSplit),
+    Custom(CustomPanel),
+}
+
+impl PanelKind {
+    #[track_caller]
+    #[inline]
+    pub const fn as_custom(&self) -> CustomPanel {
+        match self {
+            Self::Custom(c) => *c,
+
+            _ => unreachable!()
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1529,6 +1527,7 @@ pub struct View {
 
     pub scroll:        f32,  // Target scroll (set instantly on any scroll event)
     pub scroll_anim:   f32,  // Animated scroll (what actually gets rendered)
+    pub scroll_vel:    f32,
 
     pub cursor_anim_x: f32,  // Animated cursor screen position @Redundant (We currently only animate cursor's Y movements)
     pub cursor_anim_y: f32,  // Animated cursor screen position
@@ -1536,8 +1535,8 @@ pub struct View {
     pub cursor_target_line: u32,
     pub cursor_target_col:  u32,
 
-    pub cursor:      Cursor,
-    pub layout:      Option<TextLayout>,
+    pub cursor: Cursor,
+    pub layout: Option<TextLayout>,
 
     pub persistent_state_per_buffer: FastHashMap<BufferId, ViewState>,
 }
@@ -1548,6 +1547,7 @@ impl View {
             id, buffer_id, scroll, cursor: Cursor::new(), layout: None,
             cursor_anim_x: f32::NAN,
             cursor_anim_y: f32::NAN,
+            scroll_vel: 0.0,
             cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: scroll,
             persistent_state_per_buffer: Default::default(),
@@ -1641,248 +1641,6 @@ impl View {
     }
 }
 
-pub enum ListerKeyDispatch {
-    Selected,
-    Close,
-    Other,
-    None
-}
-
-#[derive(Debug)]
-pub struct ListerItem {
-    pub label:    SmallString<[u8; 32]>,
-    pub sublabel: SmallString<[u8; 64]>,
-    pub data:     u64,
-}
-
-pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> bool;
-pub type ListerSelectFn = fn(&mut CommandContext, u64);
-
-pub struct Lister {
-    pub is_open:        bool,
-    pub is_listing_file_entries: bool,
-    pub is_query_dirty: bool,
-
-    pub last_seen_cached_dir_generation: u64, // u64::MAX if we didnt see any generations
-
-    pub query:         SmallString<[u8; 128]>,
-
-    pub selected_index: u32,
-    pub  hovered_index: Option<u32>,
-
-    pub set_selected_index_to_1_instead_of_0: bool,
-
-    pub on_confirm:    Vec<ListerSelectFn>,
-    pub pending_datas: Vec<u64>,
-    pub items_update_frame_update_callback: Vec<Option<ListerFrameUpdateCallback>>,
-
-    pub scroll:        f32,
-    pub scroll_anim:   f32,
-    pub open_anim:     f32,  // 0.0 = closed, 1.0 = fully open
-
-    pub item_h:        f32,
-    pub list_h:        f32,
-
-    // Storage - cleared and refilled when lister opens
-    pub items:           Vec<ListerItem>,
-
-    // Scratch - rebuilt only when query changes (dirty flag)
-    pub filtered:        Vec<u32>,        // Indices into items
-
-    pub scratch_str:     String,          // Reused for formatting
-    pub scoring_scratch: Vec<(u32, u32)>, // Reused rebuild_filtered
-}
-
-impl Lister {
-    pub fn new() -> Self {
-        Self {
-            is_open: false,
-            open_anim: 0.0,
-            query: SmallString::new(),
-            filtered: Default::default(),
-            last_seen_cached_dir_generation: u64::MAX,
-            items_update_frame_update_callback: Default::default(),
-            hovered_index: None,
-            is_listing_file_entries: false,
-            items: Default::default(),
-            on_confirm: Default::default(),
-            pending_datas: Default::default(),
-            is_query_dirty: false,
-            scratch_str: String::with_capacity(512),
-            scroll: 0.0,
-            set_selected_index_to_1_instead_of_0: false,
-            scroll_anim: 0.0,
-            selected_index: 0,
-            scoring_scratch: Vec::with_capacity(256),
-            list_h: 0.0,
-            item_h: 0.0
-        }
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.is_open
-    }
-
-    pub fn renderer_is_open(&self) -> bool {
-        self.open_anim > 0.10
-    }
-
-    pub fn rebuild_filtered(&mut self) {
-        if !self.is_query_dirty { return; }
-
-        self.filtered.clear();
-
-        let filter_str = if self.is_listing_file_entries {
-            // For filtering entries, only use the filename part of the query
-            // (the part after the last /)
-
-            let after_last_slash = self.query.as_str()
-                .rsplit(MAIN_SEPARATOR)
-                .next()
-                .unwrap_or(self.query.as_str());
-
-            // If query ends with / or the part before the last slash is a dir,
-            // show everything - user navigated into a directory
-            if after_last_slash.is_empty() {
-                ""
-            } else {
-                after_last_slash
-            }
-        } else {
-            &self.query
-        };
-
-        if filter_str.is_empty() {
-            self.filtered.extend(0..self.items.len() as u32);
-            self.is_query_dirty = false;
-            return;
-        }
-
-        //
-        // Filter by subsequence,
-        // then score by edit distance on matched items only for sorting
-        //
-        self.scoring_scratch.clear();
-        self.scoring_scratch.extend(self.items.iter()
-            .enumerate()
-            .filter(|(_, item)| Self::fuzzy_match(&item.label, filter_str))
-            .map(|(i, item)| {
-                let score = rustc_edit_distance::edit_distance_with_substrings(
-                    filter_str,
-                    &item.label,
-                    // Use a large limit since we already know it's a subsequence match
-                    filter_str.len() * 3,
-                ).unwrap_or(usize::MAX);
-
-                (i as u32, score as u32)
-            }));
-
-        self.scoring_scratch.sort_unstable_by_key(|&(_, score)| score);
-        self.filtered.extend(self.scoring_scratch.iter().map(|&(i, _)| i));
-        self.is_query_dirty = false;
-    }
-
-    fn fuzzy_match(text: &str, query: &str) -> bool {
-        let mut qchars = query.chars();
-        let mut qc = match qchars.next() { Some(c) => c, None => return true };
-        for tc in text.chars() {
-            if tc.to_ascii_lowercase() == qc.to_ascii_lowercase() {
-                qc = match qchars.next() { Some(c) => c, None => return true };
-            }
-        }
-
-        false
-    }
-
-    pub fn lister_key(&mut self, event: &KeyEvent, mods: Mods) -> ListerKeyDispatch {
-        if !self.is_open { return ListerKeyDispatch::None; }
-
-        let Mods { ctrl, alt, shift: _ } = mods;
-
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => {
-                ListerKeyDispatch::Close
-            }
-
-            Key::Named(NamedKey::Enter) => {
-                ListerKeyDispatch::Selected
-            }
-
-            Key::Named(NamedKey::ArrowDown) => {
-                if self.selected_index + 1 < self.filtered.len() as u32 {
-                    self.selected_index += 1;
-                    self.scroll_to_selected();
-                }
-                ListerKeyDispatch::Other
-            }
-
-            Key::Named(NamedKey::ArrowUp) => {
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                    self.scroll_to_selected();
-                }
-                ListerKeyDispatch::Other
-            }
-
-            Key::Character(s) if ctrl => match s.chars().next() {
-                Some('n') => {
-                    if self.selected_index + 1 < self.filtered.len() as u32 {
-                        self.selected_index += 1;
-                        self.scroll_to_selected();
-                    }
-
-                    ListerKeyDispatch::Other
-                }
-
-                Some('p') => {
-                    if self.selected_index > 0 {
-                        self.selected_index -= 1;
-                        self.scroll_to_selected();
-                    }
-
-                    ListerKeyDispatch::Other
-                }
-
-                Some('v') => {
-                    let page = (self.list_h / self.item_h) as u32;
-                    self.selected_index = (self.selected_index + page).min(self.filtered.len().saturating_sub(1) as u32);
-                    self.scroll_to_selected();
-                    ListerKeyDispatch::Other
-                }
-
-                Some('g') => ListerKeyDispatch::Close,
-
-                _ => ListerKeyDispatch::None
-            }
-
-            Key::Character(s) if alt => match s.chars().next() {
-                Some('v') => {
-                    let page = (self.list_h / self.item_h) as u32;
-                    self.selected_index = self.selected_index.saturating_sub(page);
-                    self.scroll_to_selected();
-                    ListerKeyDispatch::Other
-                }
-                _ => ListerKeyDispatch::None
-            }
-
-            _ => ListerKeyDispatch::None
-        }
-    }
-
-    fn scroll_to_selected(&mut self) {
-        let top    = self.selected_index as f32 * self.item_h;
-        let bottom = top + self.item_h;
-
-        // Only scroll when item is fully outside the visible area
-        if top < self.scroll {
-            self.scroll = top;
-        }
-        if bottom > self.scroll + self.list_h {
-            self.scroll = bottom - self.list_h;
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct EditorLoggerConfig {
     pub log_checked_reserves: bool,
@@ -1897,6 +1655,73 @@ impl EditorLoggerConfig {
             log_checked_reserves: debug,
             log_checked_pushes:   debug,
         }
+    }
+}
+
+pub struct EditorCustomData(pub Option<Box<dyn Any>>);
+
+impl Deref for EditorCustomData {
+    type Target = Option<Box<dyn Any>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl DerefMut for EditorCustomData {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+impl EditorCustomData {
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn get<T: 'static>(&self) -> &T {
+        #[cfg(debug_assertions)]
+        {
+            self.as_ref()
+                .unwrap_or_else(|| panic!(
+                    "EditorCustomData::get::<{}>() called but custom data was never initialized. \
+                     Call editor.custom_data.set() before accessing it.",
+                    std::any::type_name::<T>()
+                ))
+                .downcast_ref::<T>()
+                .unwrap_or_else(|| panic!(
+                    "EditorCustomData::get::<{}>() failed: custom data was initialized with a different type ({:?}).",
+                    std::any::type_name::<T>(),
+                    self.as_ref().unwrap().type_id()
+                ))
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe { &*(self.as_ref().unwrap_unchecked().as_ref() as *const dyn Any as *const T) }
+    }
+
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn get_mut<T: 'static>(&mut self) -> &mut T {
+        #[cfg(debug_assertions)]
+        {
+            let type_id = self.as_ref().map(|b| b.type_id());
+            self.as_mut()
+                .unwrap_or_else(|| panic!(
+                    "EditorCustomData::get_mut::<{}>() called but custom data was never initialized. \
+                     Call editor.custom_data.set() before accessing it.",
+                    std::any::type_name::<T>()
+                ))
+                .downcast_mut::<T>()
+                .unwrap_or_else(|| panic!(
+                    "EditorCustomData::get_mut::<{}>() failed: custom data was initialized with a different type ({:?}).",
+                    std::any::type_name::<T>(),
+                    type_id
+                ))
+        }
+        #[cfg(not(debug_assertions))]
+        unsafe { &mut *(self.as_mut().unwrap_unchecked().as_mut() as *mut dyn Any as *mut T) }
+    }
+
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn set<T: 'static>(&mut self, value: impl Into<Box<T>>) -> Option<Box<T>> {
+        #[cfg(debug_assertions)]
+        { self.replace(value.into()).map(|c| c.downcast().unwrap()) }
+        #[cfg(not(debug_assertions))]
+        unsafe { self.replace(value.into()).map(|c| Box::from_raw(Box::into_raw(c) as *mut T)) }
     }
 }
 
@@ -1919,29 +1744,24 @@ pub struct Editor {
     pub most_recently_used_buffers:  VecDeque<BufferId>,
     pub buffer_cycle_index:          Option<usize>,
 
-    pub panel_before_opening_lister: Option<PanelId>,
-
     pub logger_config: EditorLoggerConfig,
 
     // Scale for font/line-height
     pub scale: f32,
+    pub win_w: f32,
+    pub win_h: f32,
+    pub is_our_window_focused: bool,
 
     // Cursor blink
     pub blink_epoch:         Instant,
     pub last_cursor_visible: bool,
 
-    pub last_is_lister_open: bool,
     pub last_messager_count: u32,
 
     // Mouse
     pub mouse_pos:          (f32, f32),
     pub mouse_left_pressed: bool,
     pub is_cursor_visible:  bool,
-
-    pub lister_query_buffer: BufferId,
-    pub lister_query_view:   ViewId,
-    pub lister_query_panel:  PanelId,  // @Redundant?
-    pub lister_split_panel:  PanelId,
 
     pub clipboard:       Option<arboard::Clipboard>,
 
@@ -1965,10 +1785,21 @@ pub struct Editor {
     pub canonicalized_current_working_directory: SmallString<[u8; 256]>,
     pub canonicalized_last_scanned_directory:    SmallString<[u8; 256]>,
 
-    pub lister:          Lister,
+    pub hooks: Hooks,
+    pub custom_data: EditorCustomData,
+
     pub director:        Director,
     pub messager:        Messager,
     pub audioer:         Audioer,
+}
+
+impl Deref for Editor {
+    type Target = EditorCustomData;
+    fn deref(&self) -> &Self::Target { &self.custom_data }
+}
+
+impl DerefMut for Editor {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.custom_data }
 }
 
 impl Editor {
@@ -1992,27 +1823,6 @@ impl Editor {
         });
         views[root_view].panel_id = root_panel;
 
-        //
-        // Lister internals
-        //
-        let lister_query_buffer = buffers.push(Buffer::new());
-        let lister_query_view   = views.next_key();
-        views.push(View::new(lister_query_view, lister_query_buffer));
-        let lister_query_panel  = panels.next_key();
-        panels.push(Panel {
-            id:   lister_query_panel,
-            rect: Rect::default(),
-            kind: PanelKind::Leaf { view_id: lister_query_view },
-        });
-        views[lister_query_view].panel_id = lister_query_panel;
-
-        let lister_split_panel = panels.next_key();
-        panels.push(Panel {
-            id:   lister_split_panel,
-            rect: Rect::default(),
-            kind: PanelKind::ListerSplit,
-        });
-
         let canonicalized_current_working_directory: SmallString<[_; _]> = std::env::args().nth(1)
             .and_then(|p| Path::new(&p).parent().map(|p| p.to_path_buf()))
             .and_then(|p| std::fs::canonicalize(p).ok())
@@ -2022,32 +1832,31 @@ impl Editor {
             .unwrap()
             .into();
 
-        views[lister_query_view].panel_id = lister_query_panel;
-
         let canonicalized_path_to_buffer_id = FastHashMap::with_capacity_and_hasher(128, Default::default());
 
         let mut editor = Self {
             buffers,
             views,
             panels,
-            lister_split_panel,
             canonicalized_path_to_buffer_id,
             logger_config,
-            lister: Lister::new(),
+            hooks: Default::default(),
             last_input_time: Instant::now(),
+            win_h: 0.0,
+            win_w: 0.0,
             last_cursor_visible: false,
             is_cursor_visible: true,
             buffer_cycle_index: None,
+            custom_data: EditorCustomData(None),
             last_messager_count: u32::MAX,
-            last_is_lister_open: false,
             scratch_paren: Vec::with_capacity(256),
             active_panel: root_panel,
             root_panel,
-            panel_before_opening_lister: None,
             scale:        1.0,
             blink_epoch:  Instant::now(),
             last_frame_time:  Instant::now(),
             mouse_pos:    (0.0, 0.0),
+            is_our_window_focused: false,
             mouse_left_pressed: false,
             frame_count:   0,
             last_fps_time: Instant::now(),
@@ -2061,9 +1870,6 @@ impl Editor {
             canonicalized_last_scanned_directory: "".into(),
             canonicalized_current_working_directory,
             most_recently_used_buffers: VecDeque::with_capacity(32),
-            lister_query_panel,
-            lister_query_view,
-            lister_query_buffer,
             clipboard: arboard::Clipboard::new().ok(),
             audioer,
             director: Director::new(),
@@ -2093,6 +1899,21 @@ impl Editor {
     }
 
     #[inline]
+    pub fn custom_data<T: 'static>(&self) -> &T {
+        self.custom_data.get()
+    }
+
+    #[inline]
+    pub fn custom_data_mut<T: 'static>(&mut self) -> &mut T {
+        self.custom_data.get_mut()
+    }
+
+    #[inline]
+    pub fn set_custom_data<T: 'static>(&mut self, value: impl Into<Box<T>>) -> Option<Box<T>> {
+        self.custom_data.set(value)
+    }
+
+    #[inline]
     pub fn get_clipboard(&mut self) -> Option<String> {
         self.clipboard.as_mut()?.get_text().ok()
     }
@@ -2118,52 +1939,6 @@ impl Editor {
 
         self.is_cursor_visible = true;
         win.set_cursor_visible(true);
-    }
-
-    #[inline]
-    pub fn is_lister_open_and_is_it_listing_file_entries(&self) -> bool {
-        self.lister.is_open() && self.lister.is_listing_file_entries
-    }
-
-    #[inline]
-    pub fn is_lister_buffer_dirty(&self) -> bool {
-        self.buffers[self.lister_query_buffer].is_dirty
-    }
-
-    #[inline]
-    pub fn open_lister(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn) {
-        self.open_lister_impl(items, on_confirm, None)
-    }
-
-    #[inline]
-    pub fn open_lister_with_frame_callback(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: ListerFrameUpdateCallback) {
-        self.open_lister_impl(items, on_confirm, Some(frame_callback))
-    }
-
-    #[inline]
-    pub fn open_lister_impl(&mut self, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: Option<ListerFrameUpdateCallback>) {
-        clear_buffer(self, self.lister_query_buffer);
-
-        self.set_active_panel(self.lister_split_panel);
-
-        self.lister.items_update_frame_update_callback.push(frame_callback);
-        self.lister.on_confirm.push(on_confirm);
-
-        self.lister.query.clear();
-        self.lister.filtered.clear();
-        self.lister.is_query_dirty     = true;
-        self.canonicalized_last_scanned_directory = SmallString::new();
-        self.lister.selected_index  = if self.lister.set_selected_index_to_1_instead_of_0 {
-            (items.len() > 1) as u32
-        } else {
-            0
-        };
-        self.lister.scroll          = 0.0;
-        self.lister.scroll_anim     = 0.0;
-        self.lister.is_open         = true;
-        self.lister.items           = items;
-
-        self.lister.rebuild_filtered();
     }
 
     pub fn view_and_buffer(&mut self, view_id: ViewId) -> (&View, &Buffer) {
@@ -2196,8 +1971,15 @@ impl Editor {
     pub fn active_view_id(&self) -> ViewId {
         match self.panels[self.active_panel].kind {
             PanelKind::Leaf { view_id } => view_id,
-            PanelKind::ListerSplit => self.lister_query_view,
             PanelKind::Split(_) => VIEW_MAIN,
+
+            PanelKind::Custom(c) => {
+                if let Some(active_view_id_hook) = self.hooks.active_view_id {
+                    active_view_id_hook(self, c)
+                } else {
+                    unreachable!()
+                }
+            }
         }
     }
 
@@ -2222,17 +2004,25 @@ impl Editor {
     /// (exactly two children, both Leaf).  N+2 panels max.
     pub fn layout_panels(&mut self, win_rect: Rect) {
         self.layout_panel(self.root_panel, win_rect);
-        self.layout_panel(self.lister_query_panel, lister_rect(win_rect.w, win_rect.h, 1.0, self.scale));
-        self.layout_panel(self.lister_split_panel, lister_rect(win_rect.w, win_rect.h, 1.0, self.scale));
+        if let Some(layout_panels_hook) = self.hooks.layout_panels {
+            layout_panels_hook(self, win_rect);
+        }
     }
 
-    fn layout_panel(&mut self, id: PanelId, rect: Rect) {
+    pub fn layout_panel(&mut self, id: PanelId, rect: Rect) {
         self.panels[id].rect = rect;
 
         let split = match self.panels[id].kind {
             PanelKind::Split(s) => s,
-            PanelKind::ListerSplit => return,
             PanelKind::Leaf { .. } => return,
+
+            _other => {
+                if let Some(layout_panel_hook) = self.hooks.layout_panel {
+                    layout_panel_hook(self, id, rect);
+                }
+
+                return;
+            }
         };
 
         let (r_left, r_right) = if split.vertical {
@@ -2387,11 +2177,17 @@ impl Editor {
 
     // @Refactor
     pub fn mru_register_new_buffer(&mut self, buffer_id: BufferId) {
-        if buffer_id == self.lister_query_buffer { return }
+        let should_short_circuit = self.hooks.register_new_buffer_in_most_recently_used_list.map_or(
+            false,
+            |f| f(self, buffer_id)
+        );
+
+        if should_short_circuit { return }
 
         if let Some(pos) = self.most_recently_used_buffers.iter().position(|&b| b == buffer_id) {
             self.most_recently_used_buffers.remove(pos);
         }
+
         // Insert at 1, not 0 - current buffer stays at front, new buffer is "next"
         let insert_at = 1.min(self.most_recently_used_buffers.len());
         self.most_recently_used_buffers.insert(insert_at, buffer_id);
@@ -2406,9 +2202,15 @@ impl Editor {
     }
 
     pub fn set_active_panel(&mut self, panel_id: PanelId) {
-        if panel_id == self.lister_split_panel {
-            self.panel_before_opening_lister = Some(self.active_panel);
+        let should_short_circuit = self.hooks.set_active_panel.map_or(
+            false,
+            |f| f(self, panel_id)
+        );
+
+        if should_short_circuit {
+            return;
         }
+
         self.active_panel = panel_id;
     }
 
@@ -2455,7 +2257,14 @@ pub const MIN_SCALE:  f32 = 0.75;
 pub const MAX_SCALE:  f32 = 5.00;
 pub const SCALE_STEP: f32 = 0.25;
 
-pub const SCROLL_ANIM_RATE: f32 = 46.67;
+// :FeelImprovement
+//
+// For whatever reason, when I user scrolls with move_down/move_up,
+// meaning that the cursor goes a tiny bit of screen, it starts to jiggle
+// or flicker a bit, this isn't good.
+
+// nocheckin @Incomplete: Make these frame rate dependent
+pub const SCROLL_ANIM_RATE: f32 = 23.67;
 pub const CURSOR_ANIM_RATE: f32 = 99.420;
 
 pub const BLINK_ON_MS:  u128 = 530;
@@ -2464,9 +2273,9 @@ pub const BLINK_OFF_MS: u128 = 370;
 pub const BLINK_START_DELAY_MS: u128 = 500;  // Start blinking after 500ms idle
 pub const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop  blinking after 5s    idle
 
-pub const DELETE_ANIMATION_DURATION: f32 = 0.115; // nocheckin @Tune
+pub const         DELETE_ANIM_DURATION: f32 = 0.115; // nocheckin @Tune
 
-pub const  PASTE_ANIMATION_DURATION: f32 = 2.48;  // nocheckin @Tune
+pub const ANIMATED_RANGE_ANIM_DURATION: f32 = 1.98;  // nocheckin @Tune
 
 pub const PASTE_ANIMATION_BITS:     usize = 4;
 pub const PASTE_ANIMATION_PER_WORD: usize = 64  / PASTE_ANIMATION_BITS;        // 16
@@ -2526,19 +2335,41 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
 
     let mut still_animating = false;
 
-    let epsilon = 0.5f32;  // Stop animating when close enough
+    let epsilon = 0.5f32;       // Stop animating when close enough
     let line_h  = editor.line_h();
 
     for view in editor.views.values_mut() {
         //
         // Scroll
         //
-        let ds = view.scroll - view.scroll_anim;
-        if ds.abs() > epsilon {
-            view.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
-            still_animating = true;
-        } else {
-            view.scroll_anim = view.scroll;
+        {
+            let dist = (view.scroll - view.scroll_anim).abs();
+
+            let stiffness = 300.0 + (dist * 8.0).min(2200.0);
+            let damping = 2.0 * stiffness.sqrt();
+
+            let target = view.scroll;
+            let x      = view.scroll_anim;
+            let v      = view.scroll_vel;
+
+            let delta = target - x;
+
+            // Spring force
+            let accel = stiffness * delta - damping * v;
+
+            view.scroll_vel  += accel * dt;
+            view.scroll_anim += view.scroll_vel * dt;
+
+            view.scroll_vel *= 0.98;  // Soft damping
+
+            if delta.abs() > 0.01 || view.scroll_vel.abs() > 0.01 {
+                still_animating = true;
+            } else {
+                view.scroll_anim = target;
+                view.scroll_vel  = 0.0;
+            }
+
+            view.scroll_anim = view.scroll_anim.round();
         }
 
         //
@@ -2605,7 +2436,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
         let before = buffer.currently_animated_pastes.len() + buffer.currently_animated_copies.len();
         for vec in [&mut buffer.currently_animated_pastes, &mut buffer.currently_animated_copies] {
             vec.retain_mut(|a| {
-                a.t = (a.t + dt / PASTE_ANIMATION_DURATION).min(1.0);
+                a.t = (a.t + dt / ANIMATED_RANGE_ANIM_DURATION).min(1.0);
                 a.t < 1.0
             });
         }
@@ -2628,7 +2459,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
     for buffer in editor.buffers.values_mut() {
         let before = buffer.currently_animated_deletions.len();
         buffer.currently_animated_deletions.retain_mut(|a| {
-            a.t = (a.t + dt / DELETE_ANIMATION_DURATION).min(1.0);
+            a.t = (a.t + dt / DELETE_ANIM_DURATION).min(1.0);
             a.t < 1.0
         });
         if buffer.currently_animated_deletions.len() < before {
@@ -2639,32 +2470,9 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
         }
     }
 
-    //
-    // Lister smooth scrolling
-    //
-    let ds = editor.lister.scroll - editor.lister.scroll_anim;
-    if ds.abs() > epsilon {
-        editor.lister.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
-        still_animating = true;
-    } else {
-        editor.lister.scroll_anim = editor.lister.scroll;
+    if let Some(animate_hook) = editor.hooks.animate {
+        animate_hook(editor, dt, &mut still_animating);
     }
-
-    //
-    // Lister opening animation
-    //
-    let target = if editor.lister.is_open { 1.0_f32 } else { 0.0 };
-    let speed = if editor.lister.open_anim > target { 55.0 } else { 25.0 }; // @Tune
-    let remaining = target - editor.lister.open_anim;
-    if remaining.abs() < 0.08 {
-        editor.lister.open_anim = target;
-    } else {
-        let step = (remaining * speed * dt).clamp(-0.15, 0.15);
-        editor.lister.open_anim += step;
-        editor.lister.open_anim = editor.lister.open_anim.clamp(0.0, 1.0);
-    }
-
-    still_animating |= editor.lister.open_anim != target;
 
     still_animating
 }
@@ -2748,9 +2556,10 @@ pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
 pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
     let panels = &editor.panels;
 
-    let mut stack = SmallVec::<[_; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
-    if editor.lister.is_open() {
-        stack.push(editor.lister_split_panel);
+    let mut stack = SmallVec::<[PanelId; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
+
+    if let Some(collect_leaf_panels_init_stack) = editor.hooks.collect_leaf_panels_init_stack {
+        collect_leaf_panels_init_stack(editor, id, &mut stack);
     }
 
     stack.push(id);
@@ -2758,10 +2567,17 @@ pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId
     while let Some(id) = stack.pop() {
         match panels[id].kind {
             PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id].rect)),
-            PanelKind::ListerSplit  => out.push((id, editor.lister_query_view, panels[editor.lister_query_panel].rect)),
+
             PanelKind::Split(split) => {
                 stack.push(split.right_id);
                 stack.push(split.left_id);
+            }
+
+            PanelKind::Custom(c) => {
+                if let Some(collect_leaf_panels_hook) = editor.hooks.collect_leaf_panels {
+                    let leaves = collect_leaf_panels_hook(editor, id, c, &mut stack);
+                    out.extend(leaves);
+                }
             }
         }
     }
@@ -2832,20 +2648,6 @@ pub fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     editor.reset_blink();
 }
 
-pub fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
-    let index = cx.editor.lister.selected_index;
-    let Some(index) = cx.editor.lister.filtered.get(index as usize) else { return };
-    let item_data = cx.editor.lister.items[*index as usize].data;
-
-    let Some(on_confirm) = cx.editor.lister.on_confirm.pop()        else { return };
-
-    cx.editor.lister.pending_datas.push(item_data);
-    _ = cx.editor.lister.items_update_frame_update_callback.pop();
-    cx.editor.lister.set_selected_index_to_1_instead_of_0 = false;
-
-    on_confirm(cx, item_data);
-}
-
 //
 // @Note @Speed: We might want to somehow parallelize this for very slow hard drives,
 // but besides from that, saving a 100mb file on my cheap ass SSD wasn't that slow at all.
@@ -2868,78 +2670,54 @@ pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) ->
     Ok(())
 }
 
-pub fn editor_handle_left_mouse_click(
-    editor: &mut Editor, gpu: &mut Gpu,
-    command_table: &mut CommandTable, keymap: &mut Keymap
-) -> bool {
-    if editor.lister.is_open() {
-        let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
-        let (mx, my) = editor.mouse_pos;
-        if lister.contains(mx, my) {
-            let line_h   = editor.line_h();
-            let scale    = editor.scale;
-            let pad      = (8.0 * scale).round();
-            let item_h   = editor.lister.item_h;
-            let input_h  = (line_h + pad).round();
-            let sep      = scale.max(1.0);
-            let list_y   = lister.y + input_h + sep;
+pub fn editor_handle_left_mouse_click(cx: &mut CommandContext) -> bool {
+    let mut should_request_redraw = false;
 
-            if my >= list_y {
-                let local_y = my - list_y + editor.lister.scroll_anim;
-                let clicked = (local_y / item_h) as u32;
-                if clicked < editor.lister.filtered.len() as u32 {
-                    editor.lister.selected_index = clicked;
-                    editor.lister.is_open = false;
-                    editor.lister.is_listing_file_entries = true;
+    //
+    // Custom layer takes priority
+    //
+    let (
+        custom_window_redraw_requested,
+        should_short_circuit
+    ) = cx.editor.hooks.left_mouse_clicked.map_or(
+        (false, false),
+        |f| f(cx)
+    );
 
-                    let panel = editor.panel_before_opening_lister.take().unwrap();
-                    editor.set_active_panel(panel);
-                    editor.reset_blink();
+    should_request_redraw |= custom_window_redraw_requested;
 
-                    editor_dispatch_lister_confirm(&mut CommandContext {
-                        editor, gpu, command_table, keymap, event: None
-                    });
-                }
-            }
-
-            return true;
-        } else {
-            // Click outside lister closes it
-            editor.lister.is_open = false;
-            editor.lister.is_listing_file_entries = true;
-
-            let panel = editor.panel_before_opening_lister.take().unwrap();
-            editor.set_active_panel(panel);
-            return true;
-        }
+    if should_short_circuit {
+        return should_request_redraw;
     }
 
-    let (mx, my) = editor.mouse_pos;
-    let pid = editor.panel_at(mx, my).unwrap_or(editor.active_panel);
+    let (mx, my) = cx.editor.mouse_pos;
+    let pid = cx.editor.panel_at(mx, my).unwrap_or(cx.editor.active_panel);
 
-    let PanelKind::Leaf { view_id } = editor.panels[pid].kind else {
-        return false;
+    let PanelKind::Leaf { view_id } = cx.editor.panels[pid].kind else {
+        return should_request_redraw;
     };
 
-    let rect        = editor.panels[pid].rect;
-    let buf_id      = editor.views[view_id].buffer_id;
-    let scroll_anim = editor.views[view_id].scroll_anim;
+    should_request_redraw |= true;
 
-    let (line, col) = if let Some(layout) = &editor.views[view_id].layout {
+    let rect        = cx.editor.panels[pid].rect;
+    let buf_id      = cx.editor.views[view_id].buffer_id;
+    let scroll_anim = cx.editor.views[view_id].scroll_anim;
+
+    let (line, col) = if let Some(layout) = &cx.editor.views[view_id].layout {
         layout.hit_test(mx, my, scroll_anim)
-    } else { // @Robustness
-        let line_h = editor.line_h();
-        let line = ((my - rect.y + editor.views[view_id].scroll) / line_h) as usize;
-        let line = line.min(editor.buffers[buf_id].text.len_lines().saturating_sub(1));
+    } else {  // @Robustness
+        let line_h = cx.editor.line_h();
+        let line = ((my - rect.y + cx.editor.views[view_id].scroll) / line_h) as usize;
+        let line = line.min(cx.editor.buffers[buf_id].text.len_lines().saturating_sub(1));
         (line as u32, 0)  // col 0 - no glyph metrics without layout
     };
 
-    let view = &mut editor.views[view_id];
-    editor.buffers[buf_id].set_cursor_line_col(line, col, &mut view.cursor);
+    let view = &mut cx.editor.views[view_id];
+    cx.editor.buffers[buf_id].set_cursor_line_col(line, col, &mut view.cursor);
     view.cursor_target_line = line;
     view.cursor_target_col  = col;
 
-    if editor.mouse_left_pressed {
+    if cx.editor.mouse_left_pressed {
         if !view.cursor.is_anchor_set() {
             view.cursor.set_anchor();
         }
@@ -2947,10 +2725,10 @@ pub fn editor_handle_left_mouse_click(
         view.cursor.unset_anchor();
     }
 
-    editor.set_active_panel(pid);
-    editor.reset_blink();
+    cx.editor.set_active_panel(pid);
+    cx.editor.reset_blink();
 
-    true
+    should_request_redraw
 }
 
 pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
@@ -3069,18 +2847,20 @@ pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl In
     editor.mru_focus(buffer_id); // @Refactor
 }
 
-pub fn does_panel_need_rebuild(
+pub fn does_view_need_layout_rebuild(
     editor: &Editor,
 
     view: ViewId, buffer: BufferId,
 
     rect: Rect,
-
-    font_size: f32, line_h: f32
 ) -> bool {
+    let font_size    = editor.font_size();
+    let line_h       = editor.line_h();
+
     let screen_lines = (rect.h / line_h) as u32;
     let anim_first = (editor.views[view].scroll_anim / line_h) as u32;
-    editor.buffers[buffer].is_dirty || editor.views[view].layout.as_ref().map(|l| {
+
+    let is_dirty = editor.buffers[buffer].is_dirty || editor.views[view].layout.as_ref().map(|l| {
         anim_first < l.first_buffer_line
             || (
                 anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
@@ -3089,7 +2869,14 @@ pub fn does_panel_need_rebuild(
             || (l.rect.w - rect.w).abs() > 0.5
             || (l.rect.h - rect.h).abs() > 0.5
             || (l.font_size - font_size).abs() > 0.01
-    }).unwrap_or(true)
+    }).unwrap_or(true);
+
+    let is_custom_dirty = editor.hooks.does_view_need_layout_rebuild.map_or(
+        false,
+        |f| f(editor, view, buffer, rect)
+    );
+
+    is_dirty || is_custom_dirty
 }
 
 pub fn open_initial_buffer(editor: &mut Editor) {

@@ -52,6 +52,7 @@ pub struct Gpu {
     pub glyph_scratch: Vec<(GpuGlyph, f32)>,
 
     pub current_vertex_buffer_capacity: u64,
+    pub clip_depth:     i32,
     pub batch_pool:     Vec<Batch>,
     pub batch_count:    usize,
 
@@ -237,6 +238,7 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
         glyph_scratch: Vec::with_capacity(256),
 
+        clip_depth: 0,
         batch_pool:  vec![Batch::full_window(w as _, h as _)],
         batch_count: 1
     }
@@ -331,6 +333,8 @@ pub fn reset_atlas(gpu: &mut Gpu) {
 
 #[inline]
 pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
+    gpu.clip_depth += 1;
+
     let i = gpu.batch_count;
     if i >= gpu.batch_pool.len() {
         gpu.batch_pool.push(Batch::new([x, y, w, h]));
@@ -344,6 +348,9 @@ pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
 
 #[inline]
 pub fn pop_clip(gpu: &mut Gpu) {
+    gpu.clip_depth -= 1;
+    debug_assert!(gpu.clip_depth >= 0, "unbalanced pop_clip — more pops than pushes");
+
     let clip = if gpu.batch_count >= 2 {
         gpu.batch_pool[gpu.batch_count - 2].clip
     } else {
@@ -469,9 +476,9 @@ pub fn draw_text_colored(
         let gx = (gx_origin + g.bearing_x as f32).round();
         let gy = (y - g.bearing_y as f32 - g.h as f32).round();
 
-        let x0 =  gx           * inv_sw * 2.0 - 1.0;
-        let x1 = (gx + g.w as f32) * inv_sw * 2.0 - 1.0;
-        let y0 =  1.0 - gy              * inv_sh * 2.0;
+        let x0 =  gx                      * inv_sw * 2.0 - 1.0;
+        let x1 = (gx + g.w as f32)        * inv_sw * 2.0 - 1.0;
+        let y0 =  1.0 - gy                * inv_sh * 2.0;
         let y1 =  1.0 - (gy + g.h as f32) * inv_sh * 2.0;
 
         let u0 =  g.uv_x            as f32;

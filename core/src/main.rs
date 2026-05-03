@@ -18,7 +18,7 @@ use editor::audioer::Audioer;
 use editor::messager::{MESSAGE_DURATION_IN_MILLISECONDS};
 use editor::session::{default_session_path, pretty_path, save_session};
 use editor::command::{CommandContext, CommandTable, Keymap, LoadedLib, Mods};
-use editor::{BLINK_START_DELAY_MS, Editor, ListerKeyDispatch, Rect, checked_reserve, gpu, prewarm_glyphs_and_print_preallocation_memory_usage};
+use editor::{BLINK_START_DELAY_MS, Editor, Rect, checked_reserve, gpu, prewarm_glyphs_and_print_preallocation_memory_usage};
 use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY};
 use winit::keyboard::{Key, NamedKey};
 
@@ -32,7 +32,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
-fn run_custom_layer_initialization(cx: &mut CommandContext, loaded: &LoadedLib) {
+fn run_custom_layer_initialization(cx: &mut CommandContext, loaded: &mut LoadedLib) {
     eprintln!("[Running custom_layer_init]");
 
     let t0 = Instant::now();
@@ -48,7 +48,6 @@ struct App {
 
     editor: Editor,
 
-    is_our_window_focused: bool,
     refresh_rate_millihertz: u32,
 
     command_table: CommandTable,
@@ -81,7 +80,6 @@ impl App {
             keymap: Keymap::empty(&mut command_table),
             command_table,
 
-            is_our_window_focused: false,
             refresh_rate_millihertz: u32::MAX,
             mods: Default::default(),
         }
@@ -104,6 +102,9 @@ impl App {
         let result = unsafe { LoadedLib::load(&self.lib_path) };
         match result {
             Ok(new_lib) => {
+                // Drop all custom data while the old dylib is still loaded so its vtable is valid
+                self.editor.custom_data.0 = None;
+
                 let old = self.loaded.replace(new_lib);
                 drop(old);
 
@@ -112,12 +113,12 @@ impl App {
                 self.keymap = Keymap::default_keymap(&mut self.command_table);
 
                 if let Some(gpu) = &mut self.gpu {
-                    let loaded = self.loaded.as_ref().unwrap();
+                    let loaded = self.loaded.as_mut().unwrap();
                     let mut cx = CommandContext {
                         editor: &mut self.editor,
                         gpu,
                         command_table: &mut self.command_table,
-                        event: None,
+                        event_and_mods: None,
                         keymap: &mut self.keymap
                     };
                     run_custom_layer_initialization(&mut cx, loaded);
@@ -156,9 +157,9 @@ impl ApplicationHandler<UserEvent> for App {
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
 
         let editor = &mut self.editor;
+        editor.win_w = gpu.win_w;
+        editor.win_h = gpu.win_h;
         editor.layout_panels(Rect::full(w as f32, h as f32));
-
-        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
 
         self.refresh_rate_millihertz = win.current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
@@ -172,16 +173,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
-        if let Some(l) = &self.loaded {
+        if let Some(l) = &mut self.loaded {
             let mut cx = CommandContext {
                 editor,
                 gpu: &mut gpu,
                 command_table: &mut self.command_table,
                 keymap: &mut self.keymap,
-                event: None,
+                event_and_mods: None,
             };
             run_custom_layer_initialization(&mut cx, l);
         }
+
+        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
 
         self.gpu    = Some(gpu);
         self.window = Some(win);
@@ -194,7 +197,10 @@ impl ApplicationHandler<UserEvent> for App {
 
         let editor = &self.editor;
 
-        if editor.lister.open_anim > 0.0 && !editor.lister.is_open {
+        if editor.hooks.inside_about_to_wait_should_request_redraw.map_or(
+            false,
+            |f| f(editor)
+        ) {
             win.request_redraw();
             return;
         }
@@ -263,14 +269,27 @@ impl ApplicationHandler<UserEvent> for App {
         let shift = self.mods.state().shift_key();
         let alt   = self.mods.state().alt_key();
 
+        let mods = Mods { alt, ctrl, shift };
+
         macro_rules! make_command_context {
-            ($event: expr) => {
+            (@event $event: expr) => {
                 CommandContext {
                     editor, gpu,
-                    event: $event,
+                    event_and_mods: $event,
                     command_table: &mut self.command_table,
                     keymap: &mut self.keymap,
                 }
+            };
+
+            (None) => {
+                make_command_context!(@event None)
+            };
+            () => {
+                make_command_context!(@event None)
+            };
+
+            ($event: expr) => {
+                make_command_context!(@event Some(($event, mods)))
             };
         }
 
@@ -284,7 +303,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                if ctrl && shift && matches!(&event.logical_key, Key::Named(NamedKey::F12)) {
+                if ctrl && shift && matches!(&event.logical_key, Key::Named(NamedKey::F12)) {  // :Configuration
                     win.request_redraw();
                     println!("[Trying to Hot reload]");
                     self.force_try_reload();
@@ -293,37 +312,24 @@ impl ApplicationHandler<UserEvent> for App {
 
                 editor.hide_cursor(win);
 
-                let mods = Mods { alt, ctrl, shift };
+                let mut should_request_redraw = false;
 
-                let is_active_view_query = editor.active_view_id() == editor.lister_query_view;
-                if is_active_view_query {
-                    let result = editor.lister.lister_key(&event, mods);
-                    let is_selected = matches!(result, ListerKeyDispatch::Selected);
-                    match result {
-                        ListerKeyDispatch::Selected | ListerKeyDispatch::Close => {
-                            editor.lister.is_open = false;
-                            editor.lister.is_listing_file_entries = true;
+                {
+                    let key_pressed = editor.hooks.key_pressed;
+                    let (
+                        custom_window_redraw_requested,
+                        should_short_circuit
+                    ) = key_pressed.map_or(
+                        (false, false),
+                        |f| f(&mut make_command_context!(&event))
+                    );
 
-                            let panel_before_opening_lister = editor.panel_before_opening_lister.take().unwrap();
-                            editor.set_active_panel(panel_before_opening_lister);
-
-                            if is_selected {
-                                let mut cx = make_command_context!(Some(&event));
-                                editor_dispatch_lister_confirm(&mut cx);
-                            }
-
+                    should_request_redraw |= custom_window_redraw_requested;
+                    if should_short_circuit {
+                        if should_request_redraw {
                             win.request_redraw();
-
-                            return;
                         }
-
-                        ListerKeyDispatch::Other => {
-                            editor.reset_blink();
-                            win.request_redraw();
-                            return;
-                        }
-
-                        ListerKeyDispatch::None => {}
+                        return;
                     }
                 }
 
@@ -333,44 +339,66 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     };
 
-                    //
-                    //
-                    // Commit cycle if switching to a non-cycle command
-                    //
-                    if [self.keymap.cycle_buffers_left_atom, self.keymap.cycle_buffers_right_atom, self.keymap.switch_buffer_atom].contains(&command_atom) {
-                        editor.commit_buffer_cycle();
+                    {
+                        // @Cutnpaste from above
+
+                        let pre_command_execution = editor.hooks.pre_command_execution;
+                        let (
+                            custom_window_redraw_requested,
+                            should_short_circuit
+                        ) = pre_command_execution.map_or(
+                            (false, false),
+                            |f| f(&mut make_command_context!(&event), command_atom)
+                        );
+
+                        should_request_redraw |= custom_window_redraw_requested;
+                        if should_short_circuit {
+                            if should_request_redraw {
+                                win.request_redraw();
+                            }
+                            return;
+                        }
                     }
 
                     {
-                        let mut cx = make_command_context!(Some(&event));
+                        let mut cx = make_command_context!(&event);
                         (command.func)(&mut cx);
                     }
 
-                    if editor.is_lister_buffer_dirty() {
-                        //
-                        // Keep lister query updated
-                        //
+                    {
+                        // @Cutnpaste from above
 
-                        let query = editor.buffers[editor.lister_query_buffer].text.chars();
-                        editor.lister.query.clear();
-                        editor.lister.query.extend(query);
-                        editor.lister.scroll = 0.0;
-                        editor.lister.selected_index = if editor.lister.set_selected_index_to_1_instead_of_0 {
-                            (editor.lister.items.len() > 1) as u32
-                        } else {
-                            0
-                        };
-                        editor.lister.is_query_dirty = true;
-                        editor.lister.rebuild_filtered();
-                        editor.lister.is_query_dirty = true; // nocheckin @DocumentThis
+                        let post_command_execution = editor.hooks.post_command_execution;
+                        let (
+                            custom_window_redraw_requested,
+                            should_short_circuit
+                        ) = post_command_execution.map_or(
+                            (false, false),
+                            |f| f(&mut make_command_context!(&event), command_atom)
+                        );
+
+                        should_request_redraw |= custom_window_redraw_requested;
+                        if should_short_circuit {
+                            if should_request_redraw {
+                                win.request_redraw();
+                            }
+                            return;
+                        }
                     }
 
+                    should_request_redraw = true; // @Redundant?
+                }
+
+                if should_request_redraw {
                     win.request_redraw();
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
                 if ctrl {
+                    // :Configuration
+                    // We might want to give the custom layer control over this?..
+
                     let dy = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(p)   => p.y as f32 * 0.01,
@@ -388,53 +416,38 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::PixelDelta(p)   => p.y as f32,
                 };
 
-                if editor.lister.is_open() { // @Refactor
-                    //
-                    // Lister scroll takes priority if open and mouse is over it
-                    //
+                let mut should_request_redraw = false;
 
-                    let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
-                    let (mx, my) = editor.mouse_pos;
-                    if lister.contains(mx, my) {
-                        let max_scroll = (
-                            editor.lister.filtered.len() as f32 * editor.lister.item_h
-                                + editor.lister.item_h * 2.0 - editor.lister.list_h
-                        ).max(0.0);
+                let mouse_wheel_scrolled = editor.hooks.mouse_wheel_scrolled;
+                let (
+                    custom_window_redraw_requested,
+                    should_short_circuit
+                ) = mouse_wheel_scrolled.map_or(
+                    (false, false),
+                    |f| f(&mut make_command_context!(), dy)
+                );
 
-                        editor.lister.scroll = (editor.lister.scroll - dy * 2.0).clamp(0.0, max_scroll);
-
-                        //
-                        // Update hovered index for new scroll position
-                        //
-                        let line_h  = editor.line_h();
-                        let scale   = editor.scale;
-                        let pad     = (8.0 * scale).round();
-                        let input_h = (line_h + pad).round();
-                        let sep     = scale.max(1.0);
-                        let list_y  = lister.y + input_h + sep;
-                        if my >= list_y {
-                            let local_y = my - list_y + editor.lister.scroll;  // Use new scroll, not anim
-                            let hovered = (local_y / editor.lister.item_h) as usize;
-                            let hovered_index_before = editor.lister.hovered_index;
-                            editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
-                                if hovered_index_before != Some(hovered as u32) {
-                                    editor.audioer.play_lister_item_hover_sound();
-                                }
-
-                                Some(hovered as u32)
-                            } else {
-                                None
-                            };
-                        }
-
+                should_request_redraw |= custom_window_redraw_requested;
+                if should_short_circuit {
+                    if should_request_redraw {
                         win.request_redraw();
-                        return;
                     }
+                    return;
                 }
 
                 let (mx, my) = editor.mouse_pos;
-                let Some(panel_id) = editor.panel_at(mx, my) else { return };
-                let PanelKind::Leaf { view_id } = editor.panels[panel_id].kind else { return };
+                let Some(panel_id) = editor.panel_at(mx, my) else {
+                    if should_request_redraw {
+                        win.request_redraw();
+                    }
+                    return;
+                };
+                let PanelKind::Leaf { view_id } = editor.panels[panel_id].kind else {
+                    if should_request_redraw {
+                        win.request_redraw();
+                    }
+                    return;
+                };
 
                 let rect    = editor.panels[panel_id].rect;
                 let buf_id  = editor.views[view_id].buffer_id;
@@ -475,7 +488,11 @@ impl ApplicationHandler<UserEvent> for App {
                     editor.snap_cursor_to_target(view_id, new_line, cur_col, rect);
                 }
 
-                win.request_redraw();
+                should_request_redraw |= true; // @Cleanup
+
+                if should_request_redraw {
+                    win.request_redraw();
+                }
             }
 
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
@@ -487,8 +504,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 editor.show_cursor(win);
 
-                if editor_handle_left_mouse_click(editor, gpu, &mut self.command_table, &mut self.keymap) {
-                    win.request_redraw();
+                {
+                    let mut cx = make_command_context!();
+                    if editor_handle_left_mouse_click(&mut cx) {
+                        win.request_redraw();
+                    }
                 }
 
                 editor.mouse_left_pressed = true;
@@ -499,42 +519,32 @@ impl ApplicationHandler<UserEvent> for App {
 
                 editor.mouse_pos = (position.x as f32, position.y as f32);
 
-                if editor.lister.is_open() { // @Refactor
-                    let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
-                    let (mx, my) = editor.mouse_pos;
-                    let line_h  = editor.line_h();
-                    let scale   = editor.scale;
-                    let pad     = (8.0 * scale).round();
-                    let item_h  = editor.lister.item_h;
-                    let input_h = (line_h + pad).round();
-                    let sep     = scale.max(1.0);
-                    let list_y  = lister.y + input_h + sep;
+                let mut should_request_redraw = false;
 
-                    if lister.contains(mx, my) && my >= list_y {
-                        let local_y = my - list_y + editor.lister.scroll_anim;
-                        let hovered = (local_y / item_h) as usize;
-                        let hovered_index_before = editor.lister.hovered_index;
-                        editor.lister.hovered_index = if hovered < editor.lister.filtered.len() {
-                            if hovered_index_before != Some(hovered as u32) {
-                                editor.audioer.play_lister_item_hover_sound();
-                            }
+                let mouse_moved = editor.hooks.mouse_moved;
+                let (
+                    custom_window_redraw_requested,
+                    should_short_circuit
+                ) = mouse_moved.map_or(
+                    (false, false),
+                    |f| f(&mut make_command_context!())
+                );
 
-                            Some(hovered as u32)
-                        } else {
-                            None
-                        };
+                should_request_redraw |= custom_window_redraw_requested;
+                if should_short_circuit {
+                    if should_request_redraw {
                         win.request_redraw();
-                    } else {
-                        editor.lister.hovered_index = None;
                     }
-
-                    win.request_redraw();
+                    return;
                 }
 
                 if editor.mouse_left_pressed {
-                    if editor_handle_left_mouse_click(editor, gpu, &mut self.command_table, &mut self.keymap) {
-                        win.request_redraw();
-                    }
+                    let mut cx = make_command_context!();
+                    should_request_redraw |= editor_handle_left_mouse_click(&mut cx);
+                }
+
+                if should_request_redraw {
+                    win.request_redraw();
                 }
             }
 
@@ -542,6 +552,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if sz.width > 0 && sz.height > 0 {
                     gpu.win_w = sz.width  as f32;
                     gpu.win_h = sz.height as f32;
+
+                    editor.win_w = gpu.win_w;
+                    editor.win_h = gpu.win_h;
+
                     gpu.surface_config.width  = sz.width;
                     gpu.surface_config.height = sz.height;
                     gpu.surface.configure(&gpu.device, &gpu.surface_config);
@@ -554,12 +568,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 tracy_client::frame_mark();
 
+                let mut should_request_redraw = false;
+
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
                 editor.last_frame_time = now;
                 editor.frame_count += 1;
 
-                editor.last_is_lister_open = editor.lister.is_open();
                 editor.last_messager_count = editor.messager.count;
 
                 editor.messager.tick(dt);
@@ -577,6 +592,13 @@ impl ApplicationHandler<UserEvent> for App {
                     editor.build_us_acc   = 0.0;
                     editor.relex_us_acc   = 0.0;
                     editor.render_us_acc  = 0.0;
+                }
+
+                debug_assert_eq!(gpu.clip_depth, 0, "clip stack not balanced at frame start");
+                gpu.clip_depth = 0;
+
+                if let Some(about_to_redraw_a_frame_hook) = editor.hooks.about_to_redraw_a_frame {
+                    should_request_redraw |= about_to_redraw_a_frame_hook(&mut make_command_context!(), dt);
                 }
 
                 //
@@ -604,11 +626,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut leaf_panels = Default::default();
                 collect_leaves(editor, editor.root_panel, &mut leaf_panels);
 
-                let mut should_request_redraw = false;
-
-                if let Some(Some(callback)) = editor.lister.items_update_frame_update_callback.last().copied() {
-                    let mut cx = make_command_context!(None);
-                    should_request_redraw |= callback(&mut cx);
+                if let Some(about_to_rebuild_dirty_layouts_hook) = editor.hooks.about_to_rebuild_dirty_layouts {
+                    should_request_redraw |= about_to_rebuild_dirty_layouts_hook(&mut make_command_context!());
                 }
 
                 //
@@ -620,13 +639,17 @@ impl ApplicationHandler<UserEvent> for App {
                 for &(_panel_id, view_id, rect) in &leaf_panels {
                     let buffer_id = editor.views[view_id].buffer_id;
 
-                    let is_dirty = does_panel_need_rebuild(editor, view_id, buffer_id, rect, font_size, line_h);
+                    let is_dirty = does_view_need_layout_rebuild(editor, view_id, buffer_id, rect);
 
                     should_request_redraw |= is_dirty;
 
                     if is_dirty {
                         rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
                     }
+                }
+
+                if let Some(rebuilt_all_dirty_layouts_hook) = editor.hooks.rebuilt_all_dirty_layouts {
+                    should_request_redraw |= rebuilt_all_dirty_layouts_hook(&mut make_command_context!());
                 }
 
                 //
@@ -637,6 +660,10 @@ impl ApplicationHandler<UserEvent> for App {
 
                 should_request_redraw |= animate(editor, dt);
 
+                if let Some(animated_all_animations_hook) = editor.hooks.animated_all_animations {
+                    should_request_redraw |= animated_all_animations_hook(&mut make_command_context!());
+                }
+
                 //
                 //
                 // Draw
@@ -644,62 +671,18 @@ impl ApplicationHandler<UserEvent> for App {
                 //
 
                 for &(panel_id, view_id, rect) in &leaf_panels {
-                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
-
-                    let buffer_id = editor.views[view_id].buffer_id;
-
-                    let show_cursor = if panel_id == active_panel {
-                        //
-                        // Only make cursor blink on the active panel.
-                        //
-                        is_cursor_visible_due_to_blinking
-                    } else {
-                        true
-                    };
-
-                    let t1 = Instant::now();
-                    render_text_layout(
-                        gpu,
-                        &editor.buffers[buffer_id],
-                        &editor.views[view_id],
-                        editor.active_view_id(),
-                        editor.lister_query_view,
-                        editor.scale,
-                        show_cursor,
-                        self.is_our_window_focused,
-                        &mut editor.scratch_paren,
-                    );
-                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
-                    gpu::pop_clip(gpu);
-                }
-
-                if editor.lister.is_open() {
-                    //
-                    // Prepare lister bg
-                    //
-
-                    let t1 = Instant::now();
                     {
-                        if active_panel == editor.lister_split_panel {
-                            let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister.open_anim, editor.scale);
-                            let t = 1.0 - (1.0 - editor.lister.open_anim).powi(4);  // Same easing as lister_rect
-                            render_lister_background_frosted(gpu, lister, editor.scale, t);
+                        let about_to_draw_this_panel = editor.hooks.about_to_draw_this_panel;
+                        let should_skip_rendering_this_specific_panel = about_to_draw_this_panel.map_or(
+                            false,
+                            |f| f(&mut make_command_context!(), panel_id, view_id, rect)
+                        );
+                        if should_skip_rendering_this_specific_panel {
+                            continue;
                         }
-                        render_lister_background(gpu, editor);
                     }
-                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
-                }
 
-                if editor.lister.is_open() {
-                    //
-                    // Render lister query buffer
-                    //
-
-                    // @Cutnpaste from above
-
-                    let view_id = editor.lister_query_view;
-                    let panel_id = editor.lister_query_panel;
-                    let rect = editor.panels[editor.lister_query_panel].rect;
+                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                     let buffer_id = editor.views[view_id].buffer_id;
 
                     let show_cursor = if panel_id == active_panel {
@@ -711,22 +694,31 @@ impl ApplicationHandler<UserEvent> for App {
                         true
                     };
 
-                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                     let t1 = Instant::now();
                     render_text_layout(
                         gpu,
                         &editor.buffers[buffer_id],
                         &editor.views[view_id],
                         editor.active_view_id(),
-                        editor.lister_query_view,
                         editor.scale,
                         show_cursor,
-                        self.is_our_window_focused,
+                        editor.is_our_window_focused,
                         &mut editor.scratch_paren,
                     );
                     editor.render_us_acc += t1.elapsed().as_micros() as f32;
                     gpu::pop_clip(gpu);
                 }
+
+                if let Some(drew_all_leaf_panels_hook) = editor.hooks.drew_all_leaf_panels {
+                    should_request_redraw |= drew_all_leaf_panels_hook(&mut make_command_context!());
+                }
+
+                let t1 = Instant::now();
+                {
+                    render_messager(gpu, editor);
+                    draw_metrics(editor, gpu, self.refresh_rate_millihertz);
+                }
+                editor.render_us_acc += t1.elapsed().as_micros() as f32;
 
                 for buffer in editor.buffers.values_mut() {
                     //
@@ -734,14 +726,6 @@ impl ApplicationHandler<UserEvent> for App {
                     //
                     buffer.is_dirty = false;
                 }
-
-                let t1 = Instant::now();
-                {
-                    render_lister_foreground(gpu, editor);
-                    render_messager(gpu, editor);
-                    draw_metrics(editor, gpu, self.refresh_rate_millihertz);
-                }
-                editor.render_us_acc += t1.elapsed().as_micros() as f32;
 
                 _ = gpu::submit_frame(gpu);
 
@@ -751,10 +735,9 @@ impl ApplicationHandler<UserEvent> for App {
 
                 should_request_redraw |= blink_changed;
 
-                should_request_redraw |= editor.lister.is_open() != editor.last_is_lister_open;
-                should_request_redraw |= editor.messager.count != editor.last_messager_count;
-                should_request_redraw |= editor.messager.count != 0;
-                should_request_redraw |= editor.lister.open_anim > 0.0 && !editor.lister.is_open;
+                if let Some(inside_redraw_should_request_redraw) = editor.hooks.inside_redraw_should_request_redraw {
+                    should_request_redraw |= inside_redraw_should_request_redraw(editor);
+                }
 
                 if should_request_redraw {
                     win.request_redraw();
@@ -764,7 +747,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::Focused(is_focused) => {
-                self.is_our_window_focused = is_focused;
+                self.editor.is_our_window_focused = is_focused;
             }
 
             _ => {}

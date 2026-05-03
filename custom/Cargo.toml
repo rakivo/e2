@@ -10,8 +10,11 @@ crate-type = ["cdylib"]
 editor = { path = "../editor" }
 editor-macros = { path = "../editor-macros" }
 
-memchr = "2.8.0"
-winit = { version = "0.30.13", features = ["wayland", "x11"] }
-cranelift-entity = "0.129.1"
-smallstr = { version = "0.3", features = ["union"] }
-wgpu = { version = "28.0.0", default-features = false, features = ["vulkan", "wgsl", "std"] }
+rustc-edit-distance.workspace = true
+memchr             .workspace = true
+smallstr           .workspace = true
+smallvec           .workspace = true
+cranelift-entity   .workspace = true
+paste              .workspace = true
+winit              .workspace = true
+wgpu               .workspace = true
