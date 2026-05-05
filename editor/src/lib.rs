@@ -48,7 +48,6 @@ pub mod messager;
 use audioer::Audioer;
 use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
-use util::format_bytes;
 use session::{apply_session, default_session_path, load_session};
 use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
@@ -56,6 +55,7 @@ use command::{CommandContext, CommandAtom};
 use director::Director;
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::io::{BufWriter, Write};
 use std::num::NonZero;
 use std::ops::{Deref, DerefMut};
@@ -64,15 +64,16 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::fmt::Write as _;
 use std::collections::VecDeque;
+use std::ops::{BitOr, BitAnd, BitOrAssign, BitAndAssign};
 
 use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap};
 use memmap2::MmapOptions;
 use smallstr::SmallString;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use wgpu::naga::FastHashMap;
 use winit::window::Window;
-use gpu::{ATLAS_SIZE, Gpu, GpuGlyph, draw_text_for_editor, prewarm_glyphs, reset_atlas};
+use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
 
 macro_rules! hooks {
     (
@@ -102,7 +103,7 @@ hooks! {
         pub layout_panels:  fn (&mut Editor, win_rect: Rect),
         pub layout_panel:   fn (&mut Editor, id: PanelId, rect: Rect),
 
-        pub animate:        fn (&mut Editor, dt: f32, still_animating: &mut bool),
+        pub animate:        fn (&mut Editor, dt: f32, still_animating: &mut ShouldRequestFrameRedraw),
 
         pub text_layout_render_settings: fn (&Editor, ViewId) -> TextLayoutRenderSettings,
 
@@ -121,25 +122,24 @@ hooks! {
 
         pub does_view_need_layout_rebuild: fn (&Editor, ViewId, BufferId, Rect) -> bool,
 
-        pub inside_about_to_wait_should_request_redraw: fn (&Editor) -> bool,
-        pub        inside_redraw_should_request_redraw: fn (&Editor) -> bool,
+        pub inside_about_to_wait_should_request_redraw: fn (&Editor) -> ShouldRequestFrameRedraw,
+        pub        inside_redraw_should_request_redraw: fn (&Editor) -> ShouldRequestFrameRedraw,
 
         /// You usually wanna do your ticks here.
-        pub about_to_redraw_a_frame:        fn (&mut CommandContext, dt: f32) -> bool,
+        pub about_to_redraw_a_frame:        fn (&mut CommandContext, dt: f32) -> ShouldRequestFrameRedraw,
 
-        /// Returns whether should request a redraw.
-        pub about_to_rebuild_dirty_layouts: fn (&mut CommandContext)          -> bool,
+        pub about_to_rebuild_dirty_layouts: fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
 
         /// Rebuilt all dirty layouts, about to animate()!
-        pub rebuilt_all_dirty_layouts:      fn (&mut CommandContext)          -> bool,
+        pub rebuilt_all_dirty_layouts:      fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
 
         /// Animated all animations,   about to draw!
-        pub animated_all_animations:        fn (&mut CommandContext)          -> bool,
+        pub animated_all_animations:        fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
 
         /// Returns `true` if should skip rendering this specific panel.
         pub about_to_draw_this_panel:       fn (&mut CommandContext, PanelId, ViewId, Rect) -> bool,
 
-        pub drew_all_leaf_panels:           fn (&mut CommandContext)          -> bool,
+        pub drew_all_leaf_panels:           fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
 
         /// Returns:
         ///
@@ -258,78 +258,6 @@ macro_rules! checked_push {
     ($vec:expr, $val:expr, $name:expr, $config:expr) => { $vec.push($val); };
     ($vec:expr, $val:expr, $name:expr) => { $vec.push($val); };
     ($vec:expr, $val:expr) => { $vec.push($val); };
-}
-
-pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
-    let mut builtin_prewarmed_font_sizes: SmallVec<[f32; 16]> = smallvec![
-        editor.scale,
-        editor.scale - SCALE_STEP,
-        editor.scale + SCALE_STEP,
-        editor.scale - 2.0 * SCALE_STEP,
-        editor.scale + 2.0 * SCALE_STEP,
-        editor.scale - 3.0 * SCALE_STEP,
-        editor.scale + 3.0 * SCALE_STEP,
-    ];
-
-    if let Some(additional_font_sizes_to_prewarm_hook) = editor.hooks.additional_font_sizes_to_prewarm {
-        for value in additional_font_sizes_to_prewarm_hook(editor) {
-            if builtin_prewarmed_font_sizes.iter().any(|&x| x == value) {
-                continue;
-            }
-
-            let d = (value - editor.scale).abs();
-
-            // Find insertion point: after last element with <= distance
-            let mut insert_at = builtin_prewarmed_font_sizes.len();
-
-            for (i, &existing) in builtin_prewarmed_font_sizes.iter().enumerate() {
-                let ed = (existing - editor.scale).abs();
-
-                if ed > d {
-                    insert_at = i;
-                    break;
-                }
-            }
-
-            builtin_prewarmed_font_sizes.insert(insert_at, value);
-        }
-    }
-
-    eprintln!("[Prewarming glyphs...]");
-    for scale in [
-        editor.scale,
-        editor.scale - SCALE_STEP,
-        editor.scale + SCALE_STEP,
-        editor.scale - 2.0 * SCALE_STEP,
-        editor.scale + 2.0 * SCALE_STEP,
-        editor.scale - 3.0 * SCALE_STEP,
-        editor.scale + 3.0 * SCALE_STEP,
-    ] {
-        let font_size = scale_base_font_size(scale);
-        prewarm_glyphs(gpu, font_size);
-    }
-
-    prewarm_glyphs(gpu, MESSAGER_FONT_SIZE);
-
-    let vertex_batch_pool_allocation = gpu.batch_pool.iter()
-        .map(|b| b.verts.capacity())
-        .sum::<usize>();
-
-    eprintln!("[Vertex batch pool preallocation]: {}", format_bytes(vertex_batch_pool_allocation));
-    eprintln!("[Vertex buffer size]:              {}", format_bytes(gpu.vertex_buffer.size() as _));
-    eprintln!("[Glyph memory usage]:              {}", format_bytes(gpu.glyphs.allocation_size()));
-
-    let used_pixels = gpu.atlas_cur_y as u32 * ATLAS_SIZE + gpu.atlas_cur_x as u32;
-    let bytes_per_pixel = 4;
-    let used_bytes = used_pixels * bytes_per_pixel;
-    let total_bytes = ATLAS_SIZE * ATLAS_SIZE * bytes_per_pixel;
-
-    eprintln!(
-        "[Atlas] used={} / {} bytes ({:.2}%)",
-        format_bytes(used_bytes as _),
-        format_bytes(total_bytes as _),
-        (used_bytes as f32 / total_bytes as f32) * 100.0
-    );
 }
 
 pub fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32) {
@@ -856,8 +784,8 @@ pub fn build_text_layout(
     //
     // Calculate the base visible range based on the animation (what we see now)
     //
-    let mut first_line = (view.scroll_anim / line_h).floor() as u32;
-    let mut last_line  = ((view.scroll_anim + rect.h) / line_h).ceil() as u32;
+    let mut first_line = (view.scroll_anim.round() / line_h).floor() as u32;
+    let mut last_line  = ((view.scroll_anim.round() + rect.h) / line_h).ceil() as u32;
 
     //
     // Add a tiny bit of padding so lines don't pop at the very edges
@@ -869,15 +797,17 @@ pub fn build_text_layout(
     // If the animation is moving DOWN, pad the BOTTOM more.
     // If the animation is moving UP,   pad the TOP    more.
     //
-    let speed = view.scroll_vel.abs();
-    let prelex_line_count = (speed * 0.017).clamp(20.0, 200.0) as u32;
-    if view.scroll_vel > 0.0 {
+    let delta = view.scroll - view.scroll_anim;
+    if delta > 0.0 {
         // We are scrolling DOWN (target is below current anim)
-        // Add prelex_line_count lines of lookahead to the bottom
-        last_line  = last_line.saturating_add(prelex_line_count);
-    } else if view.scroll_vel < 0.0 {
+        // Add prelex by remaining distance
+        let prelex_line_count = (delta / line_h).clamp(20.0, 200.0) as u32;
+        last_line = last_line.saturating_add(prelex_line_count);
+    } else if delta < 0.0 {
         // We are scrolling UP   (target is above current anim)
-        // Add prelex_line_count lines of lookahead to the top
+        // Add prelex based on where the target top actually is
+        let target_first_line = (view.scroll / line_h) as u32;
+        let prelex_line_count = first_line.saturating_sub(target_first_line).max(20);
         first_line = first_line.saturating_sub(prelex_line_count);
     }
 
@@ -1103,7 +1033,7 @@ pub fn render_text_layout(
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
 
     let line_y = |buffer_line: u32| -> f32 {
-        layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim
+        layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim.round()
     };
 
     let rect         = layout.rect;
@@ -1316,7 +1246,7 @@ pub fn render_text_layout(
 
             let full_x0 = if line == anim.start_line { layout.x_for_col(origin_x, anim.start_col, ll) } else { rect.x };
             let full_x1 = if line == anim.end_line   { layout.x_for_col(origin_x, anim.end_col,   ll) } else { rect.x + rect.w };
-            let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim;
+            let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim.round();
             if full_x1 <= full_x0 { continue; }
 
             gpu::draw_rect(gpu, full_x0, y, full_x1 - full_x0, layout.line_h, color);
@@ -1571,7 +1501,10 @@ impl View {
     #[inline]
     pub fn switch_buffer(&mut self, new: BufferId) {
         let old = self.buffer_id;
-        if old == new { return; }
+        if old == new {
+            println!("OLD == NEW");
+            return;
+        }
 
         //
         // Save old state
@@ -1896,6 +1829,13 @@ impl Editor {
         open_initial_buffer(&mut editor);
 
         editor
+    }
+
+    #[inline]
+    pub fn command_finish(&mut self) {
+        adjust_cursors_after_buffer_mutation(self);
+        scroll_to_cursor(self);
+        self.reset_blink();
     }
 
     #[inline]
@@ -2225,20 +2165,23 @@ impl Editor {
         }
     }
 
-    pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
-    pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
-    pub fn cursor_w(&self) -> f32 { scale_base_cursor_width(self.scale) }
-    pub fn cursor_h(&self) -> f32 { scale_base_cursor_height(self.scale) }
+    #[inline] pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
+    #[inline] pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
+    #[inline] pub fn cursor_w(&self)  -> f32 { scale_base_cursor_width(self.scale) }
+    #[inline] pub fn cursor_h(&self)  -> f32 { scale_base_cursor_height(self.scale) }
 
+    #[inline]
     pub fn cursor_visible(&self) -> bool {
         cursor_visible(&self.blink_epoch, &self.last_input_time)
     }
 
+    #[inline]
     pub fn reset_blink(&mut self) {
         self.blink_epoch     = Instant::now();
         self.last_input_time = Instant::now();
     }
 
+    #[inline]
     pub fn panel_at(&self, px: f32, py: f32) -> Option<PanelId> {
         let mut leaves = Default::default();
         collect_leaves(self, self.root_panel, &mut leaves);
@@ -2330,51 +2273,204 @@ pub fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
     elapsed < BLINK_ON_MS
 }
 
-pub fn animate(editor: &mut Editor, dt: f32) -> bool {
+const REASON_CAP: usize = 64;
+const NO_PARENT:  u16   = u16::MAX;
+
+#[derive(Clone, Copy)]
+struct ReasonEntry {
+    msg:    &'static str,
+    parent: u16,
+}
+
+thread_local! {
+    static REASONS: RefCell<Vec<ReasonEntry>> = RefCell::new(Vec::with_capacity(REASON_CAP));
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub enum ShouldRequestFrameRedraw {
+    Yes(u16),
+    #[default]
+    No,
+}
+
+// a | b  ≡  a.or(b)
+impl BitOr for ShouldRequestFrameRedraw {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self { self.or(rhs) }
+}
+
+// a & b  ≡  a.and(b)
+impl BitAnd for ShouldRequestFrameRedraw {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self { self.and(rhs) }
+}
+
+// a |= b
+impl BitOrAssign for ShouldRequestFrameRedraw {
+    fn bitor_assign(&mut self, rhs: Self) { *self = *self | rhs; }
+}
+
+// a &= b
+impl BitAndAssign for ShouldRequestFrameRedraw {
+    fn bitand_assign(&mut self, rhs: Self) { *self = *self & rhs; }
+}
+
+impl PartialEq for ShouldRequestFrameRedraw {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self, other),
+            (Self::No, Self::No) | (Self::Yes(_), Self::Yes(_)))
+    }
+}
+
+impl From<ShouldRequestFrameRedraw> for bool {
+    fn from(s: ShouldRequestFrameRedraw) -> bool { s.is_yes() }
+}
+
+impl std::fmt::Display for ShouldRequestFrameRedraw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::No => write!(f, "No"),
+            Self::Yes(_) => {
+                let chain = self.reason_chain();
+                write!(f, "Yes({})", chain.join(" <- "))
+            }
+        }
+    }
+}
+
+impl ShouldRequestFrameRedraw {
+    /// Call once at the start of each frame to reset the reason store.
+    #[inline]
+    pub fn begin_frame() {
+        REASONS.with(|r| r.borrow_mut().clear());
+    }
+
+    #[inline]
+    pub fn yes(msg: &'static str) -> Self {
+        Self::push(msg, NO_PARENT)
+    }
+
+    #[inline]
+    fn push(msg: &'static str, parent: u16) -> Self {
+        REASONS.with(|r| {
+            let mut v = r.borrow_mut();
+            if v.len() >= REASON_CAP { return Self::Yes(v.len() as u16 - 1); }
+            let idx = v.len() as u16;
+            v.push(ReasonEntry { msg, parent });
+            Self::Yes(idx)
+        })
+    }
+
+    /// Redraw if either does.  Keeps self's reason if both are Yes.
+    #[inline]
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Yes(_), _) | (_, Self::No) => self,
+            _                                 => other,
+        }
+    }
+
+    /// Redraw only if both do.
+    #[inline]
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Yes(_), Self::Yes(_)) => self,
+            _                            => Self::No,
+        }
+    }
+
+    /// Attach an additional reason on top of an existing one, forming a chain.
+    /// If self is No, stays No.
+    #[inline]
+    pub fn because(self, msg: &'static str) -> Self {
+        match self {
+            Self::Yes(parent) => Self::push(msg, parent),
+            Self::No          => Self::No,
+        }
+    }
+
+    #[inline]
+    pub fn if_msg(condition: bool, msg: &'static str) -> Self {
+        if condition { Self::yes(msg) } else { Self::default() }
+    }
+
+    /// Convenience: set self to Yes if the condition is true.
+    #[inline]
+    pub fn or_if(self, condition: bool, msg: &'static str) -> Self {
+        if condition { self.or(Self::yes(msg)) } else { self }
+    }
+
+    /// Convenience: set self to Yes if the condition is true.
+    #[inline]
+    pub fn or_msg(self, msg: &'static str) -> Self {
+        self.or_if(true, msg)
+    }
+
+    #[inline]
+    pub fn is_yes(self) -> bool { matches!(self, Self::Yes(_)) }
+
+    #[inline]
+    pub fn is_no (self) -> bool { matches!(self, Self::No)     }
+
+    /// Walk the reason chain from most-recent to root.
+    #[inline]
+    pub fn reason_chain(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let Self::Yes(mut id) = self else { return out };
+        REASONS.with(|r| {
+            let v = r.borrow();
+            loop {
+                let e = v[id as usize];
+                out.push(e.msg);
+                if e.parent == NO_PARENT { break; }
+                id = e.parent;
+            }
+        });
+        out
+    }
+
+    #[inline]
+    pub fn reason(self) -> Option<&'static str> {
+        let Self::Yes(id) = self else { return None };
+        REASONS.with(|r| Some(r.borrow()[id as usize].msg))
+    }
+}
+
+pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
     let _tracy = tracy::span!("animate");
 
-    let mut still_animating = false;
+    let mut should_redraw = ShouldRequestFrameRedraw::No;
 
     let epsilon = 0.5f32;       // Stop animating when close enough
     let line_h  = editor.line_h();
 
     for view in editor.views.values_mut() {
         //
+        //
         // Scroll
         //
+        //
+
         {
-            let dist = (view.scroll - view.scroll_anim).abs();
-
-            let stiffness = 300.0 + (dist * 8.0).min(2200.0);
-            let damping = 2.0 * stiffness.sqrt();
-
             let target = view.scroll;
-            let x      = view.scroll_anim;
-            let v      = view.scroll_vel;
+            let delta  = target - view.scroll_anim;
 
-            let delta = target - x;
-
-            // Spring force
-            let accel = stiffness * delta - damping * v;
-
-            view.scroll_vel  += accel * dt;
-            view.scroll_anim += view.scroll_vel * dt;
-
-            view.scroll_vel *= 0.98;  // Soft damping
-
-            if delta.abs() > 0.01 || view.scroll_vel.abs() > 0.01 {
-                still_animating = true;
+            if delta.abs() > epsilon {
+                let speed = 20.0;  // nocheckin @Tune
+                view.scroll_anim += delta * (1.0 - (-speed * dt).exp());
+                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes("View scroll animation"));
             } else {
                 view.scroll_anim = target;
                 view.scroll_vel  = 0.0;
             }
-
-            view.scroll_anim = view.scroll_anim.round();
         }
 
         //
-        // Cursor target comes from layout if available
         //
+        // Cursor position
+        //
+        //
+
         let Some(layout) = &view.layout else { continue };
 
         let (cursor_line, cursor_col) = (view.cursor_target_line, view.cursor_target_col);
@@ -2400,7 +2496,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
 
             } else if dy.abs() > epsilon {
                 view.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
-                still_animating = true;
+                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes("Cursor anim"));
 
             } else {
                 view.cursor_anim_y = target_y;
@@ -2430,10 +2526,11 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
     }
 
     //
-    // Advance animations regions in every buffer
+    // Advance animated regions in every buffer
     //
     for buffer in editor.buffers.values_mut() {
         let before = buffer.currently_animated_pastes.len() + buffer.currently_animated_copies.len();
+
         for vec in [&mut buffer.currently_animated_pastes, &mut buffer.currently_animated_copies] {
             vec.retain_mut(|a| {
                 a.t = (a.t + dt / ANIMATED_RANGE_ANIM_DURATION).min(1.0);
@@ -2446,11 +2543,12 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
             buffer.is_dirty = true;  // @Hack nocheckin @DocumentThis
         }
 
-        if !buffer.currently_animated_pastes.is_empty()
-        || !buffer.currently_animated_copies.is_empty()
-        {
-            still_animating = true;
-        }
+        should_redraw = should_redraw.or_if(
+            !buffer.currently_animated_pastes.is_empty()
+                || !buffer.currently_animated_copies.is_empty(),
+
+            "paste/copy animation",
+        );
     }
 
     //
@@ -2465,16 +2563,18 @@ pub fn animate(editor: &mut Editor, dt: f32) -> bool {
         if buffer.currently_animated_deletions.len() < before {
             buffer.is_dirty = true; // @Hack nocheckin @DocumentThis
         }
-        if !buffer.currently_animated_deletions.is_empty() {
-            still_animating = true;
-        }
+
+        should_redraw = should_redraw.or_if(
+            !buffer.currently_animated_deletions.is_empty(),
+            "deletion animation",
+        );
     }
 
     if let Some(animate_hook) = editor.hooks.animate {
-        animate_hook(editor, dt, &mut still_animating);
+        animate_hook(editor, dt, &mut should_redraw);
     }
 
-    still_animating
+    should_redraw
 }
 
 pub fn find_matching_paren(
@@ -2601,10 +2701,9 @@ pub fn apply_scale(editor: &mut Editor, new_scale: f32, anchor_my: Option<f32>) 
     }
 }
 
-pub fn rescale(editor: &mut Editor, gpu: &mut Gpu, new_scale: f32) {
+pub fn rescale(editor: &mut Editor, new_scale: f32) {
     let new = new_scale.clamp(MIN_SCALE, MAX_SCALE);
     if new != editor.scale {
-        reset_atlas(gpu);
         apply_scale(editor, new, None);
         force_layouts_from_all_views_to_rebuild(editor);
     }
@@ -2841,6 +2940,7 @@ pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl In
     let buffer_id = editor.buffers.push(buffer);
     editor.mru_register_new_buffer(buffer_id);
 
+    println!("<<<<<<<<<<<< INSERTING {}:{} {} -> {:?}", file!(), line!(), editor.buffers[buffer_id].path.as_ref().unwrap().display(), buffer_id);
     editor.canonicalized_path_to_buffer_id.insert(editor.buffers[buffer_id].path.clone().unwrap().into(), buffer_id);  // @Clone
 
     editor.views[view].switch_buffer(buffer_id);
@@ -2899,16 +2999,13 @@ pub fn open_initial_buffer(editor: &mut Editor) {
         .and_then(|p| Buffer::from_file(p).ok())
         .unwrap_or_else(Buffer::new);
 
-    //
-    // Reuse the root buffer slot
-    //
+    let buffer_id = editor.buffers.push(buffer);
 
-    editor.buffers[editor.views[VIEW_MAIN].buffer_id] = buffer;
+    editor.mru_register_new_buffer(buffer_id); // @Refactor
 
-    let root_buf_id = editor.views[VIEW_MAIN].buffer_id;
-    editor.mru_register_new_buffer(root_buf_id);
+    editor.views[VIEW_MAIN].switch_buffer(buffer_id);
 
     if let Some(p) = canon {
-        editor.canonicalized_path_to_buffer_id.insert(p.into(), root_buf_id);
+        editor.canonicalized_path_to_buffer_id.insert(p.into(), buffer_id);
     }
 }

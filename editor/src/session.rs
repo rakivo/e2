@@ -245,10 +245,9 @@ pub fn load_session<'a>(data: &'a [u8]) -> Option<Session<'a>> {
 pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
     let t0 = Instant::now();
 
-
     editor.canonicalized_current_working_directory = session.cwd.into();
 
-    let mut leaf_views  = Vec::<ViewId>::with_capacity(session.leaves.len());
+    let mut leaf_views = Vec::<ViewId>::with_capacity(session.leaves.len());
 
     let root_view_id = VIEW_MAIN;
     let line_h = editor.line_h();

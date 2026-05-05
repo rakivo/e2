@@ -1,15 +1,19 @@
 use crate::color::{Color, GpuColor, lerp_color};
 use crate::messager::MESSAGER_FONT_SIZE;
-use crate::{Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, palette, tracy};
+use crate::util::format_bytes;
+use crate::{scale_base_font_size, Editor, Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, tracy};
 
 use std::ops::Range;
 use std::sync::Arc;
 
+use swash::FontRef;
+use smallvec::SmallVec;
 use wgpu::naga::FastHashMap;
 use winit::window::Window;
+use swash::scale::ScaleContext;
 
  // @Note: Must match ATLAS_SIZE in the shader
-pub const ATLAS_SIZE: u32 = 1024; // 1MB
+pub const ATLAS_SIZE: u32 = 2048; // 2048*2048*4 = 16777216 = 16MB
 pub const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
 
 pub const INITIAL_VERTEX_BUFFER_CAPACITY: u64 = 8 * 1024 * 1024;
@@ -56,12 +60,17 @@ pub struct Gpu {
     pub batch_pool:     Vec<Batch>,
     pub batch_count:    usize,
 
+    pub atlas_sampler:  wgpu::Sampler,
     pub atlas_tex:      wgpu::Texture,
     pub atlas_cur_x:    u16,
     pub atlas_cur_y:    u16,
     pub atlas_row_h:    u16,
     pub glyphs:         FastHashMap<(char, u32), GpuGlyph>, // (char, (font size * 10.0) as u32) -> Glyph
-    pub font:           fontdue::Font,
+
+    pub font_data: Vec<u8>,
+    pub font_offset: u32,
+    pub font_key: swash::CacheKey,
+    pub scale_context: swash::scale::ScaleContext,
 
     pub surface:        wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
@@ -103,6 +112,7 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
+        flags: wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG,
         ..Default::default()
     });
 
@@ -141,7 +151,7 @@ async fn init_async(window: Arc<Window>) -> Gpu {
         mip_level_count: 1, sample_count: 1,
         dimension:    wgpu::TextureDimension::D2,
         format:       wgpu::TextureFormat::R8Unorm,
-        usage:        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage:        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let atlas_view    = atlas_tex.create_view(&Default::default());
@@ -219,11 +229,17 @@ async fn init_async(window: Arc<Window>) -> Gpu {
         mapped_at_creation: false,
     });
 
-    let font_bytes = include_bytes!("../assets/font.ttf");
-    let font = fontdue::Font::from_bytes(font_bytes.as_ref(), fontdue::FontSettings::default()).unwrap();
+    let font_data = include_bytes!("../assets/font.ttf").to_vec();
+    let font_ref = FontRef::from_index(&font_data, 0).unwrap();
+    let font_offset = font_ref.offset;
+    let font_key = font_ref.key;
+    let scale_context = ScaleContext::new();
 
     Gpu {
-        font,
+        font_key,
+        font_offset,
+        scale_context,
+        font_data,
 
         surface, surface_config, device, queue,
 
@@ -231,7 +247,7 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
         pipeline, bind_group, vertex_buffer,
 
-        atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
+        atlas_sampler, atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
 
         glyphs: FastHashMap::with_capacity_and_hasher(2048, Default::default()),
         current_vertex_buffer_capacity: INITIAL_VERTEX_BUFFER_CAPACITY,
@@ -260,21 +276,49 @@ pub fn prewarm_glyphs(gpu: &mut Gpu, font_size: f32) {
 }
 
 pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
-    let size = (size * 2.0).round() / 2.0; // snap to 0.5px increments
+    use swash::FontRef;
+    use swash::zeno::Format;
+    use swash::scale::{Render, Source};
+
+    let size = (size * 2.0).round() / 2.0;
     let key = (c, (size * 2.0) as u32);
     if let Some(g) = gpu.glyphs.get(&key) {
         return Some(*g);
     }
 
-    let (metrics, bitmap) = gpu.font.rasterize(c, size);
-    if metrics.width == 0 || metrics.height == 0 {
-        // Cache the miss so we don't re-rasterize
-        let g = GpuGlyph { advance: metrics.advance_width, ..Default::default() };
+    let font_ref = FontRef { data: &gpu.font_data, offset: gpu.font_offset, key: gpu.font_key };
+
+    let glyph_id = font_ref.charmap().map(c);
+    let advance = font_ref.glyph_metrics(&[]).scale(size).advance_width(glyph_id);
+
+    if glyph_id == 0 {
+        let g = GpuGlyph { advance, ..Default::default() };
         gpu.glyphs.insert(key, g);
         return Some(g);
     }
 
-    let (w, h) = (metrics.width as u16, metrics.height as u16);
+    let mut scaler = gpu.scale_context.builder(font_ref)
+        .size(size)
+        .build();
+
+    let image = Render::new(&[Source::Outline])
+        .format(Format::Alpha)
+        .render(&mut scaler, glyph_id);
+
+    let Some(image) = image else {
+        let g = GpuGlyph { advance, ..Default::default() };
+        gpu.glyphs.insert(key, g);
+        return Some(g);
+    };
+
+    let w = image.placement.width as u16;
+    let h = image.placement.height as u16;
+
+    if w == 0 || h == 0 || !image.data.iter().any(|&b| b > 0) {
+        let g = GpuGlyph { advance, ..Default::default() };
+        gpu.glyphs.insert(key, g);
+        return Some(g);
+    }
 
     let atlas_used = gpu.atlas_cur_y as u32 * ATLAS_SIZE + gpu.atlas_cur_x as u32;
     let atlas_total = ATLAS_SIZE * ATLAS_SIZE;
@@ -283,14 +327,14 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
     }
 
     if gpu.atlas_cur_x + w + 1 > ATLAS_SIZE as u16 {
-        // Row wrap
         gpu.atlas_cur_y += gpu.atlas_row_h + 1;
         gpu.atlas_cur_x = 1;
         gpu.atlas_row_h = 0;
     }
+
     if gpu.atlas_cur_y + h + 1 > ATLAS_SIZE as u16 {
-        eprintln!("atlas full");
-        return None; // Shouldn't really happen though!
+        eprintln!("ATLAS FULL");
+        return None;
     }
 
     gpu.queue.write_texture(
@@ -299,36 +343,112 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
             origin: wgpu::Origin3d { x: gpu.atlas_cur_x as u32, y: gpu.atlas_cur_y as u32, z: 0 },
             aspect: wgpu::TextureAspect::All,
         },
-        &bitmap,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w as u32), rows_per_image: Some(h as u32) },
+        &image.data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w as u32),
+            rows_per_image: Some(h as u32),
+        },
         wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
     );
 
+    let bearing_x = image.placement.left as i16;
+    let bearing_y = image.placement.top as i16;
+
     let g = GpuGlyph {
-        uv_x: gpu.atlas_cur_x as u16,
-        uv_y: gpu.atlas_cur_y as u16,
-        uv_w: w as u16,
-        uv_h: h as u16,
+        uv_x: gpu.atlas_cur_x,
+        uv_y: gpu.atlas_cur_y,
+        uv_w: w,
+        uv_h: h,
         w, h,
-        bearing_x: metrics.xmin as i16,
-        bearing_y: metrics.ymin as i16,
-        advance: metrics.advance_width,
+        bearing_x,
+        bearing_y,
+        advance,
     };
 
     gpu.atlas_cur_x += w + 1;
     if h > gpu.atlas_row_h { gpu.atlas_row_h = h; }
 
+    debug_assert!(g.uv_w > 0 && g.uv_h > 0);
     gpu.glyphs.insert(key, g);
-
     Some(g)
 }
 
 #[inline]
 pub fn reset_atlas(gpu: &mut Gpu) {
+    eprintln!("[Resetting Atlas!]");
+
     gpu.glyphs.clear();
     gpu.atlas_cur_x = 1;
     gpu.atlas_cur_y = 1;
     gpu.atlas_row_h = 0;
+}
+
+
+pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
+    let mut builtin_prewarmed_font_sizes: SmallVec<[f32; 16]> = [
+        editor.scale,
+        editor.scale - SCALE_STEP,
+        editor.scale + SCALE_STEP,
+        editor.scale - 2.0 * SCALE_STEP,
+        editor.scale + 2.0 * SCALE_STEP,
+        editor.scale + 3.0 * SCALE_STEP,
+    ].into_iter().map(scale_base_font_size).collect();
+
+    if let Some(additional_font_sizes_to_prewarm_hook) = editor.hooks.additional_font_sizes_to_prewarm {
+        for value in additional_font_sizes_to_prewarm_hook(editor) {
+            if builtin_prewarmed_font_sizes.iter().any(|&x| x == value) {
+                continue;
+            }
+
+            let d = (value - editor.scale).abs();
+
+            // Find insertion point: after last element with <= distance
+            let mut insert_at = builtin_prewarmed_font_sizes.len();
+
+            for (i, &existing) in builtin_prewarmed_font_sizes.iter().enumerate() {
+                let ed = (existing - editor.scale).abs();
+
+                if ed > d {
+                    insert_at = i;
+                    break;
+                }
+            }
+
+            builtin_prewarmed_font_sizes.insert(insert_at, value);
+        }
+    }
+
+    eprintln!("[Prewarming glyphs...]");
+    for font_size in builtin_prewarmed_font_sizes {
+        prewarm_glyphs(gpu, font_size);
+    }
+
+    prewarm_glyphs(gpu, MESSAGER_FONT_SIZE);
+
+    let vertex_batch_pool_allocation = gpu.batch_pool.iter()
+        .map(|b| b.verts.capacity())
+        .sum::<usize>();
+
+    eprintln!("[Vertex batch pool preallocation]: {}", format_bytes(vertex_batch_pool_allocation));
+    eprintln!("[Vertex buffer size]:              {}", format_bytes(gpu.vertex_buffer.size() as _));
+    eprintln!("[Glyph memory usage]:              {}", format_bytes(gpu.glyphs.allocation_size()));
+
+    print_atlas_usage(gpu);
+}
+
+pub fn print_atlas_usage(gpu: &Gpu) {
+    let bytes_per_pixel = 1; // R8Unorm
+    let total_bytes = ATLAS_SIZE * ATLAS_SIZE * bytes_per_pixel;
+
+    // This is a rough estimate - current row is partially used
+    let used_bytes = gpu.atlas_cur_y as u32 * ATLAS_SIZE * bytes_per_pixel;
+    eprintln!(
+        "[Atlas] used ~= {} / {} bytes ({:.2}%)",
+        format_bytes(used_bytes as _),
+        format_bytes(total_bytes as _),
+        (used_bytes as f32 / total_bytes as f32) * 100.0
+    );
 }
 
 #[inline]
@@ -474,7 +594,7 @@ pub fn draw_text_colored(
         if g.w == 0 || g.h == 0 { continue; }
 
         let gx = (gx_origin + g.bearing_x as f32).round();
-        let gy = (y - g.bearing_y as f32 - g.h as f32).round();
+        let gy = (y         - g.bearing_y as f32).round();
 
         let x0 =  gx                      * inv_sw * 2.0 - 1.0;
         let x1 = (gx + g.w as f32)        * inv_sw * 2.0 - 1.0;
@@ -558,7 +678,7 @@ pub fn draw_text_for_editor(
 
         // x is already the accumulated advance from layout - use g.x directly.
         let gx = (origin_x + g.x + gg.bearing_x as f32).round();
-        let gy = (y              - gg.bearing_y as f32 - gg.h as f32).round();
+        let gy = (y              - gg.bearing_y as f32).round();
         let gw = gg.w as f32;
         let gh = gg.h as f32;
 
@@ -674,6 +794,16 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
     let view   = output.texture.create_view(&Default::default());
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     {
+        let atlas_view = gpu.atlas_tex.create_view(&Default::default());
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &gpu.pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gpu.atlas_sampler) },
+            ],
+        });
+
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
@@ -689,7 +819,9 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
 
         if !draws.is_empty() {
             pass.set_pipeline(&gpu.pipeline);
-            pass.set_bind_group(0, &gpu.bind_group, &[]);
+            // use this local bind_group instead of gpu.bind_group
+            pass.set_bind_group(0, &bind_group, &[]);
+            // pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
 
             for Draw { range, clip } in &draws {
@@ -741,7 +873,7 @@ fn vs_main(v: V) -> F {
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var smp: sampler;
 
-const ATLAS_SIZE: f32 = 1024.0; // @Note: Must match ATLAS_SIZE in gpu
+const ATLAS_SIZE: f32 = 2048.0; // @Note: Must match ATLAS_SIZE in gpu
 
 @fragment
 fn fs_main(f: F) -> @location(0) vec4<f32> {
@@ -749,7 +881,7 @@ fn fs_main(f: F) -> @location(0) vec4<f32> {
 
     let uv = f.uv / ATLAS_SIZE;
     let a = textureSample(tex, smp, uv).r;
-
     return f.color * a;
 }
+
 "#;

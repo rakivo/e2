@@ -17,4 +17,3 @@ smallvec           .workspace = true
 cranelift-entity   .workspace = true
 paste              .workspace = true
 winit              .workspace = true
-wgpu               .workspace = true

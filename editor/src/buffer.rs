@@ -246,7 +246,7 @@ impl Buffer {
         let restart_state = self.state_at_byte(start_byte);
 
         // :LexerDebug
-        // eprintln!("lex_visible: lines {}..{} bytes {}..{} state={:?}", start_line, end_line, start_byte, end_byte, restart_state); // nocheckin
+        // eprintln!("lex_visible: lines {}..{} bytes {}..{} state={:?}", start_line, end_line, start_byte, end_byte, restart_state);
 
         self.flatten_rope_into_scratch(start_byte, end_byte);
 
@@ -255,7 +255,7 @@ impl Buffer {
             &self.scratch_space_to_flatten_rope_into,
             start_byte,
             restart_state,
-            &mut self.visible_tokens,
+            Some(&mut self.visible_tokens),
         );
     }
 
@@ -265,14 +265,6 @@ impl Buffer {
         self.comment_cache.truncate(keep);
     }
 
-    // nocheckin
-    // fn invalidate_cache_from_char(&mut self, char_index: usize) {
-    //     let byte = self.text.char_to_byte(char_index);
-    //     let keep = self.comment_cache.partition_point(|(b, _)| *b < byte);
-    //     self.comment_cache.truncate(keep);
-    //     self.extend_cache_to(self.text.len_bytes()); // re-scan to EOF from invalidation point
-    // }
-
     fn extend_cache_to(&mut self, target_byte: usize) {
         let (resume_byte, resume_state) = self.comment_cache
             .last()
@@ -281,21 +273,11 @@ impl Buffer {
 
         if resume_byte > target_byte { return; }
 
-        let char_start = self.text.byte_to_char(resume_byte);
-        let char_end   = self.text.byte_to_char(target_byte);
-        let mut state    = resume_state;
-        let mut byte_pos = resume_byte;
-        let mut tmp      = Vec::new();
+        // Flatten to contiguous buffer to avoid chunk-boundary mid-token splits
+        self.flatten_rope_into_scratch(resume_byte, target_byte);
 
-        for chunk in self.text.slice(char_start..char_end).chunks() {
-            tmp.clear();
-            let new_state = lex_from(chunk, byte_pos, state, &mut tmp);
-            state = new_state;
-            byte_pos += chunk.len();
-            self.comment_cache.push((byte_pos, state));
-        }
-
-        self.comment_cache.push((byte_pos, state));
+        let end_state = lex_from(&self.scratch_space_to_flatten_rope_into, resume_byte, resume_state, None);
+        self.comment_cache.push((target_byte, end_state));
     }
 
     fn state_at_byte(&mut self, target_byte: usize) -> LexState {

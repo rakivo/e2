@@ -8,7 +8,6 @@
 // #[global_allocator]
 // static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use cranelift_entity::packed_option::ReservedValue;
 use editor::buffer::Buffer;
 use editor::color::Color;
 use editor::director::{EntryKind, ScanState};
@@ -18,16 +17,17 @@ use editor::command::{CommandContext, CommandEntry, CommandTable, Keymap, Loaded
 use editor::*;
 
 use editor_macros::{collect_commands, command, export};
-use winit::event::KeyEvent;
 
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::time::Instant;
 use std::fmt::Write;
 
+use winit::event::KeyEvent;
+use winit::keyboard::{Key, NamedKey};
 use smallvec::smallvec;
 use smallstr::SmallString;
 use cranelift_entity::EntityRef;
-use winit::keyboard::{Key, NamedKey};
+use cranelift_entity::packed_option::ReservedValue;
 
 pub const LISTER_SPLIT_CUSTOM_PANEL: CustomPanel = CustomPanel { extra0: 420, extra1: 67, extra2: 69 };
 pub const LISTER_SPLIT_PANEL_KIND: PanelKind = PanelKind::Custom(LISTER_SPLIT_CUSTOM_PANEL);
@@ -132,13 +132,11 @@ pub fn move_down(cx: &mut CommandContext) {
 #[command]
 pub fn move_page_up(cx: &mut CommandContext) {
     scroll_page(cx.editor, cx.gpu, -1);
-    cx.editor.reset_blink();
 }
 
 #[command]
 pub fn move_page_down(cx: &mut CommandContext) {
     scroll_page(cx.editor, cx.gpu, 1);
-    cx.editor.reset_blink();
 }
 
 #[command]
@@ -271,22 +269,38 @@ pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratc
     let len = buf.text.len_chars();
     if view.cursor.char_index >= len { return; }
 
-    buf.flatten_rope_into_scratch(
+    buf.flatten_rope_into_scratch(  // :BufferScratch
         buf.text.char_to_byte(view.cursor.char_index),
         buf.text.len_bytes(),
     );
 
-    let chars_to_delete = match memchr::memchr(b'\n', buf.scratch_space_to_flatten_rope_into.as_bytes()) {
-        Some(0) => 1,  // On the newline, delete just it
+    let mut chars_to_delete = 0;
+    {
+        let slice = &buf.scratch_space_to_flatten_rope_into;
 
-        Some(p) => {
-            // Check if everything before \n is whitespace, if so, include the \n
-            let all_ws = buf.scratch_space_to_flatten_rope_into[..p].bytes().all(|b| b == b' ' || b == b'\t');
-            if all_ws { p + 1 } else { p }
+        let mut all_whitespace = true;
+
+        for c in slice.chars() {
+            if c == '\n' {
+                if chars_to_delete == 0 {
+                    chars_to_delete = 1;
+                } else if all_whitespace {
+                    chars_to_delete += 1;
+                }
+                break;
+            }
+
+            if !c.is_whitespace() {
+                all_whitespace = false;
+            }
+
+            chars_to_delete += 1;
         }
 
-        None => len - view.cursor.char_index,
-    };
+        if chars_to_delete == 0 {
+            chars_to_delete = slice.chars().count();
+        }
+    }
 
     if chars_to_delete == 0 { return; }
 
@@ -449,17 +463,19 @@ pub fn toggle_focused_split(cx: &mut CommandContext) {
 
 #[command]
 pub fn scale_down(cx: &mut CommandContext) {
-    rescale(cx.editor, cx.gpu, cx.editor.scale - SCALE_STEP);
+    rescale(cx.editor, cx.editor.scale - SCALE_STEP);
+    gpu::print_atlas_usage(cx.gpu);
 }
 
 #[command]
 pub fn scale_up(cx: &mut CommandContext) {
-    rescale(cx.editor, cx.gpu, cx.editor.scale + SCALE_STEP);
+    rescale(cx.editor, cx.editor.scale + SCALE_STEP);
+    gpu::print_atlas_usage(cx.gpu);
 }
 
 #[command]
 pub fn scale_reset(cx: &mut CommandContext) {
-    rescale(cx.editor, cx.gpu, 1.0);
+    rescale(cx.editor, 1.0);
 }
 
 #[command]
@@ -659,6 +675,8 @@ pub fn display_to_path(display: &str) -> String {  // @Refactor
 
 #[command]
 pub fn open_file(cx: &mut CommandContext) {
+    // @Note: Compute start_dir here because after the open_lister call,
+    // active_view() is gonna return the View into the lister's query buffer.
     //
     // Inherit start dir from active buffer, fall back to cwd
     //
@@ -673,9 +691,6 @@ pub fn open_file(cx: &mut CommandContext) {
 }
 
 pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
-    // @Note: Compute start_dir here because after the open_lister call,
-    // active_view() is gonna return the View into the lister's query buffer.
-
     let items = Vec::new();
     editor_open_lister_with_frame_callback(
         cx.editor,
@@ -709,11 +724,13 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 }
             }
 
-            let Ok(new_buffer) = Buffer::from_file(path.as_str().as_ref()) else { return };
+            let Ok(new_buffer) = Buffer::from_file(path.as_str().as_ref()) else {
+                return
+            };
 
             let new_buffer_id = cx.editor.buffers.push(new_buffer);
             if let Some(canon) = cx.editor.buffers[new_buffer_id].path.clone().and_then(|p| p.canonicalize().ok()) {
-                cx.editor.canonicalized_path_to_buffer_id.insert(canon.into() , new_buffer_id);  // @Clone @Refactor
+                cx.editor.canonicalized_path_to_buffer_id.insert(canon.into(), new_buffer_id);  // @Clone @Refactor
             }
             cx.editor.mru_register_new_buffer(new_buffer_id);
             cx.editor.active_view_mut().switch_buffer(new_buffer_id);
@@ -724,6 +741,8 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
         |cx| {
             let dir: &Path = cx.editor.canonicalized_last_scanned_directory.as_str().as_ref();
             let got_new_chunks = cx.editor.director.poll(dir);
+
+            let mut redraw = ShouldRequestFrameRedraw::No;
 
             let lister = cx.editor.custom_data.lister_mut();
 
@@ -747,7 +766,9 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 }
             }
 
-            if !lister.is_query_dirty { return got_new_chunks; }
+            if !lister.is_query_dirty {
+                redraw = redraw.or_if(got_new_chunks, "File Lister new chunks");
+            }
             lister.is_query_dirty = false;
 
             let query_path = display_to_path(lister.query.as_str()); // @Clone
@@ -788,6 +809,8 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 lister.last_seen_cached_dir_generation = u64::MAX;
                 lister.rebuild_filtered();
 
+                redraw = redraw.or_msg("File Lister clear");
+
                 //
                 // Also pre-scan parent so navigating up is instant
                 //
@@ -802,7 +825,7 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 cx.editor.director.get(dir_to_scan.as_path());
             }
 
-            true
+            redraw
         }
     );
 
@@ -901,7 +924,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         }
     });
 
-    cx.editor.hooks.animate = Some(|editor, dt, still_animating| {
+    cx.editor.hooks.animate = Some(|editor, dt, should_redraw| {
         let epsilon = 0.5f32;  // Stop animating when close enough
 
         let lister = editor.custom_data.lister_mut();
@@ -912,7 +935,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         let ds = lister.scroll - lister.scroll_anim;
         if ds.abs() > epsilon {
             lister.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
-            *still_animating = true;
+            *should_redraw = should_redraw.or_msg("Lister scrolling animation");
         } else {
             lister.scroll_anim = lister.scroll;
         }
@@ -931,7 +954,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             lister.open_anim = lister.open_anim.clamp(0.0, 1.0);
         }
 
-        *still_animating |= lister.open_anim != target;
+        *should_redraw = should_redraw.or_if(lister.open_anim != target, "Lister opening animation");
     });
 
 
@@ -1061,14 +1084,14 @@ fn setup_hooks(cx: &mut CommandContext) {
             lister.query.clear();
             lister.query.extend(query);
             lister.scroll = 0.0;
-            lister.selected_index = if lister.set_selected_index_to_1_instead_of_0 {
-                (lister.items.len() > 1) as u32
-            } else {
-                0
-            };
             lister.is_query_dirty = true;
             lister.rebuild_filtered();
             lister.is_query_dirty = true; // nocheckin @DocumentThis
+            lister.selected_index = if lister.set_selected_index_to_1_instead_of_0 {
+                (lister.filtered.len() > 1) as u32
+            } else {
+                0
+            };
         }
 
         (false, false)
@@ -1117,10 +1140,10 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.inside_about_to_wait_should_request_redraw = Some(|editor| {
         if editor.lister().open_anim > 0.0 && !editor.lister().is_open {
-            return true;
+            return ShouldRequestFrameRedraw::yes("Lister opening animation");
         }
 
-        false
+        ShouldRequestFrameRedraw::No
     });
 
     cx.editor.hooks.mouse_wheel_scrolled = Some(|cx, dy| {
@@ -1217,31 +1240,30 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.inside_redraw_should_request_redraw = Some(|editor| {
-        let mut should_request_redraw = false;
+        let mut redraw = ShouldRequestFrameRedraw::No;
 
         let lister = editor.lister();
 
-        should_request_redraw |= lister.is_open() != lister.last_is_lister_open;
-        should_request_redraw |= editor.messager.count != editor.last_messager_count;
-        should_request_redraw |= lister.open_anim > 0.0 && !lister.is_open;
+        redraw = redraw.or_if(lister.is_open() != lister.last_is_lister_open, "Lister opening animation");
+        redraw = redraw.or_if(lister.open_anim > 0.0 && !lister.is_open, "Lister opening animation");
 
-        should_request_redraw
+        redraw
+    });
+
+    cx.editor.hooks.about_to_redraw_a_frame = Some(|cx, _dt| {
+        cx.editor.lister_mut().last_is_lister_open = cx.editor.lister().is_open();
+
+        ShouldRequestFrameRedraw::No
     });
 
     cx.editor.hooks.about_to_rebuild_dirty_layouts = Some(|cx| {
-        let mut should_request_redraw = false;
+        let mut should_request_redraw = ShouldRequestFrameRedraw::No;
 
         if let Some(Some(callback)) = cx.editor.lister().items_update_frame_update_callback.last().copied() {
             should_request_redraw |= callback(cx);
         }
 
         should_request_redraw
-    });
-
-    cx.editor.hooks.about_to_redraw_a_frame = Some(|cx, _dt| {
-        cx.editor.lister_mut().last_is_lister_open = cx.editor.lister().is_open();
-
-        false
     });
 
     cx.editor.hooks.about_to_draw_this_panel = Some(|cx, _panel, view, _rect| {
@@ -1317,7 +1339,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
         }
 
-        false
+        ShouldRequestFrameRedraw::No
     });
 
     cx.editor.hooks.additional_font_sizes_to_prewarm = Some(|editor| {
@@ -1606,16 +1628,16 @@ pub fn editor_open_lister_impl(editor: &mut Editor, items: Vec<ListerItem>, on_c
     lister.filtered.clear();
     lister.is_query_dirty   = true;
     editor.canonicalized_last_scanned_directory = SmallString::new();
-    lister.selected_index  = if lister.set_selected_index_to_1_instead_of_0 {
-        (items.len() > 1) as u32
-    } else {
-        0
-    };
     lister.scroll          = 0.0;
     lister.scroll_anim     = 0.0;
     lister.is_open         = true;
     lister.items           = items;
     lister.rebuild_filtered();
+    lister.selected_index  = if lister.set_selected_index_to_1_instead_of_0 {
+        (lister.filtered.len() > 1) as u32
+    } else {
+        0
+    };
 }
 
 
@@ -1633,7 +1655,7 @@ pub struct ListerItem {
     pub data:     u64,
 }
 
-pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> bool;
+pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> ShouldRequestFrameRedraw;
 pub type ListerSelectFn = fn(&mut CommandContext, u64);
 
 pub struct Lister {

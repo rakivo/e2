@@ -12,20 +12,19 @@
 // #[global_allocator]
 // static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use crossbeam_channel::Receiver;
 use editor::*;
 use editor::audioer::Audioer;
 use editor::messager::{MESSAGE_DURATION_IN_MILLISECONDS};
 use editor::session::{default_session_path, pretty_path, save_session};
 use editor::command::{CommandContext, CommandTable, Keymap, LoadedLib, Mods};
-use editor::{BLINK_START_DELAY_MS, Editor, Rect, checked_reserve, gpu, prewarm_glyphs_and_print_preallocation_memory_usage};
-use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY};
-use winit::keyboard::{Key, NamedKey};
+use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY, prewarm_glyphs_and_print_preallocation_memory_usage};
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Receiver;
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 use winit::application::ApplicationHandler;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -198,9 +197,9 @@ impl ApplicationHandler<UserEvent> for App {
         let editor = &self.editor;
 
         if editor.hooks.inside_about_to_wait_should_request_redraw.map_or(
-            false,
+            Default::default(),
             |f| f(editor)
-        ) {
+        ).is_yes() {
             win.request_redraw();
             return;
         }
@@ -272,25 +271,30 @@ impl ApplicationHandler<UserEvent> for App {
         let mods = Mods { alt, ctrl, shift };
 
         macro_rules! make_command_context {
-            (@event $event: expr) => {
+            (@auto $event:expr) => {{
                 CommandContext {
                     editor, gpu,
                     event_and_mods: $event,
                     command_table: &mut self.command_table,
                     keymap: &mut self.keymap,
                 }
-            };
+            }};
 
-            (None) => {
-                make_command_context!(@event None)
-            };
-            () => {
-                make_command_context!(@event None)
-            };
+            (@defer $event:expr) => {{
+                core::mem::ManuallyDrop::new(CommandContext {
+                    editor, gpu,
+                    event_and_mods: $event,
+                    command_table: &mut self.command_table,
+                    keymap: &mut self.keymap,
+                })
+            }};
 
-            ($event: expr) => {
-                make_command_context!(@event Some(($event, mods)))
-            };
+            ()                     => { make_command_context!(@auto None) };
+            (None)                 => { make_command_context!(@auto None) };
+            (defer None)           => { make_command_context!(@defer None) };
+            (defer)                => { make_command_context!(@defer None) };
+            ($event:expr)          => { make_command_context!(@auto Some(($event, mods))) };
+            (defer $event:expr)    => { make_command_context!(@defer Some(($event, mods))) };
         }
 
         match event {
@@ -311,6 +315,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 editor.hide_cursor(win);
+                editor.reset_blink(); // nocheckin
 
                 let mut should_request_redraw = false;
 
@@ -404,7 +409,7 @@ impl ApplicationHandler<UserEvent> for App {
                         MouseScrollDelta::PixelDelta(p)   => p.y as f32 * 0.01,
                     };
                     let new = (editor.scale + dy * 0.075).clamp(MIN_SCALE, MAX_SCALE);
-                    rescale(editor, gpu, new);
+                    editor::rescale(editor, new);
                     win.request_redraw();
                     return;
                 }
@@ -568,7 +573,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 tracy_client::frame_mark();
 
-                let mut should_request_redraw = false;
+                ShouldRequestFrameRedraw::begin_frame();
+
+                let mut redraw = ShouldRequestFrameRedraw::No;
 
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
@@ -598,7 +605,8 @@ impl ApplicationHandler<UserEvent> for App {
                 gpu.clip_depth = 0;
 
                 if let Some(about_to_redraw_a_frame_hook) = editor.hooks.about_to_redraw_a_frame {
-                    should_request_redraw |= about_to_redraw_a_frame_hook(&mut make_command_context!(), dt);
+                    let mut cx = make_command_context!(defer);
+                    redraw |= about_to_redraw_a_frame_hook(&mut cx, dt);
                 }
 
                 //
@@ -627,7 +635,8 @@ impl ApplicationHandler<UserEvent> for App {
                 collect_leaves(editor, editor.root_panel, &mut leaf_panels);
 
                 if let Some(about_to_rebuild_dirty_layouts_hook) = editor.hooks.about_to_rebuild_dirty_layouts {
-                    should_request_redraw |= about_to_rebuild_dirty_layouts_hook(&mut make_command_context!());
+                    let mut cx = make_command_context!(defer);
+                    redraw |= about_to_rebuild_dirty_layouts_hook(&mut cx);
                 }
 
                 //
@@ -641,7 +650,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                     let is_dirty = does_view_need_layout_rebuild(editor, view_id, buffer_id, rect);
 
-                    should_request_redraw |= is_dirty;
+                    redraw = redraw.or_if(is_dirty, "Layout rebuild");
 
                     if is_dirty {
                         rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
@@ -649,7 +658,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(rebuilt_all_dirty_layouts_hook) = editor.hooks.rebuilt_all_dirty_layouts {
-                    should_request_redraw |= rebuilt_all_dirty_layouts_hook(&mut make_command_context!());
+                    let mut cx = make_command_context!(defer);
+                    redraw |= rebuilt_all_dirty_layouts_hook(&mut cx);
                 }
 
                 //
@@ -658,10 +668,11 @@ impl ApplicationHandler<UserEvent> for App {
                 //
                 //
 
-                should_request_redraw |= animate(editor, dt);
+                redraw |= animate(editor, dt);
 
                 if let Some(animated_all_animations_hook) = editor.hooks.animated_all_animations {
-                    should_request_redraw |= animated_all_animations_hook(&mut make_command_context!());
+                    let mut cx = make_command_context!(defer);
+                    redraw |= animated_all_animations_hook(&mut cx);
                 }
 
                 //
@@ -675,7 +686,10 @@ impl ApplicationHandler<UserEvent> for App {
                         let about_to_draw_this_panel = editor.hooks.about_to_draw_this_panel;
                         let should_skip_rendering_this_specific_panel = about_to_draw_this_panel.map_or(
                             false,
-                            |f| f(&mut make_command_context!(), panel_id, view_id, rect)
+                            |f| {
+                                let mut cx = make_command_context!(defer);
+                                f(&mut cx, panel_id, view_id, rect)
+                            }
                         );
                         if should_skip_rendering_this_specific_panel {
                             continue;
@@ -710,7 +724,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 if let Some(drew_all_leaf_panels_hook) = editor.hooks.drew_all_leaf_panels {
-                    should_request_redraw |= drew_all_leaf_panels_hook(&mut make_command_context!());
+                    let mut cx = make_command_context!(defer);
+                    redraw |= drew_all_leaf_panels_hook(&mut cx);
                 }
 
                 let t1 = Instant::now();
@@ -733,13 +748,18 @@ impl ApplicationHandler<UserEvent> for App {
                 let blink_changed = new_cursor_visible != editor.last_cursor_visible;
                 editor.last_cursor_visible = new_cursor_visible;
 
-                should_request_redraw |= blink_changed;
+                redraw = redraw.or_if(blink_changed, "Cursor blinking");
+                redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation");
+                redraw = redraw.or_if(editor.messager.count != 0, "Messager animation"); // nocheckin
 
                 if let Some(inside_redraw_should_request_redraw) = editor.hooks.inside_redraw_should_request_redraw {
-                    should_request_redraw |= inside_redraw_should_request_redraw(editor);
+                    redraw |= inside_redraw_should_request_redraw(editor);
                 }
 
-                if should_request_redraw {
+                if redraw.into() {
+                    // :RedrawDebug
+                    // println!("Requesting redraw: {redraw}");
+
                     win.request_redraw();
                 } else {
                     self.about_to_wait(el);

@@ -1,5 +1,3 @@
-use std::path::MAIN_SEPARATOR;
-
 use crate::color::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -13,6 +11,7 @@ pub enum TokenKind {
     Type,
     Punct,
     Macro,
+    Note,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +62,7 @@ impl Token {
 // base0E #a88c62  keywords, storage
 // base0F #876e48  deprecated, punctuation
 
+#[inline(always)]
 pub const fn token_color(kind: TokenKind) -> Color {
     match kind {
         TokenKind::Default => Color::hex(0xc3a983), // base05
@@ -73,6 +73,7 @@ pub const fn token_color(kind: TokenKind) -> Color {
         TokenKind::Type    => Color::hex(0xdec8a7), // base0A
         TokenKind::Punct   => Color::hex(0x876e48), // base0F
         TokenKind::Macro   => Color::hex(0xc3a983), // base0D
+        TokenKind::Note    => Color::hex(0xdec8a7)
     }
 }
 
@@ -95,7 +96,7 @@ static CHAR_CLASSES: [u8; 256] = {
             table[i] = C_ALPHA;
         } else if b.is_ascii_digit() {
             table[i] = C_DIGIT;
-        } else if b == MAIN_SEPARATOR as u8 {
+        } else if b == b'/' as u8 {
             table[i] = C_SLASH;
         } else if b == b'"' {
             table[i] = C_QUOTE;
@@ -123,22 +124,111 @@ pub fn lex_from(
     src: &str,
     byte_offset: usize,
     state: LexState,
-    out: &mut Vec<Token>,
+    mut out: Option<&mut Vec<Token>>,
 ) -> LexState {
     let bytes = src.as_bytes();
     let len   = bytes.len();
     let mut i = 0usize;
     let mut cur_state = state;
 
-    // Ensure we don't reallocate mid-lex
-    out.reserve(len / 4);
+    if let Some(out) = &mut out {
+        out.reserve(len / 4);
+    }
 
     macro_rules! push {
         ($kind:expr, $start:expr, $end:expr) => {
             if $end > $start {
-                out.push(Token::new($kind, $start + byte_offset, $end - $start));
+                if let Some(out) = &mut out {
+                    out.push(Token::new($kind, $start + byte_offset, $end - $start));
+                }
             }
         };
+    }
+
+    macro_rules! push_comment_with_notes {
+        ($seg_start:expr, $seg_end:expr) => {{
+            let seg_start: usize = $seg_start;
+            let seg_end:   usize = $seg_end;
+            let mut p    = seg_start;
+            let mut last = seg_start;
+
+            while p < seg_end {
+                let c = bytes[p];
+
+                // :Tag  /  @Tag
+                if (c == b':' || c == b'@')
+                    && p + 1 < seg_end
+                    && bytes[p + 1].is_ascii_uppercase()
+                {
+                    if last < p {
+                        push!(TokenKind::Comment, last, p);
+                    }
+                    let note_start = p;
+                    p += 1; // skip ':' / '@'
+                    while p < seg_end
+                        && (bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_')
+                    {
+                        p += 1;
+                    }
+                    push!(TokenKind::Note, note_start, p);
+                    last = p;
+                    continue;
+                }
+
+                // Screaming case notes
+                if c.is_ascii_uppercase() {
+                    let rem = &bytes[p..seg_end];
+                    let kw_len: Option<usize> =
+                         if rem.starts_with(b"IMPORTANT")  { Some(9) }
+                    else if rem.starts_with(b"FIXME")      { Some(5) }
+                    else if rem.starts_with(b"TODO")       { Some(4) }
+                    else if rem.starts_with(b"NOTE")       { Some(4) }
+                    else if rem.starts_with(b"HACK")       { Some(4) }
+                    else if rem.starts_with(b"TBD")        { Some(3) }
+                    else                                  { None    };
+
+                    if let Some(n) = kw_len {
+                        let after = p + n;
+                        // Require a word boundary so e.g. "NOTABLE" isn't matched as NOTE
+                        let at_boundary = after >= seg_end
+                            || (!bytes[after].is_ascii_alphanumeric()
+                                && bytes[after] != b'_');
+
+                        if at_boundary {
+                            if last < p {
+                                push!(TokenKind::Comment, last, p);
+                            }
+                            push!(TokenKind::Note, p, after);
+                            p    = after;
+                            last = after;
+                            continue;
+                        }
+                    }
+                }
+
+                // nocheckin (case-insensitive)
+                if p + 9 <= seg_end
+                    && bytes[p..p + 9].eq_ignore_ascii_case(b"nocheckin")
+                    && (p + 9 >= seg_end
+                        || (!bytes[p + 9].is_ascii_alphanumeric() && bytes[p + 9] != b'_'))
+                {
+                    if last < p {
+                        push!(TokenKind::Comment, last, p);
+                    }
+                    push!(TokenKind::Note, p, p + 9);
+                    p    += 9;
+                    last  = p;
+                    continue;
+                }
+
+                p += 1;
+            }
+
+            // Trailing comment fragment (or the whole range if no notes found)
+            if last < seg_end {
+                push!(TokenKind::Comment, last, seg_end);
+            }
+        }};
     }
 
     // If we're resuming mid-block-comment, scan until we close it
@@ -147,16 +237,16 @@ pub fn lex_from(
         while i < len {
             if let Some(next_star) = memchr::memchr(b'*', &bytes[i..]) {
                 i += next_star;
-                if i + 1 < len && bytes[i + 1] == MAIN_SEPARATOR as u8 {
+                if i + 1 < len && bytes[i + 1] == b'/' {
                     i += 2;
-                    push!(TokenKind::Comment, start, i);
+                    push_comment_with_notes!(start, i);
                     break;
                 }
                 i += 1;
             } else {
                 i = len;
                 // Still in block comment at end of src
-                push!(TokenKind::Comment, start, i);
+                push_comment_with_notes!(start, i);
                 return LexState::InBlockComment;
             }
         }
@@ -183,7 +273,10 @@ pub fn lex_from(
         }
 
         push!(TokenKind::String, start, i);
-        if !closed { return LexState::InString; }
+        if !closed {
+            return LexState::InString;
+        }
+
         cur_state = LexState::Normal;
     }
 
@@ -225,6 +318,69 @@ pub fn lex_from(
                 while i < len && CHAR_CLASSES[bytes[i] as usize] == C_WHITESPACE {
                     i += 1;
                 }
+            }
+
+            C_SLASH => {
+                if i + 1 < len {
+                    if bytes[i+1] == b'/' { // Line comment
+                        i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |pos| i + pos);
+                        push_comment_with_notes!(start, i);
+                    } else if bytes[i+1] == b'*' { // Block comment
+                        i += 2;
+
+                        let mut closed = false;
+                        while i < len {
+                            if let Some(pos) = memchr::memchr(b'*', &bytes[i..]) {
+                                i += pos + 1;
+                                if i < len && bytes[i] == b'/' {
+                                    i += 1;
+                                    closed = true;
+                                    push_comment_with_notes!(start, i);
+                                    break;
+                                }
+                            } else { break; }
+                        }
+
+                        if !closed {
+                            i = len;
+                            push_comment_with_notes!(start, i);
+                            return LexState::InBlockComment;
+                        }
+                    } else {
+                        i += 1;
+                        push!(TokenKind::Punct, start, i);
+                    }
+                } else {
+                    i += 1;
+                    push!(TokenKind::Punct, start, i);
+                }
+            }
+
+            C_QUOTE => {
+                // String literal
+                i += 1;
+                let mut closed = false;
+                while i < len {
+                    if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
+                        i += hit;
+                        if bytes[i] == b'\\' {
+                            i += 2; // Skip \ and the next char
+                        } else {
+                            i += 1; // Closing "
+                            closed = true;
+                            break;
+                        }
+                    } else {
+                        i = len; break;
+                    }
+                }
+
+                push!(TokenKind::String, start, i);
+                if !closed {
+                    return LexState::InString;
+                }
+
+                cur_state = LexState::Normal;
             }
 
             C_ALPHA => {
@@ -296,33 +452,45 @@ pub fn lex_from(
                     let mut kind = match word.len() {
                         2 => if matches!(word, "fn" | "if" | "as" | "in" | "do" | "is" | "go" | "to") {
                             Some(TokenKind::Keyword)
+                        } else if matches!(word, "TODO") {
+                            Some(TokenKind::Note)
                         } else { None },
 
                         3 => if matches!(word, "for" | "let" | "mut" | "pub" | "use" | "mod" | "try" | "new" | "var" | "def" | "nil") {
                             Some(TokenKind::Keyword)
+                        } else if matches!(word, "TBD") {
+                            Some(TokenKind::Note)
                         } else { None },
 
                         4 => if matches!(word, "impl" | "enum" | "type" | "else" | "case" | "char" | "byte" | "void" | "true" | "self" | "goto" | "with") {
                             Some(TokenKind::Keyword)
+                        } else if matches!(word, "NOTE" | "HACK") {
+                            Some(TokenKind::Note)
                         } else { None },
 
                         5 => if matches!(word, "match" | "const" | "while" | "break" | "async" | "await" | "trait" | "false" | "super" | "final" | "class" | "yield" | "range") {
                             Some(TokenKind::Keyword)
+                        } else if matches!(word, "FIXME") {
+                            Some(TokenKind::Note)
                         } else { None },
 
                         6 => if matches!(word, "return" | "struct" | "extern" | "import" | "public" | "static" | "switch" | "typeof" | "delete") {
                             Some(TokenKind::Keyword)
+                        } else if matches!(word, "IMPORTANT") {
+                            Some(TokenKind::Note)
                         } else { None },
 
                         7 => if matches!(word, "default" | "private" | "virtual" | "package" | "extends" | "finally") {
                             Some(TokenKind::Keyword)
+                        } else if word.eq_ignore_ascii_case("nocheckin") {
+                            Some(TokenKind::Note)
                         } else { None },
 
                         8 => if matches!(word, "continue") {
                             Some(TokenKind::Keyword)
                         } else { None },
 
-                        _ => None,
+                        _ => None
                     };
 
                     // If not a specific keyword, apply the heuristic
@@ -357,65 +525,6 @@ pub fn lex_from(
                 }
 
                 push!(TokenKind::Number, start, i);
-            }
-
-            C_SLASH => {
-                if i + 1 < len {
-                    if bytes[i+1] == MAIN_SEPARATOR as u8 { // Line comment
-                        i = memchr::memchr(b'\n', &bytes[i..]).map_or(len, |pos| i + pos);
-                        push!(TokenKind::Comment, start, i);
-                    } else if bytes[i+1] == b'*' { // Block comment
-                        i += 2;
-
-                        let mut closed = false;
-                        while i < len {
-                            if let Some(pos) = memchr::memchr(b'*', &bytes[i..]) {
-                                i += pos + 1;
-                                if i < len && bytes[i] == MAIN_SEPARATOR as u8 {
-                                    i += 1;
-                                    closed = true;
-                                    push!(TokenKind::Comment, start, i);
-                                    break;
-                                }
-                            } else { break; }
-                        }
-
-                        if !closed {
-                            i = len;
-                            push!(TokenKind::Comment, start, i);
-                            return LexState::InBlockComment;
-                        }
-                    } else {
-                        i += 1;
-                        push!(TokenKind::Punct, start, i);
-                    }
-                } else {
-                    i += 1;
-                    push!(TokenKind::Punct, start, i);
-                }
-            }
-
-            C_QUOTE => {
-                // String literal
-                i += 1;
-                let mut closed = false;
-                while i < len {
-                    if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
-                        i += hit;
-                        if bytes[i] == b'\\' {
-                            i += 2; // Skip \ and the next char
-                        } else {
-                            i += 1; // Closing "
-                            closed = true;
-                            break;
-                        }
-                    } else {
-                        i = len; break;
-                    }
-                }
-
-                push!(TokenKind::String, start, i);
-                if !closed { return LexState::InString; }
             }
 
             C_TICK => {
@@ -454,6 +563,27 @@ pub fn lex_from(
             _ => {
                 // Punctuation
                 i += 1;
+
+                if (b == b':' || b == b'@')
+                    && i < len
+                    && bytes[i].is_ascii_uppercase()
+                {
+                    let mut j = i + 1;
+
+                    while j < len {
+                        let c = bytes[j];
+                        if c.is_ascii_alphanumeric() || c == b'_' {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    i = j;
+                    push!(TokenKind::Note, start, i);
+                    continue;
+                }
+
                 push!(TokenKind::Punct, start, i);
             }
         }

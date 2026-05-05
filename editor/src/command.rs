@@ -5,7 +5,7 @@ use libloading::Library;
 use wgpu::naga::{FastHashMap, FastIndexMap};
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
-use crate::{Editor, Hooks, adjust_cursors_after_buffer_mutation, gpu::Gpu, scroll_to_cursor};
+use crate::{Editor, Hooks, gpu::Gpu};
 
 pub struct CommandContext<'a> {
     pub editor: &'a mut Editor,
@@ -20,9 +20,7 @@ pub struct CommandContext<'a> {
 
 impl<'a> CommandContext<'a> {
     pub fn finish(&mut self) {
-        adjust_cursors_after_buffer_mutation(self.editor);
-        scroll_to_cursor(self.editor);
-        self.editor.reset_blink();
+        self.editor.command_finish();
     }
 }
 
