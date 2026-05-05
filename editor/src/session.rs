@@ -271,10 +271,7 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
                 b.path = Some(file_path.into());
                 b
             });
-            let buffer_id = editor.buffers.push(buffer);
-            if let Some(c) = canon {
-                editor.canonicalized_path_to_buffer_id.insert(c.into(), buffer_id);
-            }
+            let buffer_id = editor.push_buffer(buffer);
             editor.mru_register_new_buffer(buffer_id);
             buffer_id
         };
@@ -367,6 +364,7 @@ fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) 
                 editor.panels.push(Panel {
                     id:   panel_id,
                     rect: Rect::default(),
+                    rect_including_panel_bar: Rect::default(),
                     kind: PanelKind::Leaf { view_id },
                 });
                 editor.views[view_id].panel_id = panel_id;
@@ -381,6 +379,7 @@ fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) 
             editor.panels.push(Panel {
                 id:   panel_id,
                 rect: Rect::default(),
+                rect_including_panel_bar: Rect::default(),
                 kind: PanelKind::Split(PanelSplit {
                     vertical: *vertical,
                     ratio:    *ratio,

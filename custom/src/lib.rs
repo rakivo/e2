@@ -439,21 +439,17 @@ pub fn tab(cx: &mut CommandContext) {
 
 #[command]
 pub fn split_vertically(cx: &mut CommandContext) {
-    let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
-    cx.editor.split_active(true, 0.5, win_rect);
+    cx.editor.split_active(true, 0.5);
 }
 
 #[command]
 pub fn split_horizontally(cx: &mut CommandContext) {
-    let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
-    cx.editor.split_active(false, 0.5, win_rect);
+    cx.editor.split_active(false, 0.5);
 }
 
 #[command]
 pub fn close_focused_split(cx: &mut CommandContext) {
-    let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
     cx.editor.close_active();
-    cx.editor.layout_panels(win_rect);
 }
 
 #[command]
@@ -480,14 +476,11 @@ pub fn scale_reset(cx: &mut CommandContext) {
 
 #[command]
 pub fn open_new_buffer(cx: &mut CommandContext) {
-    let buffer  = Buffer::new();
-    let buf_id  = cx.editor.buffers.push(buffer);
+    let buffer_id = cx.editor.push_buffer(Buffer::new());
     let view_id = ViewId::new(cx.editor.views.len());
-    cx.editor.views.push(View::new(view_id, buf_id));
-    cx.editor.mru_register_new_buffer(buf_id);
+    cx.editor.views.push(View::new(view_id, buffer_id));
 
-    let root_id   = cx.editor.root_panel;
-    let win_rect = Rect::full(cx.gpu.win_w, cx.gpu.win_h);
+    let root_id  = cx.editor.root_panel;
 
     if matches!(&cx.editor.panel(root_id).kind, PanelKind::Leaf { .. }) {
         //
@@ -495,7 +488,7 @@ pub fn open_new_buffer(cx: &mut CommandContext) {
         //
 
         cx.editor.active_panel = root_id;
-        cx.editor.split_active(true, 0.5, win_rect);
+        cx.editor.split_active(true, 0.5);
     }
 
     if let PanelKind::Split(split) = cx.editor.panel(root_id).kind {
@@ -728,11 +721,7 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 return
             };
 
-            let new_buffer_id = cx.editor.buffers.push(new_buffer);
-            if let Some(canon) = cx.editor.buffers[new_buffer_id].path.clone().and_then(|p| p.canonicalize().ok()) {
-                cx.editor.canonicalized_path_to_buffer_id.insert(canon.into(), new_buffer_id);  // @Clone @Refactor
-            }
-            cx.editor.mru_register_new_buffer(new_buffer_id);
+            let new_buffer_id = cx.editor.push_buffer(new_buffer);
             cx.editor.active_view_mut().switch_buffer(new_buffer_id);
             cx.editor.mru_focus(new_buffer_id); // @Refactor
         },
@@ -767,7 +756,7 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
             }
 
             if !lister.is_query_dirty {
-                redraw = redraw.or_if(got_new_chunks, "File Lister new chunks");
+                redraw = redraw.or_if(got_new_chunks, "File Lister new chunks", &mut cx.editor.redraw_reasons);
             }
             lister.is_query_dirty = false;
 
@@ -809,7 +798,7 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 lister.last_seen_cached_dir_generation = u64::MAX;
                 lister.rebuild_filtered();
 
-                redraw = redraw.or_msg("File Lister clear");
+                redraw = redraw.or_msg("File Lister clear", &mut cx.editor.redraw_reasons);
 
                 //
                 // Also pre-scan parent so navigating up is instant
@@ -917,7 +906,7 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.collect_leaf_panels = Some(|editor, id, custom_panel, _stack| {
         match custom_panel {
             LISTER_SPLIT_CUSTOM_PANEL => smallvec![
-                (id, editor.lister().query_view, editor.panels[editor.lister().query_panel].rect)
+                (id, editor.lister().query_view, editor.panels[editor.lister().query_panel].rect, editor.panels[editor.lister().query_panel].rect_including_panel_bar)
             ],
 
             _ => unreachable!()
@@ -935,7 +924,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         let ds = lister.scroll - lister.scroll_anim;
         if ds.abs() > epsilon {
             lister.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
-            *should_redraw = should_redraw.or_msg("Lister scrolling animation");
+            *should_redraw = should_redraw.or_msg("Lister scrolling animation", &mut editor.redraw_reasons);
         } else {
             lister.scroll_anim = lister.scroll;
         }
@@ -954,7 +943,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             lister.open_anim = lister.open_anim.clamp(0.0, 1.0);
         }
 
-        *should_redraw = should_redraw.or_if(lister.open_anim != target, "Lister opening animation");
+        *should_redraw = should_redraw.or_if(lister.open_anim != target, "Lister opening animation", &mut editor.redraw_reasons);
     });
 
 
@@ -1140,7 +1129,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.inside_about_to_wait_should_request_redraw = Some(|editor| {
         if editor.lister().open_anim > 0.0 && !editor.lister().is_open {
-            return ShouldRequestFrameRedraw::yes("Lister opening animation");
+            return ShouldRequestFrameRedraw::yes("Lister opening animation", &mut editor.redraw_reasons);
         }
 
         ShouldRequestFrameRedraw::No
@@ -1242,10 +1231,10 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.inside_redraw_should_request_redraw = Some(|editor| {
         let mut redraw = ShouldRequestFrameRedraw::No;
 
-        let lister = editor.lister();
+        let lister = editor.custom_data.lister();
 
-        redraw = redraw.or_if(lister.is_open() != lister.last_is_lister_open, "Lister opening animation");
-        redraw = redraw.or_if(lister.open_anim > 0.0 && !lister.is_open, "Lister opening animation");
+        redraw = redraw.or_if(lister.is_open() != lister.last_is_lister_open, "Lister opening animation", &mut editor.redraw_reasons);
+        redraw = redraw.or_if(lister.open_anim > 0.0 && !lister.is_open, "Lister opening animation", &mut editor.redraw_reasons);
 
         redraw
     });
@@ -1278,6 +1267,10 @@ fn setup_hooks(cx: &mut CommandContext) {
         should_skip
     });
 
+    cx.editor.hooks.should_view_have_panel_bar = Some(|cx, view_id| {
+        cx.lister().query_view != view_id
+    });
+
     cx.editor.hooks.drew_all_leaf_panels = Some(|cx| {
         let editor = &mut cx.editor;
         let gpu = &mut cx.gpu;
@@ -1305,7 +1298,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             let view_id = editor.lister().query_view;
             let panel_id = editor.lister().query_panel;
-            let rect = editor.panels[editor.lister().query_panel].rect;
+            let rect = editor.panels[editor.lister().query_panel].rect_including_panel_bar;
             let buffer_id = editor.views[view_id].buffer_id;
 
             let show_cursor = if panel_id == active_panel {
@@ -1379,6 +1372,7 @@ pub fn editor_init_custom_data(editor: &mut Editor) {
     editor.panels.push(Panel {
         id:   lister_query_panel,
         rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
         kind: PanelKind::Leaf { view_id: lister_query_view },
     });
     editor.views[lister_query_view].panel_id = lister_query_panel;
@@ -1387,6 +1381,7 @@ pub fn editor_init_custom_data(editor: &mut Editor) {
     editor.panels.push(Panel {
         id:   lister_split_panel,
         rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
         kind: LISTER_SPLIT_PANEL_KIND,
     });
 

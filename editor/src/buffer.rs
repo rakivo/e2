@@ -55,7 +55,9 @@ pub struct AnimatedRegion {
 #[derive(Default)]
 pub struct Buffer {
     pub text: Rope,
+
     pub path: Option<Box<Path>>,
+    pub pretty_path: Box<str>,
 
     pub is_dirty: bool,
 

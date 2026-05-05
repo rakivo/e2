@@ -149,16 +149,13 @@ impl ApplicationHandler<UserEvent> for App {
                 .with_decorations(false)
         ).unwrap().into();
 
-        let size = win.inner_size();
-        let (w, h) = (size.width.max(1), size.height.max(1));
-
         let mut gpu = gpu::init(Arc::clone(&win));
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
 
         let editor = &mut self.editor;
         editor.win_w = gpu.win_w;
         editor.win_h = gpu.win_h;
-        editor.layout_panels(Rect::full(w as f32, h as f32));
+        editor.layout_panels();
 
         self.refresh_rate_millihertz = win.current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
@@ -185,6 +182,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
 
+        editor.recompute_buffer_display_names();
+
         self.gpu    = Some(gpu);
         self.window = Some(win);
     }
@@ -194,7 +193,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         let Some(win) = &self.window else { return };
 
-        let editor = &self.editor;
+        let editor = &mut self.editor;
 
         if editor.hooks.inside_about_to_wait_should_request_redraw.map_or(
             Default::default(),
@@ -564,7 +563,7 @@ impl ApplicationHandler<UserEvent> for App {
                     gpu.surface_config.width  = sz.width;
                     gpu.surface_config.height = sz.height;
                     gpu.surface.configure(&gpu.device, &gpu.surface_config);
-                    editor.layout_panels(Rect::full(gpu.win_w, gpu.win_h));
+                    editor.layout_panels();
 
                     win.request_redraw();
                 }
@@ -573,7 +572,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 tracy_client::frame_mark();
 
-                ShouldRequestFrameRedraw::begin_frame();
+                ShouldRequestFrameRedraw::begin_frame(&mut editor.redraw_reasons);
 
                 let mut redraw = ShouldRequestFrameRedraw::No;
 
@@ -626,8 +625,6 @@ impl ApplicationHandler<UserEvent> for App {
                     checked_reserve!(verts, reserve as usize, "vertex buffer");
                 }
 
-                let font_size    = editor.font_size();
-                let line_h       = editor.line_h();
                 let is_cursor_visible_due_to_blinking = editor.cursor_visible();
                 let active_panel = editor.active_panel;
 
@@ -645,15 +642,15 @@ impl ApplicationHandler<UserEvent> for App {
                 //
                 //
 
-                for &(_panel_id, view_id, rect) in &leaf_panels {
+                for &(_panel_id, view_id, rect, _rect_including_bar) in &leaf_panels {
                     let buffer_id = editor.views[view_id].buffer_id;
 
                     let is_dirty = does_view_need_layout_rebuild(editor, view_id, buffer_id, rect);
 
-                    redraw = redraw.or_if(is_dirty, "Layout rebuild");
+                    redraw = redraw.or_if(is_dirty, "Layout rebuild", &mut editor.redraw_reasons);
 
                     if is_dirty {
-                        rebuild_text_layout(editor, gpu, view_id, rect, font_size, line_h);
+                        rebuild_text_layout(editor, gpu, view_id, rect);
                     }
                 }
 
@@ -681,7 +678,7 @@ impl ApplicationHandler<UserEvent> for App {
                 //
                 //
 
-                for &(panel_id, view_id, rect) in &leaf_panels {
+                for &(panel_id, view_id, rect, rect_including_bar) in &leaf_panels {
                     {
                         let about_to_draw_this_panel = editor.hooks.about_to_draw_this_panel;
                         let should_skip_rendering_this_specific_panel = about_to_draw_this_panel.map_or(
@@ -696,7 +693,8 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
 
-                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+                    let r = rect_including_bar;
+                    gpu::push_clip(gpu, r.x, r.y, r.w, r.h);
                     let buffer_id = editor.views[view_id].buffer_id;
 
                     let show_cursor = if panel_id == active_panel {
@@ -719,6 +717,7 @@ impl ApplicationHandler<UserEvent> for App {
                         editor.is_our_window_focused,
                         &mut editor.scratch_paren,
                     );
+                    render_panel_bar(gpu, editor, view_id);
                     editor.render_us_acc += t1.elapsed().as_micros() as f32;
                     gpu::pop_clip(gpu);
                 }
@@ -748,9 +747,9 @@ impl ApplicationHandler<UserEvent> for App {
                 let blink_changed = new_cursor_visible != editor.last_cursor_visible;
                 editor.last_cursor_visible = new_cursor_visible;
 
-                redraw = redraw.or_if(blink_changed, "Cursor blinking");
-                redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation");
-                redraw = redraw.or_if(editor.messager.count != 0, "Messager animation"); // nocheckin
+                redraw = redraw.or_if(blink_changed, "Cursor blinking", &mut editor.redraw_reasons);
+                redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation", &mut editor.redraw_reasons);
+                redraw = redraw.or_if(editor.messager.count != 0, "Messager animation", &mut editor.redraw_reasons); // nocheckin
 
                 if let Some(inside_redraw_should_request_redraw) = editor.hooks.inside_redraw_should_request_redraw {
                     redraw |= inside_redraw_should_request_redraw(editor);
@@ -758,7 +757,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 if redraw.into() {
                     // :RedrawDebug
-                    // println!("Requesting redraw: {redraw}");
+                    // println!("Requesting redraw: {}", redraw.display(&editor.redraw_reasons));
 
                     win.request_redraw();
                 } else {

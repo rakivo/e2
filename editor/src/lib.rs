@@ -55,7 +55,6 @@ use command::{CommandContext, CommandAtom};
 use director::Director;
 
 use std::any::Any;
-use std::cell::RefCell;
 use std::io::{BufWriter, Write};
 use std::num::NonZero;
 use std::ops::{Deref, DerefMut};
@@ -122,8 +121,8 @@ hooks! {
 
         pub does_view_need_layout_rebuild: fn (&Editor, ViewId, BufferId, Rect) -> bool,
 
-        pub inside_about_to_wait_should_request_redraw: fn (&Editor) -> ShouldRequestFrameRedraw,
-        pub        inside_redraw_should_request_redraw: fn (&Editor) -> ShouldRequestFrameRedraw,
+        pub inside_about_to_wait_should_request_redraw: fn (&mut Editor) -> ShouldRequestFrameRedraw,
+        pub        inside_redraw_should_request_redraw: fn (&mut Editor) -> ShouldRequestFrameRedraw,
 
         /// You usually wanna do your ticks here.
         pub about_to_redraw_a_frame:        fn (&mut CommandContext, dt: f32) -> ShouldRequestFrameRedraw,
@@ -138,6 +137,8 @@ hooks! {
 
         /// Returns `true` if should skip rendering this specific panel.
         pub about_to_draw_this_panel:       fn (&mut CommandContext, PanelId, ViewId, Rect) -> bool,
+
+        pub should_view_have_panel_bar:     fn (&Editor, ViewId) -> bool,
 
         pub drew_all_leaf_panels:           fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
 
@@ -165,7 +166,7 @@ hooks! {
         pub post_command_execution: fn (&mut CommandContext, CommandAtom)  -> (bool, bool),
 
         pub collect_leaf_panels_init_stack:         fn (&Editor, root: PanelId,              stack: &mut SmallVec<[PanelId; 48]>),
-        pub collect_leaf_panels:                    fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId, Rect); 2]>,
+        pub collect_leaf_panels:                    fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId, Rect, Rect); 2]>, // @Memory
         pub collect_leaf_panels_for_session_saving: fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId); 2]>,
     }
 }
@@ -714,7 +715,7 @@ pub fn rebuild_text_layout(
 
     view_id:   ViewId,
 
-    rect: Rect, font_size: f32, line_h: f32,
+    rect: Rect
 ) {
     let view = &editor.views[view_id];
     let buffer_id = view.buffer_id;
@@ -733,7 +734,7 @@ pub fn rebuild_text_layout(
         editor,
         gpu,
         view_id,
-        rect, font_size, line_h,
+        rect
     );
 
     editor.build_us_acc += t0.elapsed().as_micros() as f32;
@@ -772,11 +773,14 @@ pub fn build_text_layout(
 
     view_id: ViewId,
 
-    rect: Rect, font_size: f32, line_h: f32,
+    rect: Rect
 ) -> TextLayout {
     let _tracy = tracy::span!("build_text_layout");
 
     let old_layout = editor.views[view_id].layout.take();
+
+    let font_size = editor.font_size();
+    let line_h = editor.line_h();
 
     let view      = &editor.views[view_id];
     let buffer_id = view.buffer_id;
@@ -790,8 +794,8 @@ pub fn build_text_layout(
     //
     // Add a tiny bit of padding so lines don't pop at the very edges
     //
-    first_line = first_line.saturating_sub(2);
-    last_line  = last_line.saturating_add(2);
+    first_line = first_line.saturating_sub(20);
+    last_line  = last_line.saturating_add(20);
 
     //
     // If the animation is moving DOWN, pad the BOTTOM more.
@@ -1333,6 +1337,29 @@ pub fn render_text_layout(
     }
 }
 
+pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
+
+    let rect = layout.rect;
+    let bar_h = editor.panel_bar_h();
+    let bar_y = rect.y - bar_h;
+
+    gpu::draw_rect(gpu, rect.x, bar_y, rect.w, bar_h, Color::hex(0x1f1508));
+
+    let pad = (bar_h-editor.font_size())/2.0;
+
+    let center_y = bar_y + bar_h * 0.5;
+    let y = center_y + editor.font_size() * 0.35; // nocheckin
+
+    let buffer_id = view.buffer_id;
+    let buffer = &editor.buffers[buffer_id];
+    let (line, col) = buffer.cursor_line_col(&view.cursor);
+    let text = format!("{}  {}:{}  {}", buffer.pretty_path, line+1, col+1, editor.scale);
+
+    gpu::draw_text(gpu, &text, rect.x+pad, y, editor.font_size(), Color::rgba(174, 131, 60, 255));
+}
+
 pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
     let tick  = editor.messager.tick;
     let head  = editor.messager.head  as usize;
@@ -1438,6 +1465,7 @@ impl PanelKind {
 #[derive(Copy, Clone, Debug)]
 pub struct Panel {
     pub id:   PanelId,
+    pub rect_including_panel_bar: Rect, // @Memory: This is very naive
     pub rect: Rect,
     pub kind: PanelKind,
 }
@@ -1502,7 +1530,6 @@ impl View {
     pub fn switch_buffer(&mut self, new: BufferId) {
         let old = self.buffer_id;
         if old == new {
-            println!("OLD == NEW");
             return;
         }
 
@@ -1659,7 +1686,7 @@ impl EditorCustomData {
 }
 
 pub struct Editor {
-    // Storage
+    /// NOTE: If you want to push a buffer here, you probably wanna use [`Editor::push_buffer`] instead.
     pub buffers: PrimaryMap<BufferId, Buffer>,
     pub views:   PrimaryMap<ViewId,   View>,
     pub panels:  PrimaryMap<PanelId,  Panel>,
@@ -1724,6 +1751,8 @@ pub struct Editor {
     pub director:        Director,
     pub messager:        Messager,
     pub audioer:         Audioer,
+
+    pub redraw_reasons:  Vec<ReasonEntry>,
 }
 
 impl Deref for Editor {
@@ -1752,6 +1781,7 @@ impl Editor {
         panels.push(Panel {
             id:   root_panel,
             rect: Rect::default(),
+            rect_including_panel_bar: Rect::default(),
             kind: PanelKind::Leaf { view_id: root_view },
         });
         views[root_view].panel_id = root_panel;
@@ -1807,7 +1837,8 @@ impl Editor {
             audioer,
             director: Director::new(),
             messager: Messager::new(),
-            session_apply_time_in_milliseconds: None
+            session_apply_time_in_milliseconds: None,
+            redraw_reasons: Vec::with_capacity(64)
         };
 
         //
@@ -1829,6 +1860,25 @@ impl Editor {
         open_initial_buffer(&mut editor);
 
         editor
+    }
+
+    #[inline]
+    pub fn recompute_buffer_display_names(&mut self) {
+        recompute_pretty_paths(&mut self.buffers);
+    }
+
+    #[inline]
+    pub fn push_buffer(&mut self, buffer: Buffer) -> BufferId {
+        let buffer_id = self.buffers.push(buffer);
+        self.mru_register_new_buffer(buffer_id);
+
+        if let Some(canon) = self.buffers[buffer_id].path.as_ref().and_then(|p| p.canonicalize().ok()) {
+            self.canonicalized_path_to_buffer_id.insert(canon.into(), buffer_id);  // @Clone @Refactor
+        }
+
+        self.recompute_buffer_display_names();
+
+        buffer_id
     }
 
     #[inline]
@@ -1942,7 +1992,8 @@ impl Editor {
     /// Re-layout the panel tree from the root given the window rect.
     /// For now: root can either be a Leaf (single view) or a Split
     /// (exactly two children, both Leaf).  N+2 panels max.
-    pub fn layout_panels(&mut self, win_rect: Rect) {
+    pub fn layout_panels(&mut self) {
+        let win_rect = Rect::full(self.win_w, self.win_h);
         self.layout_panel(self.root_panel, win_rect);
         if let Some(layout_panels_hook) = self.hooks.layout_panels {
             layout_panels_hook(self, win_rect);
@@ -1951,10 +2002,24 @@ impl Editor {
 
     pub fn layout_panel(&mut self, id: PanelId, rect: Rect) {
         self.panels[id].rect = rect;
+        self.panels[id].rect_including_panel_bar = rect;
 
         let split = match self.panels[id].kind {
             PanelKind::Split(s) => s,
-            PanelKind::Leaf { .. } => return,
+
+            PanelKind::Leaf { view_id } => {
+                let should_have_bar = self.hooks.should_view_have_panel_bar.map_or(
+                    true,
+                    |f| f(self, view_id)
+                );
+                if should_have_bar {
+                    let bar_h = self.panel_bar_h();
+                    self.panels[id].rect.y += bar_h;
+                    self.panels[id].rect.h -= bar_h;
+                }
+
+                return;
+            }
 
             _other => {
                 if let Some(layout_panel_hook) = self.hooks.layout_panel {
@@ -1977,9 +2042,9 @@ impl Editor {
 
     /// Split the active panel.  Creates two new panels + one new view
     /// (the new panel gets a new view into the same buffer).
-    pub fn split_active(&mut self, vertical: bool, ratio: f32, win_rect: Rect) {
+    pub fn split_active(&mut self, vertical: bool, ratio: f32) {
         self.split_active_no_layout(vertical, ratio);
-        self.layout_panels(win_rect);
+        self.layout_panels();
     }
 
     /// Split the active panel.  Creates two new panels + one new view
@@ -2006,8 +2071,8 @@ impl Editor {
         let left_id  = PanelId::new(self.panels.len());
         let right_id = PanelId::new(left_id.0 as usize + 1);
 
-        self.panels.push(Panel { id: left_id,  kind: PanelKind::Leaf { view_id: old_view_id }, rect: Rect::default() });
-        self.panels.push(Panel { id: right_id, kind: PanelKind::Leaf { view_id: new_view_id }, rect: Rect::default() });
+        self.panels.push(Panel { id: left_id,  kind: PanelKind::Leaf { view_id: old_view_id }, rect: Rect::default(), rect_including_panel_bar: Default::default() });
+        self.panels.push(Panel { id: right_id, kind: PanelKind::Leaf { view_id: new_view_id }, rect: Rect::default(), rect_including_panel_bar: Default::default() });
 
         // Turn the old panel into a split node
         self.panels[active_id].kind = PanelKind::Split(PanelSplit {
@@ -2061,6 +2126,8 @@ impl Editor {
         self.panels[parent].kind = to_keep_kind;
 
         self.set_active_panel(parent);
+
+        self.layout_panels();
     }
 
     pub fn toggle_active_panel(&mut self) {
@@ -2071,9 +2138,9 @@ impl Editor {
             return;
         }
 
-        let current_pos = leaves.iter().position(|(id, _, _)| *id == self.active_panel).unwrap_or(0);
+        let current_pos = leaves.iter().position(|(id, ..)| *id == self.active_panel).unwrap_or(0);
         let next = (current_pos + 1) % leaves.len();
-        let (to_switch_to, _, _) = leaves[next];
+        let (to_switch_to, ..) = leaves[next];
 
         let (from_x, from_y) = {
             let view = self.active_view();
@@ -2167,6 +2234,7 @@ impl Editor {
 
     #[inline] pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
     #[inline] pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
+    #[inline] pub fn panel_bar_h(&self) -> f32 { self.line_h() + self.cursor_h() + self.scale * 2.5 }
     #[inline] pub fn cursor_w(&self)  -> f32 { scale_base_cursor_width(self.scale) }
     #[inline] pub fn cursor_h(&self)  -> f32 { scale_base_cursor_height(self.scale) }
 
@@ -2273,17 +2341,12 @@ pub fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
     elapsed < BLINK_ON_MS
 }
 
-const REASON_CAP: usize = 64;
-const NO_PARENT:  u16   = u16::MAX;
+const NO_PARENT: u16 = u16::MAX;
 
 #[derive(Clone, Copy)]
-struct ReasonEntry {
+pub struct ReasonEntry {
     msg:    &'static str,
     parent: u16,
-}
-
-thread_local! {
-    static REASONS: RefCell<Vec<ReasonEntry>> = RefCell::new(Vec::with_capacity(REASON_CAP));
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -2326,12 +2389,17 @@ impl From<ShouldRequestFrameRedraw> for bool {
     fn from(s: ShouldRequestFrameRedraw) -> bool { s.is_yes() }
 }
 
-impl std::fmt::Display for ShouldRequestFrameRedraw {
+pub struct ShouldRequestFrameRedrawDisplay<'a> {
+    s: ShouldRequestFrameRedraw,
+    reasons: &'a [ReasonEntry]
+}
+
+impl std::fmt::Display for ShouldRequestFrameRedrawDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::No => write!(f, "No"),
-            Self::Yes(_) => {
-                let chain = self.reason_chain();
+        match self.s {
+            ShouldRequestFrameRedraw::No => write!(f, "No"),
+            ShouldRequestFrameRedraw::Yes(_) => {
+                let chain = self.s.reason_chain(self.reasons);
                 write!(f, "Yes({})", chain.join(" <- "))
             }
         }
@@ -2339,26 +2407,52 @@ impl std::fmt::Display for ShouldRequestFrameRedraw {
 }
 
 impl ShouldRequestFrameRedraw {
+    #[inline]
+    pub fn display<'a>(self, reasons: &'a [ReasonEntry]) -> ShouldRequestFrameRedrawDisplay<'a> {
+        ShouldRequestFrameRedrawDisplay {
+            s: self,
+            reasons
+        }
+    }
+
     /// Call once at the start of each frame to reset the reason store.
     #[inline]
-    pub fn begin_frame() {
-        REASONS.with(|r| r.borrow_mut().clear());
+    pub fn begin_frame(reasons: &mut Vec<ReasonEntry>) {
+        #[cfg(debug_assertions)]
+        reasons.clear();
     }
 
     #[inline]
-    pub fn yes(msg: &'static str) -> Self {
-        Self::push(msg, NO_PARENT)
+    pub fn yes(msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
+        #[cfg(debug_assertions)]
+        return Self::push(msg, NO_PARENT, reasons);
+        #[cfg(not(debug_assertions))]
+        { let _ = (msg, reasons); Self::Yes(0) }
     }
 
     #[inline]
-    fn push(msg: &'static str, parent: u16) -> Self {
-        REASONS.with(|r| {
-            let mut v = r.borrow_mut();
-            if v.len() >= REASON_CAP { return Self::Yes(v.len() as u16 - 1); }
-            let idx = v.len() as u16;
-            v.push(ReasonEntry { msg, parent });
+    fn push(msg: &'static str, parent: u16, reasons: &mut Vec<ReasonEntry>) -> Self {
+        #[cfg(not(debug_assertions))]
+        { let _ = (msg, parent, reasons); return Self::Yes(0); }
+        #[cfg(debug_assertions)]
+        {
+            let idx = reasons.len() as u16;
+            reasons.push(ReasonEntry { msg, parent });
             Self::Yes(idx)
-        })
+        }
+    }
+
+    /// Attach an additional reason on top of an existing one, forming a chain.
+    /// If self is No, stays No.
+    #[inline]
+    pub fn because(self, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
+        #[cfg(not(debug_assertions))]
+        { let _ = (msg, reasons); return self; }
+        #[cfg(debug_assertions)]
+        match self {
+            Self::Yes(parent) => Self::push(msg, parent, reasons),
+            Self::No          => Self::No,
+        }
     }
 
     /// Redraw if either does.  Keeps self's reason if both are Yes.
@@ -2379,31 +2473,21 @@ impl ShouldRequestFrameRedraw {
         }
     }
 
-    /// Attach an additional reason on top of an existing one, forming a chain.
-    /// If self is No, stays No.
     #[inline]
-    pub fn because(self, msg: &'static str) -> Self {
-        match self {
-            Self::Yes(parent) => Self::push(msg, parent),
-            Self::No          => Self::No,
-        }
-    }
-
-    #[inline]
-    pub fn if_msg(condition: bool, msg: &'static str) -> Self {
-        if condition { Self::yes(msg) } else { Self::default() }
+    pub fn if_msg(condition: bool, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
+        if condition { Self::yes(msg, reasons) } else { Self::default() }
     }
 
     /// Convenience: set self to Yes if the condition is true.
     #[inline]
-    pub fn or_if(self, condition: bool, msg: &'static str) -> Self {
-        if condition { self.or(Self::yes(msg)) } else { self }
+    pub fn or_if(self, condition: bool, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
+        if condition { self.or(Self::yes(msg, reasons)) } else { self }
     }
 
     /// Convenience: set self to Yes if the condition is true.
     #[inline]
-    pub fn or_msg(self, msg: &'static str) -> Self {
-        self.or_if(true, msg)
+    pub fn or_msg(self, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
+        self.or_if(true, msg, reasons)
     }
 
     #[inline]
@@ -2414,26 +2498,100 @@ impl ShouldRequestFrameRedraw {
 
     /// Walk the reason chain from most-recent to root.
     #[inline]
-    pub fn reason_chain(self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        let Self::Yes(mut id) = self else { return out };
-        REASONS.with(|r| {
-            let v = r.borrow();
+    pub fn reason_chain(self, reasons: &[ReasonEntry]) -> Vec<&'static str> {
+        #[cfg(not(debug_assertions))]
+        { let _ = reasons; return Vec::new(); }
+        #[cfg(debug_assertions)]
+        {
+            let mut out = Vec::new();
+            let Self::Yes(mut id) = self else { return out };
             loop {
-                let e = v[id as usize];
+                let e = reasons[id as usize];
                 out.push(e.msg);
                 if e.parent == NO_PARENT { break; }
                 id = e.parent;
             }
-        });
-        out
+            out
+        }
     }
 
     #[inline]
-    pub fn reason(self) -> Option<&'static str> {
-        let Self::Yes(id) = self else { return None };
-        REASONS.with(|r| Some(r.borrow()[id as usize].msg))
+    pub fn reason(self, reasons: &[ReasonEntry]) -> Option<&'static str> {
+        #[cfg(not(debug_assertions))]
+        { let _ = reasons; return None; }
+        #[cfg(debug_assertions)]
+        {
+            let Self::Yes(id) = self else { return None };
+            Some(reasons[id as usize].msg)
+        }
     }
+}
+
+pub fn recompute_pretty_paths(buffers: &mut PrimaryMap<BufferId, Buffer>) {  // @Memory @Speed
+    let mut by_name: FastHashMap<String, Vec<BufferId>> = Default::default();
+    for (id, buf) in buffers.iter() {
+        let Some(path) = &buf.path else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        by_name.entry(name.to_string()).or_default().push(id);
+    }
+
+    for buf in buffers.values_mut() {
+        if buf.path.is_none() {
+            buf.pretty_path = "*scratch*".into();
+        }
+    }
+
+    let mut suffixes: Vec<Box<str>> = Vec::new();
+
+    for (name, ids) in &by_name {
+        if ids.len() == 1 {
+            buffers[ids[0]].pretty_path = name.as_str().into();
+            continue;
+        }
+
+        'depth: for depth in 1..=32usize {
+            suffixes.clear();
+
+            let path_strs = ids.iter()
+                .map(|id| buffers[*id].path.as_deref().unwrap().to_str().unwrap_or("?"));
+            for s in path_strs {
+                suffixes.push(parent_suffix(s, name, depth - 1));
+            }
+
+            let unique = (0..suffixes.len())
+                .all(|i| (i+1..suffixes.len())
+                    .all(|j| suffixes[i] != suffixes[j]));
+
+            if unique || depth == 32 {
+                for (id, suffix) in ids.iter().zip(&suffixes) {
+                    buffers[*id].pretty_path = if suffix.is_empty() {
+                        name.as_str().into()
+                    } else {
+                        format!("{}<{}>", name, suffix).into()
+                    };
+                }
+
+                break 'depth;
+            }
+        }
+    }
+}
+
+fn parent_suffix(s: &str, name: &str, depth: usize) -> Box<str> {
+    let end = s.len().saturating_sub(name.len() + 1);
+    let bytes = s.as_bytes();
+    let mut remaining = depth;
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'/' || bytes[i] == b'\\' {
+            if remaining == 0 {
+                return s[i+1..end].into();
+            }
+            remaining -= 1;
+        }
+    }
+    s[..end].into()
 }
 
 pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
@@ -2458,7 +2616,9 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
             if delta.abs() > epsilon {
                 let speed = 20.0;  // nocheckin @Tune
                 view.scroll_anim += delta * (1.0 - (-speed * dt).exp());
-                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes("View scroll animation"));
+                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+                    "View scroll animation", &mut editor.redraw_reasons
+                ));
             } else {
                 view.scroll_anim = target;
                 view.scroll_vel  = 0.0;
@@ -2496,7 +2656,9 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
 
             } else if dy.abs() > epsilon {
                 view.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
-                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes("Cursor anim"));
+                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+                    "Cursor anim", &mut editor.redraw_reasons
+                ));
 
             } else {
                 view.cursor_anim_y = target_y;
@@ -2548,6 +2710,8 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
                 || !buffer.currently_animated_copies.is_empty(),
 
             "paste/copy animation",
+
+            &mut editor.redraw_reasons
         );
     }
 
@@ -2567,6 +2731,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
         should_redraw = should_redraw.or_if(
             !buffer.currently_animated_deletions.is_empty(),
             "deletion animation",
+            &mut editor.redraw_reasons
         );
     }
 
@@ -2653,7 +2818,7 @@ pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
     line_text.chars().nth(col as usize)
 }
 
-pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect); 16]>) {
+pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect, Rect); 5]>) { // @Memory
     let panels = &editor.panels;
 
     let mut stack = SmallVec::<[PanelId; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
@@ -2666,7 +2831,7 @@ pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId
 
     while let Some(id) = stack.pop() {
         match panels[id].kind {
-            PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id].rect)),
+            PanelKind::Leaf { view_id } => out.push((id, view_id, panels[id].rect, panels[id].rect_including_panel_bar)),
 
             PanelKind::Split(split) => {
                 stack.push(split.right_id);
@@ -2705,6 +2870,7 @@ pub fn rescale(editor: &mut Editor, new_scale: f32) {
     let new = new_scale.clamp(MIN_SCALE, MAX_SCALE);
     if new != editor.scale {
         apply_scale(editor, new, None);
+        editor.layout_panels();
         force_layouts_from_all_views_to_rebuild(editor);
     }
 }
@@ -2937,11 +3103,7 @@ pub fn clear_buffer(editor: &mut Editor, buffer: BufferId) {
 pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl Into<Box<Path>>) {
     let Ok(buffer) = Buffer::from_file(path) else { return };
 
-    let buffer_id = editor.buffers.push(buffer);
-    editor.mru_register_new_buffer(buffer_id);
-
-    println!("<<<<<<<<<<<< INSERTING {}:{} {} -> {:?}", file!(), line!(), editor.buffers[buffer_id].path.as_ref().unwrap().display(), buffer_id);
-    editor.canonicalized_path_to_buffer_id.insert(editor.buffers[buffer_id].path.clone().unwrap().into(), buffer_id);  // @Clone
+    let buffer_id = editor.push_buffer(buffer);
 
     editor.views[view].switch_buffer(buffer_id);
     editor.mru_focus(buffer_id); // @Refactor
@@ -2958,16 +3120,19 @@ pub fn does_view_need_layout_rebuild(
     let line_h       = editor.line_h();
 
     let screen_lines = (rect.h / line_h) as u32;
+
     let anim_first = (editor.views[view].scroll_anim / line_h) as u32;
 
     let is_dirty = editor.buffers[buffer].is_dirty || editor.views[view].layout.as_ref().map(|l| {
+        let layout_rect = l.rect;
+
         anim_first < l.first_buffer_line
             || (
                 anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
                     && screen_lines < l.lines.len() as u32
             )
-            || (l.rect.w - rect.w).abs() > 0.5
-            || (l.rect.h - rect.h).abs() > 0.5
+            || (layout_rect.w - rect.w).abs() > 0.5
+            || (layout_rect.h - rect.h).abs() > 0.5
             || (l.font_size - font_size).abs() > 0.01
     }).unwrap_or(true);
 
