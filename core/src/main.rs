@@ -695,7 +695,6 @@ impl ApplicationHandler<UserEvent> for App {
 
                     let r = rect_including_bar;
                     gpu::push_clip(gpu, r.x, r.y, r.w, r.h);
-                    let buffer_id = editor.views[view_id].buffer_id;
 
                     let show_cursor = if panel_id == active_panel {
                         //
@@ -707,16 +706,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
 
                     let t1 = Instant::now();
-                    render_text_layout(
-                        gpu,
-                        &editor.buffers[buffer_id],
-                        &editor.views[view_id],
-                        editor.active_view_id(),
-                        editor.scale,
-                        show_cursor,
-                        editor.is_our_window_focused,
-                        &mut editor.scratch_paren,
-                    );
+                    render_text_layout(editor, gpu, view_id, show_cursor);
                     render_panel_bar(gpu, editor, view_id);
                     editor.render_us_acc += t1.elapsed().as_micros() as f32;
                     gpu::pop_clip(gpu);

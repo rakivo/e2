@@ -138,8 +138,13 @@ hooks! {
         /// Returns `true` if should skip rendering this specific panel.
         pub about_to_draw_this_panel:       fn (&mut CommandContext, PanelId, ViewId, Rect) -> bool,
 
-        pub should_view_have_panel_bar:     fn (&Editor, ViewId) -> bool,
+        pub about_to_draw_selection:                             fn (&mut Editor, &mut Gpu, ViewId, &LayoutRenderingContext),
+        pub drew_selection_about_to_draw_current_line_highlight: fn (&mut Editor, &mut Gpu, ViewId, &LayoutRenderingContext),
+        pub drew_current_line_highlight_about_to_draw_cursor:    fn (&mut Editor, &mut Gpu, ViewId, &LayoutRenderingContext),
+        pub drew_cursor_about_to_draw_text:                      fn (&mut Editor, &mut Gpu, ViewId, &LayoutRenderingContext),
+        pub drew_text_about_to_return:                           fn (&mut Editor, &mut Gpu, ViewId, &LayoutRenderingContext),
 
+        pub should_view_have_panel_bar:     fn (&Editor, ViewId) -> bool,
         /// NOTE: Custom layer should do `write!(&mut editor.scratch_panel_bar)`!
         pub format_panel_bar:               fn (&mut Editor, ViewId),
 
@@ -1025,25 +1030,75 @@ pub fn build_text_layout(
     }
 }
 
+/// NOTE: Most fields here are just copies either from the layout or the view OR the Editor,
+/// and this is done intentionally, in the purposes of convenience.
+pub struct LayoutRenderingContext {
+    pub view_id: ViewId,
+    pub view_scroll_anim: f32,
+    pub view_cursor_anim_x: f32,
+    pub view_cursor_anim_y: f32,
+
+    pub layout_cursor_style: CursorStyle,
+
+    pub show_cursor: bool,
+
+    pub cursor_col:  u32,
+    pub cursor_line: u32,
+
+    pub rect: Rect,
+
+    // @Redundant
+    pub line_h: f32,
+    pub font_size: f32,
+    pub cursor_h: f32,
+    pub cursor_w: f32,
+    pub min_cursor_w: f32,
+    pub origin_x: f32,
+
+    pub first_visible_line: u32,
+    pub last_visible_line:  u32,
+}
+
+impl LayoutRenderingContext {
+    pub fn line_y(&self, buffer_line: u32) -> f32 {
+        self.rect.y + buffer_line as f32 * self.line_h - self.view_scroll_anim.round()
+    }
+
+    pub fn cursor_rect(&self, cursor_glyph_w: f32) -> Rect {
+        let cursor_width = if self.layout_cursor_style == CursorStyle::Stick {
+            self.cursor_w
+        } else {
+            cursor_glyph_w
+        };
+
+        Rect {
+            x: self.view_cursor_anim_x,
+            y: self.view_cursor_anim_y + self.cursor_h,
+            w: cursor_width,
+            h: self.line_h + self.cursor_h,
+        }
+    }
+}
+
 pub fn render_text_layout(
+    editor:      &mut Editor,
     gpu:         &mut Gpu,
-    buffer:      &Buffer,
-    view:        &View,
-    active_view_id: ViewId,
-    scale:       f32,
+    view_id:     ViewId,
     show_cursor: bool,
-    is_our_window_focused: bool,
-    scratch_paren: &mut Vec<char>,
 ) {
     let _tracy = tracy::span!("render_text_layout");
 
+    let view = &editor.views[view_id];
     let Some(layout) = &view.layout else { return };
 
-    let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
+    let buffer_id = view.buffer_id;
+    let buffer = &editor.buffers[buffer_id];
 
-    let line_y = |buffer_line: u32| -> f32 {
-        layout.rect.y + buffer_line as f32 * layout.line_h - view.scroll_anim.round()
-    };
+    let scale = editor.scale;
+
+    let active_view_id = editor.active_view_id();
+    let is_our_window_focused = editor.is_our_window_focused;
+    let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
 
     let rect         = layout.rect;
     let line_h       = layout.line_h;
@@ -1065,11 +1120,42 @@ pub fn render_text_layout(
 
     let min_cursor_w = min_cursor_w.max(space_width);
 
+    let context = LayoutRenderingContext {
+        cursor_col,
+        cursor_line,
+        origin_x,
+        min_cursor_w,
+        first_visible_line: vis_start,
+        last_visible_line: vis_end,
+        font_size,
+        line_h,
+        show_cursor,
+        rect,
+        view_id,
+        view_scroll_anim: view.scroll_anim,
+        cursor_h,
+        cursor_w: scale_base_cursor_width(scale),
+        layout_cursor_style: layout.cursor_style,
+        view_cursor_anim_x: view.cursor_anim_x,
+        view_cursor_anim_y: view.cursor_anim_y,
+    };
+
     //
     //
     // Selection
     //
     //
+
+    if let Some(hook) = editor.hooks.about_to_draw_selection {
+        hook(editor, gpu, view_id, &context);
+    }
+
+    // Reload borrows...
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
+
+    let buffer_id = view.buffer_id;
+    let buffer = &editor.buffers[buffer_id];
 
     if let Some(anchor) = view.cursor.anchor_char_index {
         let _tracy = tracy::span!("render_text_layout::selection");
@@ -1086,7 +1172,7 @@ pub fn render_text_layout(
 
             for line_index in draw_start..=draw_end {
                 let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
-                let y = line_y(line_index) + cursor_h*2.0;
+                let y = context.line_y(line_index) + cursor_h*2.0;
 
                 let (x0, x1) = if start_line == end_line {
                     (layout.x_for_col(origin_x, start_col, ll), layout.x_for_col(origin_x, end_col, ll))
@@ -1125,6 +1211,17 @@ pub fn render_text_layout(
     // Current-line highlight
     //
     //
+
+    if let Some(hook) = editor.hooks.drew_selection_about_to_draw_current_line_highlight {
+        hook(editor, gpu, view_id, &context);
+    }
+
+    // Reload borrows again...
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
+    let buffer_id = view.buffer_id;
+    let buffer = &editor.buffers[buffer_id];
+
     if layout.should_highlight_current_line_when_rendering
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
@@ -1177,98 +1274,37 @@ pub fn render_text_layout(
         }
     }
 
-    //
-    //
-    // Matching paren
-    //
-    //
-    if let Some((m_line, m_col)) = find_matching_paren(buffer, cursor_line, cursor_col, scratch_paren) {
-        let _tracy = tracy::span!("render_text_layout::matching_paren_render");
-
-        // Cursor paren
-        if cursor_line >= vis_start && cursor_line < vis_end {
-            if let Some(ll) = layout.line_for_buffer_line(cursor_line) {
-                let x = layout.x_for_col(origin_x, cursor_col, ll);
-                let w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll);
-                let y = line_y(cursor_line);
-                gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
-            }
-        }
-
-        // Matching paren
-        if m_line >= vis_start && m_line < vis_end {
-            if let Some(ll) = layout.line_for_buffer_line(m_line) {
-                let x = layout.x_for_col(origin_x, m_col, ll);
-                let w = layout.glyph_width_at_col(m_col, min_cursor_w, ll);
-                let y = line_y(m_line);
-                gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
-            }
-        }
+    if let Some(hook) = editor.hooks.drew_current_line_highlight_about_to_draw_cursor {
+        hook(editor, gpu, view_id, &context);
     }
+
+    // Reload borrows again...
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
 
     //
     //
     // Cursor (on the focused view (filled in rectangle))
     //
     //
-    let cursor_rect = |cursor_glyph_w: f32| {
-        let cursor_width = if layout.cursor_style == CursorStyle::Stick {
-            scale_base_cursor_width(scale)
-        } else {
-            cursor_glyph_w
-        };
 
-        Rect {
-            x: view.cursor_anim_x,
-            y: view.cursor_anim_y + cursor_h,
-            w: cursor_width,
-            h: line_h + cursor_h,
-        }
-    };
     if show_cursor && is_this_view_focused
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
-        let rect = cursor_rect(cursor_glyph_w);
+        let rect = context.cursor_rect(cursor_glyph_w);
         gpu::draw_rect(gpu, rect.x, rect.y, rect.w, rect.h, palette().cursor);
     }
 
-    //
-    //
-    // Deletion animations
-    //
-    //
-    for anim in &buffer.currently_animated_deletions {
-        let alpha = ((1.0 - anim.t) * 160.0) as u8;  // Linear fade
-        if alpha == 0 { continue }
-
-        let color = Color::rgba(
-            palette().delete_highlight.r,
-            palette().delete_highlight.g,
-            palette().delete_highlight.b,
-            alpha
-        );
-
-        for line in anim.start_line..=anim.end_line {
-            if line == anim.end_line && anim.end_col == 0         { continue }
-            let Some(ll) = layout.line_for_buffer_line(line) else { continue };
-
-            let full_x0 = if line == anim.start_line { layout.x_for_col(origin_x, anim.start_col, ll) } else { rect.x };
-            let full_x1 = if line == anim.end_line   { layout.x_for_col(origin_x, anim.end_col,   ll) } else { rect.x + rect.w };
-            let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim.round();
-            if full_x1 <= full_x0 { continue; }
-
-            gpu::draw_rect(gpu, full_x0, y, full_x1 - full_x0, layout.line_h, color);
-
-            if line == anim.start_line
-                && anim.start_line != anim.end_line
-                && anim.start_col > 0
-                && full_x0 > rect.x + 1.0
-            {
-                gpu::draw_rect(gpu, rect.x, y, full_x0 - rect.x, layout.line_h, color);
-            }
-        }
+    if let Some(hook) = editor.hooks.drew_cursor_about_to_draw_text {
+        hook(editor, gpu, view_id, &context);
     }
+
+    // Reload borrows again...
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
+    let buffer_id = view.buffer_id;
+    let buffer = &editor.buffers[buffer_id];
 
     //
     //
@@ -1298,7 +1334,7 @@ pub fn render_text_layout(
             let glyphs = ll.glyphs(&layout.glyphs);
             if glyphs.is_empty() { continue; }
 
-            let y = line_y(ll.buffer_line) + line_h;
+            let y = context.line_y(ll.buffer_line) + line_h;
 
             let cursor_col_glyph_index = if ll.buffer_line == cursor_line
                 && is_this_view_focused
@@ -1328,6 +1364,14 @@ pub fn render_text_layout(
         }
     }
 
+    if let Some(hook) = editor.hooks.drew_text_about_to_return {
+        hook(editor, gpu, view_id, &context);
+    }
+
+    // Reload borrows again...
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
+
     //
     //
     // Cursor (on the UNfocused view (outlined rectangle))
@@ -1337,7 +1381,7 @@ pub fn render_text_layout(
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
-        let rect = cursor_rect(cursor_glyph_w);
+        let rect = context.cursor_rect(cursor_glyph_w);
         gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
     }
 }

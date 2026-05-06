@@ -1299,7 +1299,6 @@ fn setup_hooks(cx: &mut CommandContext) {
             let view_id = editor.lister().query_view;
             let panel_id = editor.lister().query_panel;
             let rect = editor.panels[editor.lister().query_panel].rect_including_panel_bar;
-            let buffer_id = editor.views[view_id].buffer_id;
 
             let show_cursor = if panel_id == active_panel {
                 //
@@ -1312,16 +1311,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
             let t1 = Instant::now();
-            render_text_layout(
-                gpu,
-                &editor.buffers[buffer_id],
-                &editor.views[view_id],
-                editor.active_view_id(),
-                editor.scale,
-                show_cursor,
-                editor.is_our_window_focused,
-                &mut editor.scratch_paren,
-            );
+            render_text_layout(editor, gpu, view_id, show_cursor);
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
             gpu::pop_clip(gpu);
 
@@ -1350,6 +1340,100 @@ fn setup_hooks(cx: &mut CommandContext) {
             &mut editor.scratch_panel_bar,
             "{}  {}:{}  {}", buffer.pretty_path, line+1, col+1, editor.scale
         );
+    });
+
+    cx.editor.hooks.drew_current_line_highlight_about_to_draw_cursor = Some(|editor, gpu, view_id, context| {
+        //
+        //
+        // Matching paren
+        //
+        //
+
+        let LayoutRenderingContext {
+            cursor_col, cursor_line,
+            line_h,
+            first_visible_line, last_visible_line,
+            min_cursor_w, origin_x, cursor_h, ..
+        } = context;
+
+        let view = &editor.views[view_id];
+        let Some(layout) = &view.layout else { return };
+        let buffer = &editor.buffers[view.buffer_id];
+
+        if let Some((m_line, m_col)) = find_matching_paren(buffer, *cursor_line, *cursor_col, &mut editor.scratch_paren) {
+            let _tracy = tracy::span!("render_text_layout::matching_paren_render");
+
+            // Cursor paren
+            if cursor_line >= first_visible_line && cursor_line < last_visible_line {
+                if let Some(ll) = layout.line_for_buffer_line(*cursor_line) {
+                    let x = layout.x_for_col(*origin_x, *cursor_col, ll);
+                    let w = layout.glyph_width_at_col(*cursor_col, *min_cursor_w, ll);
+                    let y = context.line_y(*cursor_line);
+                    gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+                }
+            }
+
+            // Matching paren
+            if m_line >= *first_visible_line && m_line < *last_visible_line {
+                if let Some(ll) = layout.line_for_buffer_line(m_line) {
+                    let x = layout.x_for_col(*origin_x, m_col, ll);
+                    let w = layout.glyph_width_at_col(m_col, *min_cursor_w, ll);
+                    let y = context.line_y(m_line);
+                    gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+                }
+            }
+        }
+    });
+
+    cx.editor.hooks.drew_cursor_about_to_draw_text = Some(|editor, gpu, view_id, context| {
+        //
+        //
+        // Matching paren
+        //
+        //
+
+        let LayoutRenderingContext { rect, origin_x, .. } = context;
+
+        let view = &editor.views[view_id];
+        let Some(layout) = &view.layout else { return };
+        let buffer = &editor.buffers[view.buffer_id];
+
+        //
+        //
+        // Deletion animations
+        //
+        //
+        for anim in &buffer.currently_animated_deletions {
+            let alpha = ((1.0 - anim.t) * 160.0) as u8;  // Linear fade
+            if alpha == 0 { continue }
+
+            let color = Color::rgba(
+                palette().delete_highlight.r,
+                palette().delete_highlight.g,
+                palette().delete_highlight.b,
+                alpha
+            );
+
+            for line in anim.start_line..=anim.end_line {
+                if line == anim.end_line && anim.end_col == 0         { continue }
+                let Some(ll) = layout.line_for_buffer_line(line) else { continue };
+
+                let full_x0 = if line == anim.start_line { layout.x_for_col(*origin_x, anim.start_col, ll) } else { rect.x };
+                let full_x1 = if line == anim.end_line   { layout.x_for_col(*origin_x, anim.end_col,   ll) } else { rect.x + rect.w };
+                let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim.round();
+                if full_x1 <= full_x0 { continue; }
+
+                gpu::draw_rect(gpu, full_x0, y, full_x1 - full_x0, layout.line_h, color);
+
+                if line == anim.start_line
+                    && anim.start_line != anim.end_line
+                    && anim.start_col > 0
+                    && full_x0 > rect.x + 1.0
+                {
+                    gpu::draw_rect(gpu, rect.x, y, full_x0 - rect.x, layout.line_h, color);
+                }
+            }
+        }
     });
 }
 
