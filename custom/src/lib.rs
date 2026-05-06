@@ -539,13 +539,13 @@ pub fn lister_item_list_from_buffer_list(cx: &CommandContext) -> Vec<ListerItem>
         if buffer_id == cx.editor.lister().query_buffer { return None; }
 
         let buffer = &cx.editor.buffers[buffer_id];
-        let label: SmallString<[u8; 32]> = buffer.path.as_ref()
+        let label: SmallString<_> = buffer.path.as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("[scratch]")
             .into();
 
-        let sublabel: SmallString<[u8; 64]> = buffer.path.as_ref()
+        let sublabel: SmallString<_> = buffer.path.as_ref()
             .and_then(|p| p.to_str())
             .unwrap_or("")
             .into();
@@ -1339,6 +1339,17 @@ fn setup_hooks(cx: &mut CommandContext) {
         smallvec![
             lister_smaller_font_size(editor.font_size())
         ]
+    });
+
+    cx.editor.hooks.format_panel_bar = Some(|editor, view_id| {
+        let view = &editor.views[view_id];
+        let buffer_id = view.buffer_id;
+        let buffer = &editor.buffers[buffer_id];
+        let (line, col) = buffer.cursor_line_col(&view.cursor);
+        _ = write!(
+            &mut editor.scratch_panel_bar,
+            "{}  {}:{}  {}", buffer.pretty_path, line+1, col+1, editor.scale
+        );
     });
 }
 

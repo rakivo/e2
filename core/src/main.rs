@@ -55,7 +55,7 @@ struct App {
     loaded:   Option<LoadedLib>,
     lib_path: Box<Path>,
     lib_rx:   Receiver<()>,
-    _watcher: RecommendedWatcher,  // must stay alive
+    _watcher: RecommendedWatcher,  // Must stay alive
 }
 
 impl App {

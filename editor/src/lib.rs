@@ -140,6 +140,11 @@ hooks! {
 
         pub should_view_have_panel_bar:     fn (&Editor, ViewId) -> bool,
 
+        /// NOTE: Custom layer should do `write!(&mut editor.scratch_panel_bar)`!
+        pub format_panel_bar:               fn (&mut Editor, ViewId),
+
+        pub render_panel_bar:               fn (&mut Editor, &mut Gpu, ViewId),
+
         pub drew_all_leaf_panels:           fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
 
         /// Returns:
@@ -1338,6 +1343,14 @@ pub fn render_text_layout(
 }
 
 pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
+    if let Some(hook) = editor.hooks.render_panel_bar {
+        //
+        // Custom layer's hooks take priority!
+        //
+        hook(editor, gpu, view_id);
+        return;
+    }
+
     let view = &editor.views[view_id];
     let Some(layout) = &view.layout else { return };
 
@@ -1352,12 +1365,18 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     let center_y = bar_y + bar_h * 0.5;
     let y = center_y + editor.font_size() * 0.35; // nocheckin
 
-    let buffer_id = view.buffer_id;
-    let buffer = &editor.buffers[buffer_id];
-    let (line, col) = buffer.cursor_line_col(&view.cursor);
-    let text = format!("{}  {}:{}  {}", buffer.pretty_path, line+1, col+1, editor.scale);
+    editor.scratch_panel_bar.clear();
+    if let Some(format_panel_bar) = editor.hooks.format_panel_bar {
+        format_panel_bar(editor, view_id);
+    }
 
-    gpu::draw_text(gpu, &text, rect.x+pad, y, editor.font_size(), Color::rgba(174, 131, 60, 255));
+    gpu::draw_text(
+        gpu,
+        &editor.scratch_panel_bar,
+        rect.x+pad, y,
+        editor.font_size(),
+        Color::rgba(174, 131, 60, 255)
+    );
 }
 
 pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
@@ -1699,7 +1718,8 @@ pub struct Editor {
     // Root panel id - its rect always equals the window
     pub root_panel:    PanelId,
 
-    pub scratch_paren: Vec<char>,
+    pub scratch_paren:     Vec<char>,
+    pub scratch_panel_bar: String,
 
     pub most_recently_used_buffers:  VecDeque<BufferId>,
     pub buffer_cycle_index:          Option<usize>,
@@ -1802,6 +1822,7 @@ impl Editor {
             views,
             panels,
             canonicalized_path_to_buffer_id,
+            scratch_panel_bar: String::with_capacity(256),
             logger_config,
             hooks: Default::default(),
             last_input_time: Instant::now(),
