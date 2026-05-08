@@ -8,26 +8,38 @@
 // #[global_allocator]
 // static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod lsp;
+
+use lsp::*;
+
+use crossbeam_channel::{Receiver, Sender};
 use editor::buffer::Buffer;
 use editor::color::Color;
 use editor::director::{EntryKind, ScanState};
 use editor::gpu::Gpu;
-use editor::session::{default_session_path, pretty_path};
-use editor::command::{CommandContext, CommandEntry, CommandTable, Keymap, LoadedLib, Mods};
+use editor::session::{CustomChunkId, apply_session, default_session_path, load_session, pretty_path};
+use editor::command::{CommandContext, CommandEntry, CommandTable, KeyCombo, Keymap, LoadedLib, Mods};
 use editor::*;
 
 use editor_macros::{collect_commands, command, export};
+use memmap2::MmapOptions;
 
+use std::io::Read;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::fmt::Write;
 
-use winit::event::KeyEvent;
-use winit::keyboard::{Key, NamedKey};
 use smallvec::smallvec;
 use smallstr::SmallString;
+use winit::event::KeyEvent;
 use cranelift_entity::EntityRef;
+use winit::keyboard::{Key, NamedKey};
 use cranelift_entity::packed_option::ReservedValue;
+
+pub const    LISTER_CUSTOM_CHUNK_ID: CustomChunkId = 42;
+pub const COMMANDER_CUSTOM_CHUNK_ID: CustomChunkId = 1337;
 
 pub const LISTER_SPLIT_CUSTOM_PANEL: CustomPanel = CustomPanel { extra0: 420, extra1: 67, extra2: 69 };
 pub const LISTER_SPLIT_PANEL_KIND: PanelKind = PanelKind::Custom(LISTER_SPLIT_CUSTOM_PANEL);
@@ -36,72 +48,96 @@ pub const LISTER_SPLIT_PANEL_KIND: PanelKind = PanelKind::Custom(LISTER_SPLIT_CU
 macro_rules! custom_data {
     (
         $(#[$struct_meta:meta])*
-        $vis:vis struct $name:ident {
-            $(
-                $(#[$field_meta:meta])*
-                $field_vis:vis $field:ident : $ty:ty
-            ),* $(,)?
+        $vis:vis struct $name:ident -> $transient_name:ident {
+            persistent {
+                $(
+                    $(#[$p_field_meta:meta])*
+                    $p_field_vis:vis $p_field:ident : $p_ty:ty
+                ),* $(,)?
+            }
+            transient {
+                $(
+                    $(#[$t_field_meta:meta])*
+                    $t_field_vis:vis $t_field:ident : $t_ty:ty
+                ),* $(,)?
+            }
         }
     ) => {
-        #[allow(dead_code)]
-        #[allow(unused)]
-        $(#[$struct_meta])*
-        $vis struct $name {
-            $(
-                #[allow(dead_code)]
-                #[allow(unused)]
-                $(#[$field_meta])*
-                $field_vis $field: $ty,
-            )*
-        }
+        paste::paste! {
+            #[allow(dead_code, unused)]
+            $(#[$struct_meta])*
+            $vis struct $name {
+                $($p_field_vis $p_field: $p_ty,)*
+            }
 
-        #[allow(dead_code)]
-        #[allow(unused)]
-        $vis trait CustomDataAccess {
-            $(
-                #[allow(dead_code)]
-                #[allow(unused)]
-                fn $field(&self) -> &$ty;
+            #[allow(dead_code, unused)]
+            $vis struct $transient_name {
+                $($t_field_vis $t_field: $t_ty,)*
+            }
 
-                paste::paste! {
-                    #[allow(dead_code)]
-                    #[allow(unused)]
-                    fn [<$field _mut>](&mut self) -> &mut $ty;
-                }
-            )*
-        }
+            #[allow(dead_code, unused)]
+            $vis trait CustomDataAccess {
+                $(
+                    fn $p_field(&self) -> &$p_ty;
+                    fn [<$p_field _mut>](&mut self) -> &mut $p_ty;
+                )*
+                $(
+                    fn $t_field(&self) -> &$t_ty;
+                    fn [<$t_field _mut>](&mut self) -> &mut $t_ty;
+                )*
+            }
 
-        #[allow(dead_code)]
-        #[allow(unused)]
-        #[allow(clippy::all)]
-        #[allow(clippy::pedantic)]
-        impl CustomDataAccess for editor::EditorCustomData {
-            $(
-                #[inline]
-                #[allow(dead_code)]
-                #[allow(unused)]
-                #[cfg_attr(debug_assertions, track_caller)]
-                fn $field(&self) -> &$ty {
-                    &self.get::<$name>().$field
-                }
-
-                paste::paste! {
+            #[allow(dead_code, unused, clippy::all)]
+            impl CustomDataAccess for editor::EditorCustomData {
+                $(
                     #[inline]
-                    #[allow(dead_code)]
-                    #[allow(unused)]
                     #[cfg_attr(debug_assertions, track_caller)]
-                    fn [<$field _mut>](&mut self) -> &mut $ty {
-                        &mut self.get_mut::<$name>().$field
+                    fn $p_field(&self) -> &$p_ty {
+                        &self.get::<$name>().$p_field
                     }
-                }
-            )*
+                    #[inline]
+                    #[cfg_attr(debug_assertions, track_caller)]
+                    fn [<$p_field _mut>](&mut self) -> &mut $p_ty {
+                        &mut self.get_mut::<$name>().$p_field
+                    }
+                )*
+                $(
+                    #[inline]
+                    #[cfg_attr(debug_assertions, track_caller)]
+                    fn $t_field(&self) -> &$t_ty {
+                        &self.get_transient::<$transient_name>().$t_field
+                    }
+                    #[inline]
+                    #[cfg_attr(debug_assertions, track_caller)]
+                    fn [<$t_field _mut>](&mut self) -> &mut $t_ty {
+                        &mut self.get_transient_mut::<$transient_name>().$t_field
+                    }
+                )*
+            }
         }
     };
 }
 
 custom_data! {
-    struct CustomData {
-        lister: Lister,
+    struct CustomData -> CustomDataTransient {
+        persistent {
+            // IMPORTANT IMPORTANT IMPORTANT IMPORTANT IMPORTANT IMPORTANT IMPORTANT IMPORTANT
+            // @Important @Important @Important @Important @Important @Important @Important @Important
+
+            //
+            // SAFETY: types here MUST not contain vtable pointers into the dylib.
+            // Only use types from std or types defined in the shared crate.
+            //
+            // If you know your types are gonna use virtual dispatch, put them inside the `transient {}` block below.
+            //
+
+            lister: Lister,
+            commander: Commander,
+
+            lsp: LspClient,
+        }
+
+        transient {}
     }
 }
 
@@ -312,77 +348,6 @@ pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratc
 }
 
 #[command]
-pub fn insert_newline(cx: &mut CommandContext) {
-    let (view, buf) = cx.editor.active_view_and_buffer_mut();
-    view.cursor.unset_anchor();
-
-    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
-
-    // Cap context line search to 4KB
-    let start_byte = cursor_byte.saturating_sub(4096); // :Configuration
-    buf.flatten_rope_into_scratch(start_byte, cursor_byte);
-
-    let flat = buf.scratch_space_to_flatten_rope_into.as_bytes();
-
-    // Walk backwards to find last non-blank line
-    let context_start = {
-        let mut pos = flat.len();
-        loop {
-            let line_end = pos;
-            match memchr::memrchr(b'\n', &flat[..pos]) {
-                None => break 0,  // No newline found, start of buffer
-
-                Some(nl) => {
-                    let line_bytes = &flat[nl + 1..line_end];
-                    if line_bytes.iter().any(|&b| b != b' ' && b != b'\t') {
-                        break nl + 1;  // Start of the non-blank line, after the \n
-                    }
-
-                    pos = nl;  // Step back past this \n
-                    if pos == 0 { break 0; }
-                }
-            }
-        }
-    };
-
-    // Find indent of context line
-    let line_end = memchr::memchr(b'\n', &flat[context_start..])
-        .map(|p| context_start + p)
-        .unwrap_or(flat.len());
-
-    let line_bytes = &flat[context_start..line_end];
-
-    //
-    // Count leading whitespace bytes (all spaces/tabs are single-byte)
-    //
-    let indent_len = line_bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
-
-    //
-    // Last meaningful char before cursor
-    //
-    let last_meaningful = line_bytes.iter().filter(|&&b| b != b' ' && b != b'\t').last().copied();
-
-    let open = matches!(last_meaningful, Some(b'{') | Some(b'(') | Some(b'['));
-
-    let mut indent = SmallString::<[u8; 128]>::new();
-
-    //
-    // Preserve tabs vs spaces
-    //
-    indent.push_str(unsafe { std::str::from_utf8_unchecked(&line_bytes[..indent_len]) });
-    if open {
-        // :Configuration
-        // Fill the extra 4 with spaces
-        for _ in 0..4 { indent.push(' '); }
-    }
-
-    buf.insert_char('\n', &mut view.cursor);
-    if !indent.is_empty() {
-        buf.insert_literal(&indent, &mut view.cursor);
-    }
-}
-
-#[command]
 pub fn insert_newline_after(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
@@ -460,13 +425,11 @@ pub fn toggle_focused_split(cx: &mut CommandContext) {
 #[command]
 pub fn scale_down(cx: &mut CommandContext) {
     rescale(cx.editor, cx.editor.scale - SCALE_STEP);
-    gpu::print_atlas_usage(cx.gpu);
 }
 
 #[command]
 pub fn scale_up(cx: &mut CommandContext) {
     rescale(cx.editor, cx.editor.scale + SCALE_STEP);
-    gpu::print_atlas_usage(cx.gpu);
 }
 
 #[command]
@@ -477,7 +440,7 @@ pub fn scale_reset(cx: &mut CommandContext) {
 #[command]
 pub fn open_new_buffer(cx: &mut CommandContext) {
     let buffer_id = cx.editor.push_buffer(Buffer::new());
-    let view_id = ViewId::new(cx.editor.views.len());
+    let view_id = cx.editor.views.next_key();
     cx.editor.views.push(View::new(view_id, buffer_id));
 
     let root_id  = cx.editor.root_panel;
@@ -577,9 +540,9 @@ pub fn paste(cx: &mut CommandContext) {
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
+    buf.delete_selection_without_animation(&mut view.cursor);
     buf.insert_literal(&clipboard, &mut view.cursor);
     buf.append_last_insertion_to_currently_animated_pastes();
-    view.cursor.unset_anchor();
 }
 
 pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool, animate: bool) { // :BufferScratch
@@ -635,7 +598,7 @@ pub fn delete_selection_and_copy(cx: &mut CommandContext) {
 }
 
 #[command]
-pub fn switch_buffer(cx: &mut CommandContext) {
+pub fn switch_buffer(cx: &mut CommandContext) { // @Refactor: Rename switch_buffer -> open_buffer_lister
     cx.editor.lister_mut().set_selected_index_to_1_instead_of_0 = true;
 
     let items = lister_item_list_from_buffer_list(cx);
@@ -706,24 +669,10 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                 return;
             }
 
-            {
-                let path: &Path = path.as_str().as_ref();
-                if let Ok(canon) = path.canonicalize()
-                && let Some(&old_buffer_id) = cx.editor.canonicalized_path_to_buffer_id.get(canon.as_path())
-                {
-                    cx.editor.active_view_mut().switch_buffer(old_buffer_id);
-                    cx.editor.mru_focus(old_buffer_id); // @Refactor
-                    return;
-                }
-            }
-
-            let Ok(new_buffer) = Buffer::from_file(path.as_str().as_ref()) else {
-                return
-            };
-
-            let new_buffer_id = cx.editor.push_buffer(new_buffer);
-            cx.editor.active_view_mut().switch_buffer(new_buffer_id);
-            cx.editor.mru_focus(new_buffer_id); // @Refactor
+            let view = cx.editor.active_view_id();
+            let path: &Path = path.as_str().as_ref();
+            let path = Box::from(path);
+            open_buffer_from_path_in(cx.editor, view, path);
         },
 
         // Called on every frame redraw
@@ -866,6 +815,77 @@ pub fn save_session(cx: &mut CommandContext) {
     }
 }
 
+pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32, col: u32) {
+    open_buffer_from_path_in(editor, view_id, path.as_ref());
+
+    let line_char_index = {
+        let (_view, buf) = editor.view_and_buffer_mut(view_id);
+        buf.text.line_to_char(line as _)
+    };
+
+    let line_h = editor.line_h();
+
+    let panel_id = {
+        let (view, _buf) = editor.view_and_buffer_mut(view_id);
+        view.panel_id
+    };
+
+    let rect = editor.panels[panel_id].rect;
+
+    let (view, _buf) = editor.view_and_buffer_mut(view_id);
+    view.cursor.char_index = line_char_index + col as usize;
+    view.scroll_to_cursor_centered(line, line_h, rect);
+
+    view.cursor_target_col = col;
+    view.cursor_target_line = line;
+}
+
+#[command]
+pub fn goto_definition(cx: &mut CommandContext) {
+    let (line, col, path) = {
+        let (view, buf) = cx.editor.active_view_and_buffer_mut();
+        let (line, col) = buf.cursor_line_col(&view.cursor);
+        (line, col, buf.path.clone())
+    };
+
+    let Some(Ok(canon)) = path.map(std::fs::canonicalize) else { return };
+
+    let lsp = cx.editor.custom_data.lsp_mut();
+    lsp.goto_definition_async(canon.to_str().unwrap(), line, col);
+}
+
+#[command]
+pub fn cargo_build(cx: &mut CommandContext) { // nocheckin
+    let buffer = cx.editor.commander().command_buffer;
+    clear_buffer(cx.editor, buffer);
+
+    let view_id = cx.editor.views.next_key();
+    cx.editor.views.push(View::new(view_id, buffer));
+
+    let root_id  = cx.editor.root_panel;
+
+    if matches!(&cx.editor.panel(root_id).kind, PanelKind::Leaf { .. }) {
+        //
+        // Ensure root is a split
+        //
+
+        cx.editor.active_panel = root_id;
+        cx.editor.split_active(true, 0.5);
+    }
+
+    if let PanelKind::Split(split) = cx.editor.panel(root_id).kind {
+        let unfocused_id = if cx.editor.active_panel == split.left_id {
+            split.right_id
+        } else {
+            split.left_id
+        };
+
+        cx.editor.panel_mut(unfocused_id).kind = PanelKind::Leaf { view_id };
+    }
+
+    _ = cx.editor.commander().command_tx.send("cargo build".into());
+}
+
 #[export]
 pub static COMMANDS: &[CommandEntry] = collect_commands!();
 
@@ -876,15 +896,212 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     *cx.command_table = CommandTable::from_commands(loaded.commands);
     *cx.keymap = Keymap::default_keymap(&mut cx.command_table);
 
-    editor_init_custom_data(cx.editor);
+    cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build")); // nocheckin
+    cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition")); // nocheckin
+    cx.keymap.bind(KeyCombo::char_mods('\\', Mods { alt: true, ctrl: true, ..Default::default() }), cx.command_table.intern("indent_region")); // nocheckin
 
     setup_hooks(cx);
+    editor_initialize_custom_data(cx.editor, cx.gpu);
+}
+
+fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
+    let was_custom_data_ever_initialized = editor.was_custom_data_ever_initialized();
+    let mut did_we_apply_any_sessions = false;
+
+    if was_custom_data_ever_initialized {
+        return; // nocheckin
+    }
+
+    editor.set_custom_data(CustomData {
+        lister: Lister::new(),
+        commander: Commander::new(),
+
+        lsp: LspClient::start("rust-analyzer", &[], ".")
+    });
+    editor.set_custom_transient_data(CustomDataTransient {});
+
+    //
+    // Try to restore session first
+    //
+    let session_path = &default_session_path();
+
+    if let Ok(file)      = std::fs::File::open(session_path)
+    && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
+    && let Some(session) = load_session(&mmap[..])
+    {
+        let time = apply_session(editor, session);
+
+        let pretty = pretty_path(&session_path);
+        let message = format!("Applied session in {time}us from '{pretty}'");
+        editor.messager.push(&message, gpu);
+
+        did_we_apply_any_sessions = true;
+    }
+
+    //
+    // Open the file from argv if user provided it
+    //
+    open_initial_buffer(editor);
+
+    if !did_we_apply_any_sessions {
+        lister_create_fresh_buffers_views_panels(editor);
+        commander_create_fresh_buffers_views_panels(editor);
+    }
+}
+
+fn lister_create_fresh_buffers_views_panels(editor: &mut Editor) {
+    let lister_query_buffer = editor.buffers.push(Buffer::new());
+
+    let lister_query_view = editor.views.next_key();
+    editor.views.push(View::new(lister_query_view, lister_query_buffer));
+
+    let lister_query_panel = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   lister_query_panel,
+        rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
+        kind: PanelKind::Leaf { view_id: lister_query_view },
+    });
+    editor.views[lister_query_view].panel_id = lister_query_panel;
+
+    let lister_split_panel = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   lister_split_panel,
+        rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
+        kind: LISTER_SPLIT_PANEL_KIND,
+    });
+
+    let lister = editor.lister_mut();
+    lister.query_buffer = lister_query_buffer;
+    lister.query_view   = lister_query_view;
+    lister.query_panel  = lister_query_panel;
+    lister.query_split  = lister_split_panel;
+}
+
+fn commander_create_fresh_buffers_views_panels(editor: &mut Editor) { // nocheckin
+    let commander_command_buffer = editor.buffers.push(Buffer::new());
+
+    let commander_command_view = editor.views.next_key();
+    editor.views.push(View::new(commander_command_view, commander_command_buffer));
+
+    let commander_command_panel = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   commander_command_panel,
+        rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
+        kind: PanelKind::Leaf { view_id: commander_command_view },
+    });
+    editor.views[commander_command_view].panel_id = commander_command_panel;
+
+    let commander_split_panel = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   commander_split_panel,
+        rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
+        kind: PanelKind::Leaf { view_id: commander_command_view },
+    });
+
+    let commander = editor.commander_mut();
+    commander.command_buffer = commander_command_buffer;
+    commander.command_view   = commander_command_view;
+    commander.command_panel  = commander_command_panel;
+
+    editor.mru_register_new_buffer(commander_command_buffer);
+}
+
+fn find_panel_by_kind(editor: &Editor, root: PanelId, kind: &PanelKind) -> Option<PanelId> {
+    let mut out = Default::default();
+    collect_leaves(editor, root, &mut out); // @Memory
+
+    for (id, ..) in out {
+        if &editor.panels[id].kind == kind {
+            return Some(id);
+        }
+    }
+
+    None
+}
+
+pub fn find_matching_paren(
+    buffer: &Buffer,
+    start_line: u32, start_col: u32,
+    scratch_paren: &mut Vec<char>,
+) -> Option<(u32, u32)> {
+    let _tracy = tracy::span!("find_matching_paren");
+
+    let (open, close, dir) = {
+        let ch = char_at_line_col(buffer, start_line, start_col)?;
+
+        match ch {
+            '(' => ('(', ')',  1),
+            '[' => ('[', ']',  1),
+            '{' => ('{', '}',  1),
+            ')' => ('(', ')', -1),
+            ']' => ('[', ']', -1),
+            '}' => ('{', '}', -1),
+            _ => return None,
+        }
+    };
+
+    let mut depth = 0;
+
+    const MAX_SCAN_LINES: u32 = 128;
+
+    if dir > 0 {
+        let mut line = start_line;
+
+        while line < buffer.text.len_lines() as u32 && line < start_line + MAX_SCAN_LINES {
+            let text = buffer.text.line(line as usize);
+
+            let start_col_in_line = if line == start_line { start_col } else { 0 };
+
+            for (col, ch) in text.chars().enumerate().skip(start_col_in_line as usize) {
+                if ch == open {
+                    depth += 1;
+                } else if ch == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((line, col as u32));
+                    }
+                }
+            }
+
+            line += 1;
+        }
+    } else {
+        let mut line = start_line;
+        loop {
+            let text = buffer.text.line(line as usize);
+            let end_col = if line == start_line { start_col + 1 } else { text.chars().count() as u32 };
+
+            scratch_paren.clear();
+            scratch_paren.extend(text.chars().take(end_col as usize));
+
+            for col in (0..scratch_paren.len()).rev() {
+                let ch = scratch_paren[col];
+                if ch == close      { depth += 1; }
+                else if ch == open  { depth -= 1; if depth == 0 { return Some((line, col as u32)); } }
+            }
+
+            if line == 0 { break; }
+            line -= 1;
+
+            if start_line - line > MAX_SCAN_LINES { break; }
+        }
+    }
+
+    None
 }
 
 fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.layout_panels = Some(|editor, win_rect| {
-        editor.layout_panel(editor.lister().query_panel, lister_rect(win_rect.w, win_rect.h, 1.0, editor.scale));
-        editor.layout_panel(editor.lister().split_panel, lister_rect(win_rect.w, win_rect.h, 1.0, editor.scale));
+        {
+            editor.layout_panel(editor.lister().query_panel, lister_rect(win_rect.w, win_rect.h, 1.0, editor.scale));
+            editor.layout_panel(editor.lister().query_split, lister_rect(win_rect.w, win_rect.h, 1.0, editor.scale));
+        }
+
+        editor.layout_panel(editor.commander().command_panel, win_rect);
     });
 
     cx.editor.hooks.layout_panel = Some(|editor, id, _rect| {
@@ -905,9 +1122,12 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.collect_leaf_panels = Some(|editor, id, custom_panel, _stack| {
         match custom_panel {
-            LISTER_SPLIT_CUSTOM_PANEL => smallvec![
-                (id, editor.lister().query_view, editor.panels[editor.lister().query_panel].rect, editor.panels[editor.lister().query_panel].rect_including_panel_bar)
-            ],
+            LISTER_SPLIT_CUSTOM_PANEL => {
+                let l = editor.lister();
+                smallvec![
+                    (id, l.query_view, editor.panels[l.query_panel].rect, editor.panels[l.query_panel].rect_including_panel_bar)
+                ]
+            }
 
             _ => unreachable!()
         }
@@ -1088,12 +1308,12 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.collect_leaf_panels_init_stack = Some(|editor, _id, stack| {
         if editor.lister().is_open {
-            stack.push(editor.lister().split_panel);
+            stack.push(editor.lister().query_split);
         }
     });
 
     cx.editor.hooks.set_active_panel = Some(|editor, panel_id| {
-        if panel_id == editor.lister().split_panel {
+        if panel_id == editor.lister().query_split {
             editor.lister_mut().panel_before_opening_lister = Some(editor.active_panel);
         }
 
@@ -1128,11 +1348,24 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.inside_about_to_wait_should_request_redraw = Some(|editor| {
+        let mut redraw = ShouldRequestFrameRedraw::No;
+
         if editor.lister().open_anim > 0.0 && !editor.lister().is_open {
-            return ShouldRequestFrameRedraw::yes("Lister opening animation", &mut editor.redraw_reasons);
+            redraw = redraw.or_msg("Lister opening animation", &mut editor.redraw_reasons);
         }
 
-        ShouldRequestFrameRedraw::No
+        {
+            redraw |= drain_pending_lsp_goto(editor);
+        }
+
+        {
+            let commander_buffer = editor.commander().command_buffer;
+            redraw = redraw.or_if(editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut editor.redraw_reasons);
+
+            redraw |= drain_commander_output(editor);
+        }
+
+        redraw
     });
 
     cx.editor.hooks.mouse_wheel_scrolled = Some(|cx, dy| {
@@ -1228,7 +1461,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         (false, false)
     });
 
-    cx.editor.hooks.inside_redraw_should_request_redraw = Some(|editor| {
+    cx.editor.hooks.at_the_end_of_redraw_should_request_redraw = Some(|editor| {
         let mut redraw = ShouldRequestFrameRedraw::No;
 
         let lister = editor.custom_data.lister();
@@ -1236,13 +1469,46 @@ fn setup_hooks(cx: &mut CommandContext) {
         redraw = redraw.or_if(lister.is_open() != lister.last_is_lister_open, "Lister opening animation", &mut editor.redraw_reasons);
         redraw = redraw.or_if(lister.open_anim > 0.0 && !lister.is_open, "Lister opening animation", &mut editor.redraw_reasons);
 
+        {
+            redraw |= peek_pending_lsp_goto(editor);
+        }
+
+        {
+            let commander_buffer = editor.commander().command_buffer;
+
+            let char_count = editor.buffers[commander_buffer].text.len_chars();
+
+            redraw = redraw.or_if(char_count != editor.commander().last_command_buffer_character_count, "Commander buffer updated", &mut editor.redraw_reasons);
+            redraw = redraw.or_if(editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut editor.redraw_reasons);
+
+            redraw |= peek_commander_output(editor);
+        }
+
         redraw
     });
 
     cx.editor.hooks.about_to_redraw_a_frame = Some(|cx, _dt| {
-        cx.editor.lister_mut().last_is_lister_open = cx.editor.lister().is_open();
+        let mut redraw = ShouldRequestFrameRedraw::No;
 
-        ShouldRequestFrameRedraw::No
+        {
+            redraw |= drain_pending_lsp_goto(cx.editor);
+        }
+
+        {
+            cx.editor.lister_mut().last_is_lister_open = cx.editor.lister().is_open();
+        }
+
+        {
+            let commander_buffer = cx.editor.commander().command_buffer;
+            let char_count = cx.editor.buffers[commander_buffer].text.len_chars();
+            cx.editor.commander_mut().last_command_buffer_character_count = char_count;
+
+            redraw = redraw.or_if(cx.editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut cx.editor.redraw_reasons);
+
+            redraw |= drain_commander_output(cx.editor);
+        }
+
+        redraw
     });
 
     cx.editor.hooks.about_to_rebuild_dirty_layouts = Some(|cx| {
@@ -1268,7 +1534,7 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.should_view_have_panel_bar = Some(|cx, view_id| {
-        cx.lister().query_view != view_id
+        ![cx.lister().query_view].contains(&view_id)
     });
 
     cx.editor.hooks.drew_all_leaf_panels = Some(|cx| {
@@ -1338,8 +1604,19 @@ fn setup_hooks(cx: &mut CommandContext) {
         let (line, col) = buffer.cursor_line_col(&view.cursor);
         _ = write!(
             &mut editor.scratch_panel_bar,
+
             "{}  {}:{}  {}", buffer.pretty_path, line+1, col+1, editor.scale
         );
+    });
+
+    cx.editor.hooks.panel_bar_color = Some(|editor, view_id| {
+        let view = &editor.views[view_id];
+        let panel_color = Color::hex(0x1a1a2e);
+        if Some(editor.active_panel) == view.panel_id() { // @PaletteRefactor
+            (panel_color, Some(Color::hex(0x5a4a2a)))  // active: gold border
+        } else {
+            (panel_color.darken(0.5), None)            // inactive: no border
+        }
     });
 
     cx.editor.hooks.drew_current_line_highlight_about_to_draw_cursor = Some(|editor, gpu, view_id, context| {
@@ -1358,28 +1635,28 @@ fn setup_hooks(cx: &mut CommandContext) {
 
         let view = &editor.views[view_id];
         let Some(layout) = &view.layout else { return };
+
         let buffer = &editor.buffers[view.buffer_id];
 
-        if let Some((m_line, m_col)) = find_matching_paren(buffer, *cursor_line, *cursor_col, &mut editor.scratch_paren) {
-            let _tracy = tracy::span!("render_text_layout::matching_paren_render");
+        let cols_to_check: &[_] = if *cursor_col > 0 {
+            &[*cursor_col, *cursor_col - 1]
+        } else {
+            &[*cursor_col]
+        };
 
-            // Cursor paren
-            if cursor_line >= first_visible_line && cursor_line < last_visible_line {
-                if let Some(ll) = layout.line_for_buffer_line(*cursor_line) {
-                    let x = layout.x_for_col(*origin_x, *cursor_col, ll);
-                    let w = layout.glyph_width_at_col(*cursor_col, *min_cursor_w, ll);
-                    let y = context.line_y(*cursor_line);
-                    gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
-                }
-            }
+        for &check_col in cols_to_check {
+            let Some((matching_line, matching_col)) = find_matching_paren(
+                buffer, *cursor_line, check_col, &mut editor.scratch_paren
+            ) else { continue };
 
-            // Matching paren
-            if m_line >= *first_visible_line && m_line < *last_visible_line {
-                if let Some(ll) = layout.line_for_buffer_line(m_line) {
-                    let x = layout.x_for_col(*origin_x, m_col, ll);
-                    let w = layout.glyph_width_at_col(m_col, *min_cursor_w, ll);
-                    let y = context.line_y(m_line);
-                    gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+            for (line, col) in [(*cursor_line, check_col), (matching_line, matching_col)] {
+                if line >= *first_visible_line && line < *last_visible_line {
+                    if let Some(ll) = layout.line_for_buffer_line(line) {
+                        let x = layout.x_for_col(*origin_x, col, ll);
+                        let w = layout.glyph_width_at_col(col, *min_cursor_w, ll);
+                        let y = context.line_y(line);
+                        gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+                    }
                 }
             }
         }
@@ -1435,6 +1712,111 @@ fn setup_hooks(cx: &mut CommandContext) {
             }
         }
     });
+
+    use editor::session::*;
+
+    cx.editor.hooks.session_save_chunks.get_or_insert_default().push(|editor, view_index, _buf_index| {
+        let lister = editor.lister();
+        let mut data = Vec::with_capacity(8);
+        // Store the serial view indices for query_view and any result view
+        if let Some(&vi) = view_index.get(&lister.query_view) {
+            write_u32(&mut data, vi);
+        } else {
+            return None;
+        }
+        Some((LISTER_CUSTOM_CHUNK_ID, data))
+    });
+
+    cx.editor.hooks.session_restore_chunks.get_or_insert_default().push(|editor, chunk_id, data, view_ids, _buf_ids| {
+        if chunk_id != LISTER_CUSTOM_CHUNK_ID { return; }
+        let mut r = Reader::new(data);
+        if let Some(vi) = r.u32() {
+            if let Some(&real_view_id) = view_ids.get(vi as usize) {
+                let lister = editor.custom_data.lister_mut();
+                lister.query_view   = real_view_id;
+                lister.query_buffer = editor.views[real_view_id].buffer_id;
+                lister.query_panel = if let Some(existing) = editor.views[lister.query_view].panel_id() {
+                    existing
+                } else {
+                    let panel_id = editor.panels.next_key();
+                    editor.panels.push(Panel {
+                        id:   panel_id,
+                        rect: Rect::default(),
+                        rect_including_panel_bar: Rect::default(),
+                        kind: PanelKind::Leaf { view_id: lister.query_view },
+                    });
+                    editor.views[lister.query_view].panel_id = panel_id;
+                    panel_id
+                };
+                editor.lister_mut().query_split = find_panel_by_kind(editor, editor.root_panel, &LISTER_SPLIT_PANEL_KIND)
+                    .unwrap_or_else(|| {
+                        let panel_id = editor.panels.next_key();
+                        editor.panels.push(Panel {
+                            id:   panel_id,
+                            rect: Rect::default(),
+                            rect_including_panel_bar: Rect::default(),
+                            kind: LISTER_SPLIT_PANEL_KIND,
+                        });
+                        panel_id
+                    });
+            }
+        }
+    });
+
+    cx.editor.hooks.session_save_chunks.get_or_insert_default().push(|editor, view_index, _| {
+        let commander = editor.commander();
+        let mut data = Vec::with_capacity(8);
+        if let Some(&vi) = view_index.get(&commander.command_view) {
+            write_u32(&mut data, vi);
+            Some((COMMANDER_CUSTOM_CHUNK_ID, data))
+        } else {
+            None
+        }
+    });
+
+    cx.editor.hooks.session_restore_chunks.get_or_insert_default().push(|editor, chunk_id, data, view_ids, _| {
+        if chunk_id != COMMANDER_CUSTOM_CHUNK_ID { return; }
+
+        let mut r = Reader::new(data);
+        if let Some(vi) = r.u32() {
+            if let Some(&real_view_id) = view_ids.get(vi as usize) {
+                let commander = editor.custom_data.commander_mut();
+                commander.command_view   = real_view_id;
+                commander.command_buffer = editor.views[real_view_id].buffer_id;
+                commander.command_panel = if let Some(existing) = editor.views[commander.command_view].panel_id() {
+                    existing
+                } else {
+                    let panel_id = editor.panels.next_key();
+                    editor.panels.push(Panel {
+                        id:   panel_id,
+                        rect: Rect::default(),
+                        rect_including_panel_bar: Rect::default(),
+                        kind: PanelKind::Leaf { view_id: commander.command_view },
+                    });
+                    editor.views[commander.command_view].panel_id = panel_id;
+                    panel_id
+                };
+            }
+        }
+    });
+
+    cx.editor.hooks.opened_file = Some(|editor, buffer_id| {  // :BufferScratch nocheckin
+        let buffer = &mut editor.buffers[buffer_id];
+        let Some(path) = buffer.path.clone() else { return };
+        let end = buffer.text.len_bytes();
+        buffer.flatten_rope_into_scratch(0, end);  // :BufferScratch
+        editor.custom_data.lsp_mut().did_open_buf(path.to_str().unwrap(), &buffer.scratch_space_to_flatten_rope_into);
+    });
+
+    cx.editor.hooks.modified_file = Some(|editor, buffer_id| {  // :BufferScratch
+        let buffer = &mut editor.buffers[buffer_id];
+        let Some(path) = buffer.path.clone() else { return };
+        let end = buffer.text.len_bytes();
+        buffer.flatten_rope_into_scratch(0, end);  // :BufferScratch
+        editor.custom_data.lsp_mut().did_change_buf(path.to_str().unwrap(), &buffer.scratch_space_to_flatten_rope_into, 1); // nocheckin
+    });
+
+    cx.editor.hooks.exiting = Some(|editor| editor.lsp_mut().shutdown_blocking());
 }
 
 pub fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
@@ -1451,40 +1833,6 @@ pub fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
     lister.set_selected_index_to_1_instead_of_0 = false;
 
     on_confirm(cx, item_data);
-}
-
-pub fn editor_init_custom_data(editor: &mut Editor) {
-    editor.custom_data.set(CustomData {
-        lister: Lister::new()
-    });
-
-    let lister_query_buffer = editor.buffers.push(Buffer::new());
-
-    let lister_query_view = editor.views.next_key();
-    editor.views.push(View::new(lister_query_view, lister_query_buffer));
-
-    let lister_query_panel = editor.panels.next_key();
-    editor.panels.push(Panel {
-        id:   lister_query_panel,
-        rect: Rect::default(),
-        rect_including_panel_bar: Rect::default(),
-        kind: PanelKind::Leaf { view_id: lister_query_view },
-    });
-    editor.views[lister_query_view].panel_id = lister_query_panel;
-
-    let lister_split_panel = editor.panels.next_key();
-    editor.panels.push(Panel {
-        id:   lister_split_panel,
-        rect: Rect::default(),
-        rect_including_panel_bar: Rect::default(),
-        kind: LISTER_SPLIT_PANEL_KIND,
-    });
-
-    let lister = editor.lister_mut();
-    lister.query_buffer = lister_query_buffer;
-    lister.query_view   = lister_query_view;
-    lister.query_panel  = lister_query_panel;
-    lister.split_panel  = lister_split_panel;
 }
 
 // Frosted glass approximation - layered semi-transparent rects
@@ -1519,7 +1867,7 @@ pub fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32,
 }
 
 pub fn render_lister_background(gpu: &mut Gpu, editor: &Editor) {
-    if editor.active_panel != editor.lister().split_panel { return; }
+    if editor.active_panel != editor.lister().query_split { return; }
 
     if !editor.lister().renderer_is_open() { return; }
 
@@ -1707,7 +2055,7 @@ pub fn editor_open_lister_with_frame_callback(editor: &mut Editor, items: Vec<Li
 pub fn editor_open_lister_impl(editor: &mut Editor, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: Option<ListerFrameUpdateCallback>) {
     clear_buffer(editor, editor.lister().query_buffer);
 
-    editor.set_active_panel(editor.lister().split_panel);
+    editor.set_active_panel(editor.lister().query_split);
 
     let lister = editor.custom_data.lister_mut();
 
@@ -1730,7 +2078,6 @@ pub fn editor_open_lister_impl(editor: &mut Editor, items: Vec<ListerItem>, on_c
     };
 }
 
-
 pub enum ListerKeyDispatch {
     Selected,
     Close,
@@ -1738,7 +2085,7 @@ pub enum ListerKeyDispatch {
     None
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ListerItem {
     pub label:    SmallString<[u8; 32]>,
     pub sublabel: SmallString<[u8; 64]>,
@@ -1748,6 +2095,7 @@ pub struct ListerItem {
 pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> ShouldRequestFrameRedraw;
 pub type ListerSelectFn = fn(&mut CommandContext, u64);
 
+#[derive(Clone)]
 pub struct Lister {
     pub is_open:        bool,
     pub is_listing_file_entries: bool,
@@ -1760,7 +2108,7 @@ pub struct Lister {
     pub query_buffer: BufferId, // :CustomData
     pub query_view:   ViewId,   // :CustomData
     pub query_panel:  PanelId,  // :CustomData @Redundant?
-    pub split_panel:  PanelId,  // :CustomData
+    pub query_split:  PanelId,  // :CustomData
 
     pub selected_index: u32,
     pub  hovered_index: Option<u32>,
@@ -1799,7 +2147,7 @@ impl Lister {
             query_panel: PanelId::reserved_value(),
             query_buffer: BufferId::reserved_value(),
             query_view: ViewId::reserved_value(),
-            split_panel: PanelId::reserved_value(),
+            query_split: PanelId::reserved_value(),
             query: SmallString::new(),
             filtered: Default::default(),
             panel_before_opening_lister: None,
@@ -1985,4 +2333,165 @@ impl Lister {
             self.scroll = bottom - self.list_h;
         }
     }
+}
+
+#[derive(Clone)]
+pub struct Commander {
+    pub command_view: ViewId,
+    pub command_buffer: BufferId,
+    pub command_panel: PanelId,
+
+    pub command_tx: Sender<Box<str>>,
+    pub output_rx: Receiver<Box<str>>,
+    pub current_child: Arc<Mutex<Option<Child>>>,
+
+    pub last_command_buffer_character_count: usize,
+}
+
+impl Commander {
+    pub fn new() -> Self {
+        let (command_tx, command_rx) = crossbeam_channel::unbounded::<Box<str>>();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded::<Box<str>>();
+
+        let current_child: Arc<Mutex<Option<Child>>> = Default::default();
+        let current_child2 = Arc::clone(&current_child);
+
+        std::thread::spawn(move || {
+            let current_child = current_child2;
+
+            while let Ok(command) = command_rx.recv() {
+                //
+                // Kill previous child if still running
+                //
+                if let Ok(mut guard) = current_child.lock() {
+                    if let Some(child) = guard.as_mut() {
+                        child.kill().ok();
+                    }
+                    *guard = None;
+                }
+
+                let (c1, c2) = {
+                    #[cfg(unix)]    { ("sh",  "-c") }
+                    #[cfg(windows)] { ("cmd", "/C") }
+                };
+
+                let mut child = match Command::new(c1)
+                    .arg(c2)
+                    .arg(format!("{command} 2>&1"))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        _ = output_tx.send(format!("error: {e}\n").into_boxed_str());
+                        continue;
+                    }
+                };
+
+                let stdout = child.stdout.take();
+                *current_child.lock().unwrap() = Some(child);
+
+                //
+                // Read thread
+                //
+                if let Some(mut stdout) = stdout {
+                    let output_tx = output_tx.clone();
+                    let current_child = current_child.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stdout.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
+                                    let _ = output_tx.send(s.into_boxed_str());
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        //
+                        // Reap the child
+                        //
+                        if let Ok(mut guard) = current_child.lock() {
+                            if let Some(mut child) = guard.take() {
+                                child.wait().ok();
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        Self {
+            command_buffer: BufferId::reserved_value(),
+            command_view: ViewId::reserved_value(),
+            command_panel: PanelId::reserved_value(),
+            command_tx,
+            last_command_buffer_character_count: 0,
+            output_rx,
+            current_child,
+        }
+    }
+
+    pub fn cancel(&self) {
+        if let Ok(mut guard) = self.current_child.lock() {
+            if let Some(child) = guard.as_mut() {
+                child.kill().ok();
+            }
+        }
+    }
+}
+
+pub fn drain_commander_output(editor: &mut Editor) -> ShouldRequestFrameRedraw {
+    let mut redraw = ShouldRequestFrameRedraw::No;
+
+    let commander_buffer = editor.commander().command_buffer;
+
+    while let Ok(chunk) = editor.commander().output_rx.try_recv() {
+        redraw = redraw.or_msg("Commander update", &mut editor.redraw_reasons);
+
+        let buf = &mut editor.buffers[commander_buffer];
+        buf.is_dirty = true;
+        let end = buf.text.len_chars();
+        buf.text.insert(end, &chunk);
+    }
+
+    redraw
+}
+
+pub fn peek_commander_output(editor: &mut Editor) -> ShouldRequestFrameRedraw {
+    let mut redraw = ShouldRequestFrameRedraw::No;
+
+    if !editor.commander().output_rx.is_empty() {
+        redraw = redraw.or_msg("Commander update", &mut editor.redraw_reasons);
+    }
+
+    redraw
+}
+
+pub fn drain_pending_lsp_goto(editor: &mut Editor) -> ShouldRequestFrameRedraw {
+    let mut redraw = ShouldRequestFrameRedraw::No;
+
+    if let Some(polled_jump_loc) = editor.custom_data.lsp_mut().poll_goto_definition() {
+        redraw = redraw.or_msg("Location jump", &mut editor.redraw_reasons);
+
+        goto_location(
+            editor, editor.active_view_id(),
+            &polled_jump_loc.path, polled_jump_loc.line, polled_jump_loc.col
+        );
+    }
+
+    redraw
+}
+
+pub fn peek_pending_lsp_goto(editor: &mut Editor) -> ShouldRequestFrameRedraw {
+    let mut redraw = ShouldRequestFrameRedraw::No;
+
+    if editor.lsp().goto_definition_is_some() {
+        redraw = redraw.or_msg("Location jump update", &mut editor.redraw_reasons);
+    }
+
+    redraw
 }

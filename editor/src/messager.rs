@@ -7,7 +7,7 @@ pub struct Message {
     // High 20 bits: blob offset, low 12 bits: len
     pub blob_offset_and_len: u32,
 
-    pub  pushed_at: u32,  // Milliseconds from some epoch, or a tick counter
+    pub  pushed_at: u32,
     pub started_at: Option<NonZeroU32>,
 
     pub width: f32

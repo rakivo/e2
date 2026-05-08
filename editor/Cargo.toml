@@ -23,7 +23,6 @@ bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2.11.0"
 ropey = "1.6.1"
 tempfile = "3.27.0"
-memmap2 = "0.9.10"
 swash = "0.2.7"
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
 dirs = "6.0.0"

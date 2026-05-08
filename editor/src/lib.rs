@@ -48,7 +48,7 @@ pub mod messager;
 use audioer::Audioer;
 use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
-use session::{apply_session, default_session_path, load_session};
+use session::CustomChunkId;
 use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
 use command::{CommandContext, CommandAtom};
@@ -67,10 +67,9 @@ use std::ops::{BitOr, BitAnd, BitOrAssign, BitAndAssign};
 
 use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap};
-use memmap2::MmapOptions;
 use smallstr::SmallString;
 use smallvec::SmallVec;
-use wgpu::naga::FastHashMap;
+use wgpu::naga::{FastHashMap, FastHashSet};
 use winit::window::Window;
 use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
 
@@ -122,7 +121,7 @@ hooks! {
         pub does_view_need_layout_rebuild: fn (&Editor, ViewId, BufferId, Rect) -> bool,
 
         pub inside_about_to_wait_should_request_redraw: fn (&mut Editor) -> ShouldRequestFrameRedraw,
-        pub        inside_redraw_should_request_redraw: fn (&mut Editor) -> ShouldRequestFrameRedraw,
+        pub        at_the_end_of_redraw_should_request_redraw: fn (&mut Editor) -> ShouldRequestFrameRedraw,
 
         /// You usually wanna do your ticks here.
         pub about_to_redraw_a_frame:        fn (&mut CommandContext, dt: f32) -> ShouldRequestFrameRedraw,
@@ -147,10 +146,17 @@ hooks! {
         pub should_view_have_panel_bar:     fn (&Editor, ViewId) -> bool,
         /// NOTE: Custom layer should do `write!(&mut editor.scratch_panel_bar)`!
         pub format_panel_bar:               fn (&mut Editor, ViewId),
+        /// First return is the color of the panel bar itself,
+        /// the second (optional) return is the color of the border separating the bar and the editor's background.
+        pub panel_bar_color:                fn (&mut Editor, ViewId) -> (Color, Option<Color>),
 
         pub render_panel_bar:               fn (&mut Editor, &mut Gpu, ViewId),
 
         pub drew_all_leaf_panels:           fn (&mut CommandContext)          -> ShouldRequestFrameRedraw,
+
+        pub opened_file:                    fn (&mut Editor, inside: BufferId),
+        /// NOTE: Use [`Buffer::last_insert`] and [`Buffer::last_delete`] if you want to get the latest modification info.
+        pub modified_file:                  fn (&mut Editor, inside: BufferId),
 
         /// Returns:
         ///
@@ -175,9 +181,30 @@ hooks! {
         /// Returns: Same as left_mouse_clicked
         pub post_command_execution: fn (&mut CommandContext, CommandAtom)  -> (bool, bool),
 
-        pub collect_leaf_panels_init_stack:         fn (&Editor, root: PanelId,              stack: &mut SmallVec<[PanelId; 48]>),
-        pub collect_leaf_panels:                    fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId, Rect, Rect); 2]>, // @Memory
-        pub collect_leaf_panels_for_session_saving: fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 48]>) -> SmallVec<[(PanelId, ViewId); 2]>,
+        pub dont_serialize_these_buffers_while_saving_session: FastHashSet<BufferId>,
+
+        pub session_save_chunks: Vec<
+        fn(
+            &Editor,
+            &FastHashMap<ViewId, u32>,   // View serial index map
+            &FastHashMap<BufferId, u32>, // Buffer serial index map
+        ) -> Option<(CustomChunkId, Vec<u8>)>>,
+
+        pub session_restore_chunks: Vec<
+        fn(
+            &mut Editor,
+            CustomChunkId, // chunk ID
+            &[u8],         // chunk data
+            &[ViewId],     // serial index -> real ViewId
+            &[BufferId]    // serial index -> real BufferId
+        )>,
+
+        pub exiting:                                fn (&mut Editor),
+
+        pub collect_leaf_panels_init_stack:         fn (&Editor, root: PanelId,              stack: &mut SmallVec<[PanelId; 12]>),
+        pub collect_leaf_panels:                    fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 12]>) -> SmallVec<[(PanelId, ViewId, Rect, Rect); 2]>, // @Memory
+        pub collect_leaf_panels_for_session_saving: fn (&Editor, root: PanelId, CustomPanel, stack: &mut SmallVec<[PanelId; 12]>) -> SmallVec<[(PanelId, ViewId); 2]>,
+
     }
 }
 
@@ -815,17 +842,16 @@ pub fn build_text_layout(
     if delta > 0.0 {
         // We are scrolling DOWN (target is below current anim)
         // Add prelex by remaining distance
-        let prelex_line_count = (delta / line_h).clamp(20.0, 200.0) as u32;
+        let prelex_line_count = (delta / line_h).clamp(20.0, 400.0) as u32;
         last_line = last_line.saturating_add(prelex_line_count);
     } else if delta < 0.0 {
-        // We are scrolling UP   (target is above current anim)
-        // Add prelex based on where the target top actually is
-        let target_first_line = (view.scroll / line_h) as u32;
-        let prelex_line_count = first_line.saturating_sub(target_first_line).max(20);
+        // We are scrolling UP (target is above current anim)
+        // Add prelex by remaining distance
+        let prelex_line_count = ((-delta) / line_h).clamp(20.0, 400.0) as u32;
         first_line = first_line.saturating_sub(prelex_line_count);
     }
 
-    let line_count = last_line - first_line;
+    let line_count = last_line.max(first_line) - first_line; // guard just in case
 
     //
     // @Speed @Note:
@@ -1292,8 +1318,8 @@ pub fn render_text_layout(
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
-        let rect = context.cursor_rect(cursor_glyph_w);
-        gpu::draw_rect(gpu, rect.x, rect.y, rect.w, rect.h, palette().cursor);
+        let crect = context.cursor_rect(cursor_glyph_w);
+        gpu::draw_rect(gpu, crect.x, crect.y, crect.w, crect.h, palette().cursor);
     }
 
     if let Some(hook) = editor.hooks.drew_cursor_about_to_draw_text {
@@ -1386,6 +1412,70 @@ pub fn render_text_layout(
     }
 }
 
+pub fn find_panel_split_context(editor: &Editor, target: PanelId) -> Option<(bool /*vertical*/, bool /*is_left_or_top*/)> {
+    let mut stack = SmallVec::<[PanelId; 12]>::new();
+
+    stack.push(editor.root_panel);
+    while let Some(id) = stack.pop() {
+        if let PanelKind::Split(s) = editor.panels[id].kind {
+            if s.left_id == target  { return Some((s.vertical, true));  }
+            if s.right_id == target { return Some((s.vertical, false)); }
+            stack.push(s.left_id);
+            stack.push(s.right_id);
+        }
+    }
+
+    None
+}
+
+pub struct BorderedEdges {
+    pub top:    bool,
+    pub bottom: bool,
+    pub left:   bool,
+    pub right:  bool,
+}
+
+pub fn find_bordered_edges(editor: &Editor, target: PanelId) -> BorderedEdges {
+    let mut edges = BorderedEdges { top: false, bottom: false, left: false, right: false };
+    accumulate_edges(editor, editor.root_panel, target, &mut edges);
+    edges
+}
+
+pub fn accumulate_edges(editor: &Editor, current: PanelId, target: PanelId, edges: &mut BorderedEdges) -> bool {
+    match editor.panels[current].kind {
+        PanelKind::Split(s) => {
+            if accumulate_edges(editor, s.left_id, target, edges) {
+                // Target is somewhere in the left/top subtree
+                if s.vertical {
+                    edges.right  = true;  // Left panel gets right border
+                } else {
+                    edges.bottom = true;  // Top panel gets bottom border
+                }
+
+                return true;
+            }
+
+            if accumulate_edges(editor, s.right_id, target, edges) {
+                // Target is somewhere in the right/bottom subtree
+                if s.vertical {
+                    edges.left   = true;  // Right panel gets left border
+                } else {
+                    edges.top    = true;  // Bottom panel gets top border
+                }
+
+                return true;
+            }
+
+            false
+        }
+
+        PanelKind::Leaf { .. } => current == target,
+
+        // :Configuration ?
+        PanelKind::Custom(_)   => current == target,
+    }
+}
+
 pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     if let Some(hook) = editor.hooks.render_panel_bar {
         //
@@ -1402,17 +1492,73 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     let bar_h = editor.panel_bar_h();
     let bar_y = rect.y - bar_h;
 
-    gpu::draw_rect(gpu, rect.x, bar_y, rect.w, bar_h, Color::hex(0x1f1508));
+    let (panel_bar_color, border_color) = if let Some(hook) = editor.hooks.panel_bar_color {
+        hook(editor, view_id)
+    } else {
+        (Color::hex(0x3d2a0f), None)  // @PaletteRefactor
+    };
 
-    let pad = (bar_h-editor.font_size())/2.0;
+    gpu::draw_rect(gpu, rect.x, bar_y, rect.w, bar_h, panel_bar_color);
 
-    let center_y = bar_y + bar_h * 0.5;
-    let y = center_y + editor.font_size() * 0.35; // nocheckin
+    if let Some(border_color) = border_color {
+        let border_thickness = 1.0*editor.scale;
+        let panel_id = editor.views[view_id].panel_id().unwrap();
+        let edges    = find_bordered_edges(editor, panel_id);
+
+        gpu::draw_rect(gpu, rect.x, bar_y + bar_h - border_thickness, rect.w, border_thickness, border_color);
+
+        //
+        // Right edge - full panel height including bar
+        //
+        if edges.right {
+            gpu::draw_rect(gpu, rect.x + rect.w - border_thickness, bar_y, border_thickness, bar_h + rect.h, border_color);
+        }
+
+        //
+        // Left edge - full panel height including bar
+        //
+        if edges.left {
+            gpu::draw_rect(gpu, rect.x, bar_y, border_thickness, bar_h + rect.h, border_color);
+        }
+
+        //
+        // Bottom of bar
+        //
+        if edges.bottom {
+            let panel_rect = editor.views[view_id].panel_id().map_or(
+                rect,
+                |panel_id| editor.panels[panel_id].rect_including_panel_bar
+            );
+            gpu::draw_rect(
+                gpu,
+                panel_rect.x, panel_rect.y + panel_rect.h - border_thickness,
+                panel_rect.w, border_thickness,
+                border_color
+            );
+        }
+
+        //
+        // Top of bar
+        //
+        if edges.top {
+            gpu::draw_rect(
+                gpu,
+                rect.x, bar_y,
+                rect.w, border_thickness,
+                border_color
+            );
+        }
+    }
 
     editor.scratch_panel_bar.clear();
     if let Some(format_panel_bar) = editor.hooks.format_panel_bar {
         format_panel_bar(editor, view_id);
     }
+
+    let pad = (bar_h-editor.font_size())/2.0;
+
+    let center_y = bar_y + bar_h * 0.5;
+    let y = center_y + editor.font_size() * 0.35; // nocheckin
 
     gpu::draw_text(
         gpu,
@@ -1421,6 +1567,44 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
         editor.font_size(),
         Color::rgba(174, 131, 60, 255)
     );
+}
+
+pub fn render_split_seams(gpu: &mut Gpu, editor: &Editor, panel_id: PanelId, color: Color) {
+    match editor.panels[panel_id].kind {
+        PanelKind::Split(s) => {
+            let left = editor.panels[s.left_id].rect_including_panel_bar;
+            let border_thickness = 1.0 * editor.scale; // :Configuration ?
+
+            if s.vertical {
+                // Draw at the seam between left and right
+                let x = left.x + left.w;
+                gpu::draw_rect(gpu, x, left.y, border_thickness, left.h, color);
+            } else {
+                // Draw at the seam between top and bottom
+                let y = left.y + left.h;
+                gpu::draw_rect(gpu, left.x, y, left.w, border_thickness, color);
+            }
+
+            render_split_seams(gpu, editor, s.left_id,  color);
+            render_split_seams(gpu, editor, s.right_id, color);
+        }
+
+        PanelKind::Leaf { .. } => {
+            // Bar/buffer separator
+            let bar_h = editor.panel_bar_h();
+            let panel = editor.panels[panel_id].rect_including_panel_bar;
+            let border_thickness = 1.0 * editor.scale; // :Configuration ?
+            gpu::draw_rect(
+                gpu,
+                panel.x, panel.y + bar_h,
+                panel.w, border_thickness,
+                color
+            );
+        }
+
+        // :Configuration ?
+        PanelKind::Custom(_) => {}
+    }
 }
 
 pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
@@ -1497,6 +1681,16 @@ pub struct PanelSplit {
     pub right_id: PanelId,
 }
 
+impl Eq for PanelSplit {}
+
+impl PartialEq for PanelSplit {
+    fn eq(&self, other: &Self) -> bool {
+        self.vertical == other.vertical &&
+        self.left_id == other.left_id &&
+        self.right_id == other.right_id
+    }
+}
+
 #[derive(Eq, PartialEq, PartialOrd, Ord, Debug, Copy, Clone, Default)]
 pub struct CustomPanel {
     pub extra0: u32, pub extra1: u32, pub extra2: u32,
@@ -1506,7 +1700,7 @@ impl CustomPanel {
     pub const UNIT: Self = unsafe { core::mem::zeroed() };
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub enum PanelKind {
     Leaf { view_id: ViewId },
     Split(PanelSplit),
@@ -1581,6 +1775,14 @@ impl View {
     }
 
     #[inline]
+    pub fn reset_cursor(&mut self) {
+        self.scroll = 0.0;
+        self.cursor_target_line = 0;
+        self.cursor_target_col = 0;
+        self.cursor = Cursor::new();
+    }
+
+    #[inline]
     pub fn panel_id(&self) -> Option<PanelId> {
         if self.panel_id.is_reserved_value() {
             return None;
@@ -1643,6 +1845,12 @@ impl View {
     }
 
     #[inline]
+    pub fn scroll_to_cursor_centered(&mut self, line: u32, line_h: f32, rect: Rect) {
+        let cursor_top = line as f32 * line_h;
+        self.scroll = (cursor_top - rect.h / 2.0 + line_h / 2.0).max(0.0);
+    }
+
+    #[inline]
     pub fn clamp_scroll(&mut self, total_lines: usize, line_h: f32, rect: Rect) {
         let max = (total_lines as f32 * line_h - rect.h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
@@ -1681,70 +1889,85 @@ impl EditorLoggerConfig {
     }
 }
 
-pub struct EditorCustomData(pub Option<Box<dyn Any>>);
+#[derive(Default)]
+pub struct EditorCustomData {  // @DocumentThis
+    pub transient:  Option<Box<dyn Any>>,
+    pub persistent: Option<Box<dyn Any>>,
+}
 
 impl Deref for EditorCustomData {
     type Target = Option<Box<dyn Any>>;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    #[inline] fn deref(&self) -> &Self::Target { &self.persistent }
 }
 
 impl DerefMut for EditorCustomData {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+    #[inline] fn deref_mut(&mut self) -> &mut Self::Target { &mut self.persistent }
 }
 
 impl EditorCustomData {
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn get<T: 'static>(&self) -> &T {
-        #[cfg(debug_assertions)]
-        {
-            self.as_ref()
-                .unwrap_or_else(|| panic!(
-                    "EditorCustomData::get::<{}>() called but custom data was never initialized. \
-                     Call editor.custom_data.set() before accessing it.",
-                    std::any::type_name::<T>()
-                ))
-                .downcast_ref::<T>()
-                .unwrap_or_else(|| panic!(
-                    "EditorCustomData::get::<{}>() failed: custom data was initialized with a different type ({:?}).",
-                    std::any::type_name::<T>(),
-                    self.as_ref().unwrap().type_id()
-                ))
+        unsafe {
+            &*(self.persistent.as_ref()
+               .unwrap_or_else(|| panic!(
+                   "EditorCustomData::get::<{}>() called but persistent data was never initialized.",
+                   std::any::type_name::<T>()
+               ))
+               .as_ref() as *const dyn Any as *const T)
         }
-        #[cfg(not(debug_assertions))]
-        unsafe { &*(self.as_ref().unwrap_unchecked().as_ref() as *const dyn Any as *const T) }
     }
 
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn get_mut<T: 'static>(&mut self) -> &mut T {
-        #[cfg(debug_assertions)]
-        {
-            let type_id = self.as_ref().map(|b| b.type_id());
-            self.as_mut()
-                .unwrap_or_else(|| panic!(
-                    "EditorCustomData::get_mut::<{}>() called but custom data was never initialized. \
-                     Call editor.custom_data.set() before accessing it.",
-                    std::any::type_name::<T>()
-                ))
-                .downcast_mut::<T>()
-                .unwrap_or_else(|| panic!(
-                    "EditorCustomData::get_mut::<{}>() failed: custom data was initialized with a different type ({:?}).",
-                    std::any::type_name::<T>(),
-                    type_id
-                ))
+        unsafe {
+            &mut *(self.persistent.as_mut()
+                   .unwrap_or_else(|| panic!(
+                       "EditorCustomData::get_mut::<{}>() called but persistent data was never initialized.",
+                       std::any::type_name::<T>()
+                   ))
+                   .as_mut() as *mut dyn Any as *mut T)
         }
-        #[cfg(not(debug_assertions))]
-        unsafe { &mut *(self.as_mut().unwrap_unchecked().as_mut() as *mut dyn Any as *mut T) }
     }
 
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
-    pub fn set<T: 'static>(&mut self, value: impl Into<Box<T>>) -> Option<Box<T>> {
-        #[cfg(debug_assertions)]
-        { self.replace(value.into()).map(|c| c.downcast().unwrap()) }
-        #[cfg(not(debug_assertions))]
-        unsafe { self.replace(value.into()).map(|c| Box::from_raw(Box::into_raw(c) as *mut T)) }
+    pub fn set<T: 'static>(&mut self, value: impl Into<Box<T>>) {
+        self.persistent.replace(value.into());
+    }
+}
+
+impl EditorCustomData {
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn get_transient<T: 'static>(&self) -> &T {
+        unsafe {
+            &*(self.transient.as_ref()
+               .unwrap_or_else(|| panic!(
+                   "EditorCustomData::get_transient::<{}>() called but transient data was never initialized.",
+                   std::any::type_name::<T>()
+               ))
+               .as_ref() as *const dyn Any as *const T)
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn get_transient_mut<T: 'static>(&mut self) -> &mut T {
+        unsafe {
+            &mut *(self.transient.as_mut()
+                   .unwrap_or_else(|| panic!(
+                       "EditorCustomData::get_transient_mut::<{}>() called but transient data was never initialized.",
+                       std::any::type_name::<T>()
+                   ))
+                   .as_mut() as *mut dyn Any as *mut T)
+        }
+    }
+
+    #[inline]
+    pub fn set_transient<T: 'static>(&mut self, value: impl Into<Box<T>>) {
+        self.transient.replace(value.into());
     }
 }
 
@@ -1761,6 +1984,7 @@ pub struct Editor {
 
     // Root panel id - its rect always equals the window
     pub root_panel:    PanelId,
+    pub root_buffer:   BufferId,
 
     pub scratch_paren:     Vec<char>,
     pub scratch_panel_bar: String,
@@ -1775,6 +1999,8 @@ pub struct Editor {
     pub win_w: f32,
     pub win_h: f32,
     pub is_our_window_focused: bool,
+
+    pub did_we_apply_any_sessions: bool,
 
     // Cursor blink
     pub blink_epoch:         Instant,
@@ -1803,8 +2029,6 @@ pub struct Editor {
     pub relex_us:        f32,
     pub build_us:        f32,
     pub render_us:       f32,
-
-    pub session_apply_time_in_milliseconds: Option<f32>,
 
     pub canonicalized_current_working_directory: SmallString<[u8; 256]>,
     pub canonicalized_last_scanned_directory:    SmallString<[u8; 256]>,
@@ -1861,7 +2085,7 @@ impl Editor {
 
         let canonicalized_path_to_buffer_id = FastHashMap::with_capacity_and_hasher(128, Default::default());
 
-        let mut editor = Self {
+        Self {
             buffers,
             views,
             panels,
@@ -1872,10 +2096,11 @@ impl Editor {
             last_input_time: Instant::now(),
             win_h: 0.0,
             win_w: 0.0,
+            root_buffer,
             last_cursor_visible: false,
             is_cursor_visible: true,
             buffer_cycle_index: None,
-            custom_data: EditorCustomData(None),
+            custom_data: EditorCustomData::default(),
             last_messager_count: u32::MAX,
             scratch_paren: Vec::with_capacity(256),
             active_panel: root_panel,
@@ -1902,29 +2127,14 @@ impl Editor {
             audioer,
             director: Director::new(),
             messager: Messager::new(),
-            session_apply_time_in_milliseconds: None,
-            redraw_reasons: Vec::with_capacity(64)
-        };
-
-        //
-        // Try to restore session first
-        //
-        let session_path = &default_session_path();
-
-        if let Ok(file)      = std::fs::File::open(session_path)
-        && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
-        && let Some(session) = load_session(&mmap[..])
-        {
-            let time = apply_session(&mut editor, session);
-            editor.session_apply_time_in_milliseconds = Some(time);
+            did_we_apply_any_sessions: false,
+            redraw_reasons: Vec::with_capacity(64),
         }
+    }
 
-        //
-        // Open the file from argv if user provided it
-        //
-        open_initial_buffer(&mut editor);
-
-        editor
+    #[inline]
+    pub fn was_custom_data_ever_initialized(&self) -> bool {
+        self.custom_data.is_some()
     }
 
     #[inline]
@@ -1937,6 +2147,10 @@ impl Editor {
         let buffer_id = self.buffers.push(buffer);
         self.mru_register_new_buffer(buffer_id);
 
+        if let Some(hook) = self.hooks.opened_file {  // @Design: Move this into the if-block below?
+            hook(self, buffer_id);
+        }
+
         if let Some(canon) = self.buffers[buffer_id].path.as_ref().and_then(|p| p.canonicalize().ok()) {
             self.canonicalized_path_to_buffer_id.insert(canon.into(), buffer_id);  // @Clone @Refactor
         }
@@ -1948,6 +2162,17 @@ impl Editor {
 
     #[inline]
     pub fn command_finish(&mut self) {
+        { // @Hack
+            let current_buffer_id = self.active_view().buffer_id;
+            let current_buffer = &self.buffers[current_buffer_id];
+            let modified = current_buffer.last_delete.is_some() || current_buffer.last_insert.is_some();
+            if modified {
+                if let Some(hook) = self.hooks.modified_file {
+                    hook(self, current_buffer_id);
+                }
+            }
+        }
+
         adjust_cursors_after_buffer_mutation(self);
         scroll_to_cursor(self);
         self.reset_blink();
@@ -1964,8 +2189,23 @@ impl Editor {
     }
 
     #[inline]
-    pub fn set_custom_data<T: 'static>(&mut self, value: impl Into<Box<T>>) -> Option<Box<T>> {
+    pub fn set_custom_data<T: 'static>(&mut self, value: impl Into<Box<T>>) {
         self.custom_data.set(value)
+    }
+
+    #[inline]
+    pub fn custom_transient_data<T: 'static>(&self) -> &T {
+        self.custom_data.get_transient()
+    }
+
+    #[inline]
+    pub fn custom_transient_data_mut<T: 'static>(&mut self) -> &mut T {
+        self.custom_data.get_transient_mut()
+    }
+
+    #[inline]
+    pub fn set_custom_transient_data<T: 'static>(&mut self, value: impl Into<Box<T>>) {
+        self.custom_data.set_transient(value)
     }
 
     #[inline]
@@ -2488,6 +2728,7 @@ impl ShouldRequestFrameRedraw {
     }
 
     #[inline]
+    #[must_use]
     pub fn yes(msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
         #[cfg(debug_assertions)]
         return Self::push(msg, NO_PARENT, reasons);
@@ -2510,6 +2751,7 @@ impl ShouldRequestFrameRedraw {
     /// Attach an additional reason on top of an existing one, forming a chain.
     /// If self is No, stays No.
     #[inline]
+    #[must_use]
     pub fn because(self, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
         #[cfg(not(debug_assertions))]
         { let _ = (msg, reasons); return self; }
@@ -2522,6 +2764,7 @@ impl ShouldRequestFrameRedraw {
 
     /// Redraw if either does.  Keeps self's reason if both are Yes.
     #[inline]
+    #[must_use]
     pub fn or(self, other: Self) -> Self {
         match (self, other) {
             (Self::Yes(_), _) | (_, Self::No) => self,
@@ -2531,6 +2774,7 @@ impl ShouldRequestFrameRedraw {
 
     /// Redraw only if both do.
     #[inline]
+    #[must_use]
     pub fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Yes(_), Self::Yes(_)) => self,
@@ -2539,18 +2783,21 @@ impl ShouldRequestFrameRedraw {
     }
 
     #[inline]
+    #[must_use]
     pub fn if_msg(condition: bool, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
         if condition { Self::yes(msg, reasons) } else { Self::default() }
     }
 
     /// Convenience: set self to Yes if the condition is true.
     #[inline]
+    #[must_use]
     pub fn or_if(self, condition: bool, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
         if condition { self.or(Self::yes(msg, reasons)) } else { self }
     }
 
     /// Convenience: set self to Yes if the condition is true.
     #[inline]
+    #[must_use]
     pub fn or_msg(self, msg: &'static str, reasons: &mut Vec<ReasonEntry>) -> Self {
         self.or_if(true, msg, reasons)
     }
@@ -2679,7 +2926,8 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
             let delta  = target - view.scroll_anim;
 
             if delta.abs() > epsilon {
-                let speed = 20.0;  // nocheckin @Tune
+                let speed = 20.0 + (delta.abs() / line_h).sqrt() * 3.0; // @Tune 3.0
+                // let speed = (20.0 + delta.abs() / line_h * 0.5).min(35.0); // @Tune
                 view.scroll_anim += delta * (1.0 - (-speed * dt).exp());
                 should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
                     "View scroll animation", &mut editor.redraw_reasons
@@ -2807,77 +3055,6 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
     should_redraw
 }
 
-pub fn find_matching_paren(
-    buffer: &Buffer,
-    start_line: u32, start_col: u32,
-    scratch_paren: &mut Vec<char>,
-) -> Option<(u32, u32)> {
-    let _tracy = tracy::span!("find_matching_paren");
-
-    let (open, close, dir) = {
-        let ch = char_at_line_col(buffer, start_line, start_col)?;
-
-        match ch {
-            '(' => ('(', ')',  1),
-            '[' => ('[', ']',  1),
-            '{' => ('{', '}',  1),
-            ')' => ('(', ')', -1),
-            ']' => ('[', ']', -1),
-            '}' => ('{', '}', -1),
-            _ => return None,
-        }
-    };
-
-    let mut depth = 0;
-
-    const MAX_SCAN_LINES: u32 = 128;
-
-    if dir > 0 {
-        let mut line = start_line;
-
-        while line < buffer.text.len_lines() as u32 && line < start_line + MAX_SCAN_LINES {
-            let text = buffer.text.line(line as usize);
-
-            let start_col_in_line = if line == start_line { start_col } else { 0 };
-
-            for (col, ch) in text.chars().enumerate().skip(start_col_in_line as usize) {
-                if ch == open {
-                    depth += 1;
-                } else if ch == close {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((line, col as u32));
-                    }
-                }
-            }
-
-            line += 1;
-        }
-    } else {
-        let mut line = start_line;
-        loop {
-            let text = buffer.text.line(line as usize);
-            let end_col = if line == start_line { start_col + 1 } else { text.chars().count() as u32 };
-
-            scratch_paren.clear();
-            scratch_paren.extend(text.chars().take(end_col as usize));
-
-            for col in (0..scratch_paren.len()).rev() {
-                let ch = scratch_paren[col];
-                if ch == close      { depth += 1; }
-                else if ch == open  { depth -= 1; if depth == 0 { return Some((line, col as u32)); } }
-            }
-
-            if line == 0 { break; }
-            line -= 1;
-
-            if start_line - line > MAX_SCAN_LINES { break; }
-        }
-    }
-
-    None
-}
-
 pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
     let line_text = buffer.text.line(line as usize);
     line_text.chars().nth(col as usize)
@@ -2886,7 +3063,7 @@ pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
 pub fn collect_leaves(editor: &Editor, id: PanelId, out: &mut SmallVec<[(PanelId, ViewId, Rect, Rect); 5]>) { // @Memory
     let panels = &editor.panels;
 
-    let mut stack = SmallVec::<[PanelId; 48]>::with_capacity((panels.len() as f32 * 1.5) as usize);
+    let mut stack = SmallVec::<[PanelId; 12]>::with_capacity((panels.len() as f32 * 1.5) as usize);
 
     if let Some(collect_leaf_panels_init_stack) = editor.hooks.collect_leaf_panels_init_stack {
         collect_leaf_panels_init_stack(editor, id, &mut stack);
@@ -3163,12 +3340,24 @@ pub fn scroll_to_cursor(editor: &mut Editor) {
 
 pub fn clear_buffer(editor: &mut Editor, buffer: BufferId) {
     editor.buffers[buffer].clear();
+
+    for view in editor.views.values_mut().filter(|view| view.buffer_id == buffer) { // @Redundant?
+        view.reset_cursor();
+    }
 }
 
 pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl Into<Box<Path>>) {
-    let Ok(buffer) = Buffer::from_file(path) else { return };
+    let path = path.into();
 
-    let buffer_id = editor.push_buffer(buffer);
+    let Ok(canon) = std::fs::canonicalize(&path) else { return };
+
+    let canon: &Path = canon.as_ref();
+    let buffer_id = if let Some(&existing_buffer_id) = editor.canonicalized_path_to_buffer_id.get(canon) {
+        existing_buffer_id
+    } else {
+        let Ok(buffer) = Buffer::from_file(path) else { return };
+        editor.push_buffer(buffer)
+    };
 
     editor.views[view].switch_buffer(buffer_id);
     editor.mru_focus(buffer_id); // @Refactor
@@ -3229,7 +3418,12 @@ pub fn open_initial_buffer(editor: &mut Editor) {
         .and_then(|p| Buffer::from_file(p).ok())
         .unwrap_or_else(Buffer::new);
 
-    let buffer_id = editor.buffers.push(buffer);
+    let buffer_id = if editor.did_we_apply_any_sessions {
+        editor.buffers.push(buffer)
+    } else {
+        editor.buffers[editor.root_buffer] = buffer;
+        editor.root_buffer
+    };
 
     editor.mru_register_new_buffer(buffer_id); // @Refactor
 

@@ -149,7 +149,7 @@ pub enum KeyCombo {
     Physical(KeyCode, Mods),
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Default)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, Default)]
 pub struct Mods {  // @Memory: Make Mods bitflags
     pub ctrl:  bool,
     pub alt:   bool,
@@ -168,6 +168,7 @@ impl KeyCombo {
     pub fn named_mods(k: NamedKey, mods: Mods) -> Self { Self::Named(k, mods) }
     pub fn physical_mods(k: KeyCode, mods: Mods) -> Self { Self::Physical(k, mods) }
     pub fn ctrl(c: char)  -> Self { Self::Char(c, Mods::ctrl()) }
+    pub fn char_mods(c: char, mods: Mods)  -> Self { Self::Char(c, mods) }
     pub fn alt(c: char)   -> Self { Self::Char(c, Mods::alt()) }
     pub fn physical(k: KeyCode) -> Self { Self::Physical(k, Mods::default()) }
 }

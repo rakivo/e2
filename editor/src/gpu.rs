@@ -384,7 +384,6 @@ pub fn reset_atlas(gpu: &mut Gpu) {
     gpu.atlas_row_h = 0;
 }
 
-
 pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
     let mut builtin_prewarmed_font_sizes: SmallVec<[f32; 16]> = [
         editor.scale,

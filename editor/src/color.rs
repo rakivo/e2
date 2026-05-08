@@ -93,6 +93,18 @@ impl Color {
             a: 255,
         }
     }
+
+    /// 0..1 amount
+    #[inline]
+    pub fn darken(self, amount: f32) -> Color {
+        let factor = (1.0 - amount).clamp(0.0, 1.0);
+        Color {
+            r: (self.r as f32 * factor) as u8,
+            g: (self.g as f32 * factor) as u8,
+            b: (self.b as f32 * factor) as u8,
+            a: self.a,
+        }
+    }
 }
 
 #[repr(transparent)]

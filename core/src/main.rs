@@ -12,6 +12,7 @@
 // #[global_allocator]
 // static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use editor::color::Color;
 use editor::*;
 use editor::audioer::Audioer;
 use editor::messager::{MESSAGE_DURATION_IN_MILLISECONDS};
@@ -37,7 +38,15 @@ fn run_custom_layer_initialization(cx: &mut CommandContext, loaded: &mut LoadedL
     let t0 = Instant::now();
     (loaded.init)(cx, loaded);
 
+
     eprintln!("[Ran custom_layer_init in {}us]", t0.elapsed().as_micros() as f32);
+
+    post_custom_layer_initialization(cx.editor);
+}
+
+fn post_custom_layer_initialization(editor: &mut Editor) {
+    editor.layout_panels();
+    editor.recompute_buffer_display_names();
 }
 
 struct App {
@@ -102,14 +111,10 @@ impl App {
         match result {
             Ok(new_lib) => {
                 // Drop all custom data while the old dylib is still loaded so its vtable is valid
-                self.editor.custom_data.0 = None;
+                self.editor.custom_data.transient = None;
 
                 let old = self.loaded.replace(new_lib);
                 drop(old);
-
-                let commands = self.loaded.as_ref().unwrap().commands;
-                self.command_table = CommandTable::from_commands(commands);
-                self.keymap = Keymap::default_keymap(&mut self.command_table);
 
                 if let Some(gpu) = &mut self.gpu {
                     let loaded = self.loaded.as_mut().unwrap();
@@ -155,19 +160,10 @@ impl ApplicationHandler<UserEvent> for App {
         let editor = &mut self.editor;
         editor.win_w = gpu.win_w;
         editor.win_h = gpu.win_h;
-        editor.layout_panels();
 
         self.refresh_rate_millihertz = win.current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
             .unwrap_or(60*1000); // 60Hz
-
-        {
-            if let Some(time) = editor.session_apply_time_in_milliseconds {
-                let path = pretty_path(&default_session_path());
-                let message = format!("Applied session in {time}us from '{path}'");
-                editor.messager.push(&message, &mut gpu);
-            }
-        }
 
         if let Some(l) = &mut self.loaded {
             let mut cx = CommandContext {
@@ -180,9 +176,9 @@ impl ApplicationHandler<UserEvent> for App {
             run_custom_layer_initialization(&mut cx, l);
         }
 
-        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
+        post_custom_layer_initialization(editor);
 
-        editor.recompute_buffer_display_names();
+        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
 
         self.gpu    = Some(gpu);
         self.window = Some(win);
@@ -250,6 +246,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let Some(hook) = self.editor.hooks.exiting {
+            hook(&mut self.editor);
+        }
+
         _ = save_session(&self.editor, &default_session_path());
     }
 
@@ -678,6 +678,8 @@ impl ApplicationHandler<UserEvent> for App {
                 //
                 //
 
+                render_split_seams(gpu, editor, editor.root_panel, Color::hex(0x2a2a2a)); // :Configuration ?
+
                 for &(panel_id, view_id, rect, rect_including_bar) in &leaf_panels {
                     {
                         let about_to_draw_this_panel = editor.hooks.about_to_draw_this_panel;
@@ -741,7 +743,7 @@ impl ApplicationHandler<UserEvent> for App {
                 redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation", &mut editor.redraw_reasons);
                 redraw = redraw.or_if(editor.messager.count != 0, "Messager animation", &mut editor.redraw_reasons); // nocheckin
 
-                if let Some(inside_redraw_should_request_redraw) = editor.hooks.inside_redraw_should_request_redraw {
+                if let Some(inside_redraw_should_request_redraw) = editor.hooks.at_the_end_of_redraw_should_request_redraw {
                     redraw |= inside_redraw_should_request_redraw(editor);
                 }
 
