@@ -448,7 +448,7 @@ pub fn padding_left(should_pad_left_when_rendering: bool) -> f32 {
     if should_pad_left_when_rendering {
         PADDING_LEFT
     } else {
-        0.0
+        2.0 // nocheckin
     }
 }
 
@@ -469,6 +469,7 @@ define_base_and_scale! {
     const BASE_CURSOR_HEIGHT: f32 = 2.0;
     const BASE_CURSOR_WIDTH:  f32 = 2.0;
     const BASE_CURSOR_OUTLINE_THICKNESS: f32 = 1.5;
+    const BASE_PANEL_BAR_BORDER_THICKNESS: f32 = 1.0;
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -1501,7 +1502,7 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     gpu::draw_rect(gpu, rect.x, bar_y, rect.w, bar_h, panel_bar_color);
 
     if let Some(border_color) = border_color {
-        let border_thickness = 1.0*editor.scale;
+        let border_thickness = editor.panel_bar_border_thickness();
         let panel_id = editor.views[view_id].panel_id().unwrap();
         let edges    = find_bordered_edges(editor, panel_id);
 
@@ -1531,7 +1532,7 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
             );
             gpu::draw_rect(
                 gpu,
-                panel_rect.x, panel_rect.y + panel_rect.h - border_thickness,
+                panel_rect.x, panel_rect.y + panel_rect.h - border_thickness*2.0,
                 panel_rect.w, border_thickness,
                 border_color
             );
@@ -1558,7 +1559,7 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     let pad = (bar_h-editor.font_size())/2.0;
 
     let center_y = bar_y + bar_h * 0.5;
-    let y = center_y + editor.font_size() * 0.35; // nocheckin
+    let y = center_y + editor.font_size() * 0.38; // nocheckin
 
     gpu::draw_text(
         gpu,
@@ -1573,7 +1574,7 @@ pub fn render_split_seams(gpu: &mut Gpu, editor: &Editor, panel_id: PanelId, col
     match editor.panels[panel_id].kind {
         PanelKind::Split(s) => {
             let left = editor.panels[s.left_id].rect_including_panel_bar;
-            let border_thickness = 1.0 * editor.scale; // :Configuration ?
+            let border_thickness = editor.panel_bar_border_thickness(); // :Configuration ?
 
             if s.vertical {
                 // Draw at the seam between left and right
@@ -1593,7 +1594,7 @@ pub fn render_split_seams(gpu: &mut Gpu, editor: &Editor, panel_id: PanelId, col
             // Bar/buffer separator
             let bar_h = editor.panel_bar_h();
             let panel = editor.panels[panel_id].rect_including_panel_bar;
-            let border_thickness = 1.0 * editor.scale; // :Configuration ?
+            let border_thickness = editor.panel_bar_border_thickness(); // :Configuration ?
             gpu::draw_rect(
                 gpu,
                 panel.x, panel.y + bar_h,
@@ -1618,7 +1619,7 @@ pub fn render_messager(gpu: &mut Gpu, editor: &mut Editor) {
     let screen_width = gpu.win_w;
     let font_size    = MESSAGER_FONT_SIZE;
     let line_height  = font_size + 4.0;
-    let margin_top   = 12.0;
+    let margin_top   = editor.panel_bar_h()*1.88;
     let margin_right = 8.0;
     let x = screen_width - editor.messager.column_width - margin_right;
 
@@ -2539,7 +2540,8 @@ impl Editor {
 
     #[inline] pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
     #[inline] pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
-    #[inline] pub fn panel_bar_h(&self) -> f32 { self.line_h() + self.cursor_h() + self.scale * 2.5 }
+    #[inline] pub fn panel_bar_border_thickness(&self) -> f32 { scale_base_panel_bar_border_thickness(self.scale) }
+    #[inline] pub fn panel_bar_h(&self) -> f32 { self.line_h() + self.cursor_h() + self.scale * 3.5 }
     #[inline] pub fn cursor_w(&self)  -> f32 { scale_base_cursor_width(self.scale) }
     #[inline] pub fn cursor_h(&self)  -> f32 { scale_base_cursor_height(self.scale) }
 

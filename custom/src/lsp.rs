@@ -10,7 +10,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 pub struct Location {
     pub path: Box<str>,
     pub line: u32,      // 0-indexed
-    pub col: u32,       // 0-indexed, UTF-16 units (what LSP gives us)
+    pub col:  u32,      // 0-indexed, UTF-16 units (what LSP gives us)
 }
 
 // Handle to an in-flight async request.

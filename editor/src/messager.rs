@@ -45,7 +45,7 @@ pub const MAX_MESSAGE_COUNT: usize = 32;
 
 pub const MESSAGE_DURATION_IN_MILLISECONDS: u32 = 2900;
 
-pub const MESSAGER_FONT_SIZE: f32 = 12.0;
+pub const MESSAGER_FONT_SIZE: f32 = 13.0;
 
 #[derive(Debug)]
 pub struct Messager {
