@@ -1559,7 +1559,7 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     let pad = (bar_h-editor.font_size())/2.0;
 
     let center_y = bar_y + bar_h * 0.5;
-    let y = center_y + editor.font_size() * 0.38; // nocheckin
+    let y = center_y + editor.font_size() * 0.34; // nocheckin
 
     gpu::draw_text(
         gpu,

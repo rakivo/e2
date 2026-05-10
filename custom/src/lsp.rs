@@ -43,7 +43,7 @@ impl PendingRequest {
 pub type RequestId = u64;
 
 pub struct LspClient {
-    stdin:   ChildStdin,
+    stdin: ChildStdin,
     next_request_id: RequestId,
 
     // One entry per in-flight request. Reader thread removes the entry and
@@ -56,7 +56,7 @@ pub struct LspClient {
     send_buf: Vec<u8>,
 
     // Keep child alive. Dropping it would close stdin and kill the server.
-    _child: Child,
+    _server_child: Child,
 
     pub pending_goto: Option<PendingRequest>,
 }
@@ -66,7 +66,7 @@ impl LspClient {
     // Blocks until the server responds to initialize - this is the right
     // place to block because the editor isn't ready to use LSP yet anyway.
     pub fn start(server_cmd: &str, server_args: &[&str], workspace_root: &str) -> Self {
-        let mut child = Command::new(server_cmd)
+        let mut server_child = Command::new(server_cmd)
             .args(server_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -74,8 +74,8 @@ impl LspClient {
             .spawn()
             .expect("failed to spawn LSP server");
 
-        let stdout = child.stdout.take().unwrap();
-        let stdin  = child.stdin.take().unwrap();
+        let stdout = server_child.stdout.take().unwrap();
+        let stdin  = server_child.stdin.take().unwrap();
 
         let pending = Default::default();
 
@@ -89,7 +89,7 @@ impl LspClient {
             next_request_id: 1,
             pending,
             send_buf: Vec::with_capacity(64 * 1024), // 64k initial, grows as needed
-            _child: child,
+            _server_child: server_child,
             pending_goto: None,
         };
 
