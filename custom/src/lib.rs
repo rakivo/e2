@@ -24,6 +24,7 @@ use editor::*;
 use editor_macros::{collect_commands, command, export};
 use memmap2::MmapOptions;
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -791,6 +792,993 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
     lister.is_query_dirty = true;
     lister.is_listing_file_entries = true;
     lister.last_seen_cached_dir_generation = u64::MAX;
+}
+
+#[cfg(test)]
+mod indent_tests {
+    use super::*;
+
+    fn do_indent(input: &str) -> Cow<'_, str> {
+        indent_region_impl(input, 0, input.lines().count().saturating_sub(1), 4)
+    }
+
+    fn do_indent_lines(input: &str, start: usize, end: usize) -> Cow<'_, str> {
+        indent_region_impl(input, start, end, 4)
+    }
+
+    #[test]
+    fn test_basic_block() {
+        let input = "\
+fn foo() {
+        let x = 1;
+        let y = 2;
+}";
+        let expected = "\
+fn foo() {
+    let x = 1;
+    let y = 2;
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_closing_brace() {
+        let input = "\
+fn foo() {
+        let x = 1;
+        }";
+        let expected = "\
+fn foo() {
+    let x = 1;
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_method_chain_preserved() {
+        let input = "\
+fn foo() {
+    let x = something
+        .and_then(|x| x)
+        .unwrap();
+}";
+        // method chain relative indent should be preserved
+        let expected = "\
+fn foo() {
+    let x = something
+        .and_then(|x| x)
+        .unwrap();
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_nested() {
+        let input = "\
+fn foo() {
+            if true {
+                let x = 1;
+            }
+}";
+        let expected = "\
+fn foo() {
+    if true {
+        let x = 1;
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_blank_lines_preserved() {
+        let input = "\
+fn foo() {
+        let x = 1;
+
+        let y = 2;
+}";
+        let expected = "\
+fn foo() {
+    let x = 1;
+
+    let y = 2;
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_already_correct() {
+        let input = "\
+fn foo() {
+    let x = 1;
+}";
+        assert_eq!(do_indent(input), input);
+    }
+
+    #[test]
+    fn test_partial_selection() {
+        // Only indent lines 1..=2, leave line 0 alone
+        let input = "\
+fn foo() {
+        let x = 1;
+        let y = 2;
+    let z = 3;
+}";
+        let expected = "\
+fn foo() {
+    let x = 1;
+    let y = 2;
+    let z = 3;
+}";
+        assert_eq!(do_indent_lines(input, 1, 2), expected);
+    }
+
+    #[test]
+    fn test_closure_block() {
+        let input = "\
+fn foo() {
+    vec.iter().map(|x| {
+            let y = x + 1;
+            y
+        }).collect()
+}";
+        let expected = "\
+fn foo() {
+    vec.iter().map(|x| {
+        let y = x + 1;
+        y
+    }).collect()
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_deeply_nested() {
+        let input = "\
+fn foo() {
+                if true {
+                        for i in 0..10 {
+                                let x = i;
+                        }
+                }
+}";
+        let expected = "\
+fn foo() {
+    if true {
+        for i in 0..10 {
+            let x = i;
+        }
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_else_block() {
+        let input = "\
+fn foo() {
+        if true {
+                let x = 1;
+        } else {
+                let y = 2;
+        }
+}";
+        let expected = "\
+fn foo() {
+    if true {
+        let x = 1;
+    } else {
+        let y = 2;
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_chained_closers() {
+        // }).collect() - the }) is a closer followed by more content
+        let input = "\
+fn foo() {
+    let v = vec![1, 2, 3]
+        .iter()
+        .map(|x| {
+                *x + 1
+                }).collect::<Vec<_>>();
+}";
+        let expected = "\
+fn foo() {
+    let v = vec![1, 2, 3]
+        .iter()
+        .map(|x| {
+            *x + 1
+        }).collect::<Vec<_>>();
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_match_block() {
+        let input = "\
+fn foo() {
+        match x {
+                Foo::A => 1,
+                Foo::B => 2,
+        }
+}";
+        let expected = "\
+fn foo() {
+    match x {
+        Foo::A => 1,
+        Foo::B => 2,
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_empty_body() {
+        let input = "\
+fn foo() {
+}";
+        assert_eq!(do_indent(input), input);
+    }
+
+    #[test]
+    fn test_multiple_blank_lines_between_blocks() {
+        let input = "\
+fn foo() {
+        let x = 1;
+
+
+        let y = 2;
+}";
+        let expected = "\
+fn foo() {
+    let x = 1;
+
+
+    let y = 2;
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_struct_definition() {
+        let input = "\
+struct Foo {
+        x: i32,
+        y: i32,
+}";
+        // struct fields - same logic should apply
+        let expected = "\
+struct Foo {
+    x: i32,
+    y: i32,
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_multiline_args() {
+        // opening paren continuation
+        let input = "\
+fn foo() {
+    some_call(
+            arg1,
+            arg2,
+    );
+}";
+        let expected = "\
+fn foo() {
+    some_call(
+        arg1,
+        arg2,
+    );
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_some_stuff() {
+        // opening paren continuation
+        let input = "\
+#[derive(Default, Copy, Clone, Debug)]
+pub struct Cursor {
+    pub char_index:        usize,
+    pub anchor_char_index: Option<usize>,
+        pub preferred_col:     Option<u32>,
+}
+
+impl Cursor {
+        pub fn new() -> Self {
+        Self::default()
+    }
+
+        pub fn set_anchor(&mut self) {
+        self.anchor_char_index = Some(self.char_index);
+    }
+
+        pub fn is_anchor_set(&self) -> bool {
+            self.anchor_char_index.is_some()
+    }\
+";
+
+
+        let expected = "\
+#[derive(Default, Copy, Clone, Debug)]
+pub struct Cursor {
+    pub char_index:        usize,
+    pub anchor_char_index: Option<usize>,
+    pub preferred_col:     Option<u32>,
+}
+
+impl Cursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_anchor(&mut self) {
+        self.anchor_char_index = Some(self.char_index);
+    }
+
+    pub fn is_anchor_set(&self) -> bool {
+        self.anchor_char_index.is_some()
+    }\
+";
+
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_some_other_stuff() {
+        // opening paren continuation
+        let input = "\
+#[command]
+pub fn basic_character(cx: &mut CommandContext) {
+    let Some(c) = (match &cx.event_and_mods.map(|(e, _)| &e.logical_key) {
+        Some(Key::Character(s))           => s.chars().next(),
+            Some(Key::Named(NamedKey::Space)) => Some(' '),
+        _ => None,
+    }) else {
+        return
+    };
+
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+        let cursor = &mut view.cursor;
+    cursor.unset_anchor();
+
+    if matches!(c, '}' | ')' | ']') {  // :Configuration
+            let (line, col) = buf.cursor_line_col(cursor);
+            let line_str = buf.text.line(line as usize);
+        let only_ws = col > 0 && line_str.chars().take(col as usize).all(|c| c == ' ' || c == '\t');
+        if only_ws && col >= 4 {
+            for _ in 0..4 {
+                buf.delete_backward(cursor);
+                }
+        }
+    }
+
+        buf.insert_char(c, cursor);
+}\
+";
+
+
+        let expected = "\
+#[command]
+pub fn basic_character(cx: &mut CommandContext) {
+    let Some(c) = (match &cx.event_and_mods.map(|(e, _)| &e.logical_key) {
+        Some(Key::Character(s))           => s.chars().next(),
+        Some(Key::Named(NamedKey::Space)) => Some(' '),
+        _ => None,
+    }) else {
+        return
+    };
+
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let cursor = &mut view.cursor;
+    cursor.unset_anchor();
+
+    if matches!(c, '}' | ')' | ']') {  // :Configuration
+        let (line, col) = buf.cursor_line_col(cursor);
+        let line_str = buf.text.line(line as usize);
+        let only_ws = col > 0 && line_str.chars().take(col as usize).all(|c| c == ' ' || c == '\t');
+        if only_ws && col >= 4 {
+            for _ in 0..4 {
+                buf.delete_backward(cursor);
+            }
+        }
+    }
+
+    buf.insert_char(c, cursor);
+}\
+";
+
+        assert_eq!(do_indent(input), expected);
+    }
+
+#[test]
+    fn test_where_clause() {
+        let input = "\
+fn foo<T>(x: T) -> T
+where
+    T: Clone + std::fmt::Debug,
+{
+        x.clone()
+}";
+        let expected = "\
+fn foo<T>(x: T) -> T
+where
+    T: Clone + std::fmt::Debug,
+{
+    x.clone()
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_multiline_match() {
+        let input = "\
+fn foo(x: Option<i32>) -> i32 {
+        match x {
+                Some(v) if v > 0 => {
+                        v * 2
+                }
+                Some(v) => v,
+                None => {
+                        eprintln!(\"none\");
+                        0
+                }
+        }
+}";
+        let expected = "\
+fn foo(x: Option<i32>) -> i32 {
+    match x {
+        Some(v) if v > 0 => {
+            v * 2
+        }
+        Some(v) => v,
+        None => {
+            eprintln!(\"none\");
+            0
+        }
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_let_else() {
+        let input = "\
+fn foo(x: Option<i32>) -> i32 {
+        let Some(v) = x else {
+                return 0;
+        };
+        v + 1
+}";
+        let expected = "\
+fn foo(x: Option<i32>) -> i32 {
+    let Some(v) = x else {
+        return 0;
+    };
+    v + 1
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_impl_trait_block() {
+        let input = "\
+impl Foo for Bar {
+        fn method_a(&self) -> i32 {
+                self.x + 1
+        }
+
+        fn method_b(&self) -> bool {
+                self.x > 0
+        }
+}";
+        let expected = "\
+impl Foo for Bar {
+    fn method_a(&self) -> i32 {
+        self.x + 1
+    }
+
+    fn method_b(&self) -> bool {
+        self.x > 0
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_nested_closures() {
+        let input = "\
+fn foo() {
+        let result = outer.map(|x| {
+                        inner.map(|y| {
+                                x + y
+                        }).sum::<i32>()
+                }).collect::<Vec<_>>();
+}";
+        let expected = "\
+fn foo() {
+    let result = outer.map(|x| {
+        inner.map(|y| {
+            x + y
+        }).sum::<i32>()
+    }).collect::<Vec<_>>();
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_macro_with_braces() {
+        let input = "\
+fn foo() {
+        let v = vec![
+                1,
+                2,
+                3,
+        ];
+        println!(\"{:?}\", v);
+}";
+        let expected = "\
+fn foo() {
+    let v = vec![
+        1,
+        2,
+        3,
+    ];
+    println!(\"{:?}\", v);
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_if_let_chain() {
+        let input = "\
+fn foo(a: Option<i32>, b: Option<i32>) {
+        if let Some(x) = a {
+                if let Some(y) = b {
+                        println!(\"{} {}\", x, y);
+                } else {
+                        println!(\"no b\");
+                }
+        }
+}";
+        let expected = "\
+fn foo(a: Option<i32>, b: Option<i32>) {
+    if let Some(x) = a {
+        if let Some(y) = b {
+            println!(\"{} {}\", x, y);
+        } else {
+            println!(\"no b\");
+        }
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_struct_impl_combined() {
+        let input = "\
+pub struct Foo {
+        x: i32,
+        y: String,
+}
+
+impl Foo {
+        pub fn new(x: i32, y: String) -> Self {
+                Self { x, y }
+        }
+
+        pub fn process(&self) -> String {
+                format!(\"{}: {}\", self.x, self.y)
+        }
+}";
+        let expected = "\
+pub struct Foo {
+    x: i32,
+    y: String,
+}
+
+impl Foo {
+    pub fn new(x: i32, y: String) -> Self {
+        Self { x, y }
+    }
+
+    pub fn process(&self) -> String {
+        format!(\"{}: {}\", self.x, self.y)
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_multiline_string_let() {
+        // string contents should not be touched
+        let input = "\
+fn foo() {
+        let s = \"hello\";
+        let t = \"world\";
+}";
+        let expected = "\
+fn foo() {
+    let s = \"hello\";
+    let t = \"world\";
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_attributes_on_methods() {
+        let input = "\
+impl Foo {
+        #[inline(always)]
+        pub fn fast(&self) -> i32 {
+                self.x
+        }
+
+        #[cfg(test)]
+        fn test_helper() {
+                println!(\"hi\");
+        }
+}";
+        let expected = "\
+impl Foo {
+    #[inline(always)]
+    pub fn fast(&self) -> i32 {
+        self.x
+    }
+
+    #[cfg(test)]
+    fn test_helper() {
+        println!(\"hi\");
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_return_early() {
+        let input = "\
+fn foo(x: i32) -> i32 {
+        if x < 0 {
+                return -1;
+        }
+        if x == 0 {
+                return 0;
+        }
+        x + 1
+}";
+        let expected = "\
+fn foo(x: i32) -> i32 {
+    if x < 0 {
+        return -1;
+    }
+    if x == 0 {
+        return 0;
+    }
+    x + 1
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_tuple_struct_and_impl() {
+        let input = "\
+pub struct Foo(i32, i32);
+
+impl Foo {
+        pub fn sum(&self) -> i32 {
+                self.0 + self.1
+        }
+}";
+        let expected = "\
+pub struct Foo(i32, i32);
+
+impl Foo {
+    pub fn sum(&self) -> i32 {
+        self.0 + self.1
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_chained_methods_with_args() {
+        let input = "\
+fn foo() {
+    let result = some_iter
+        .filter(|x| x.is_valid())
+        .map(|x| x.transform())
+        .fold(0, |acc, x| acc + x);
+}";
+        let expected = "\
+fn foo() {
+    let result = some_iter
+        .filter(|x| x.is_valid())
+        .map(|x| x.transform())
+        .fold(0, |acc, x| acc + x);
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_nested_if_match() {
+        let input = "\
+fn foo(x: Option<i32>) {
+        if true {
+                match x {
+                        Some(v) => {
+                                println!(\"{}\", v);
+                        }
+                        None => {}
+                }
+        }
+}";
+        let expected = "\
+fn foo(x: Option<i32>) {
+    if true {
+        match x {
+            Some(v) => {
+                println!(\"{}\", v);
+            }
+            None => {}
+        }
+    }
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_closure_as_arg() {
+        let input = "\
+fn foo() {
+        register(\"name\", |cx| {
+                cx.do_thing();
+                cx.do_other_thing();
+        });
+}";
+        let expected = "\
+fn foo() {
+    register(\"name\", |cx| {
+        cx.do_thing();
+        cx.do_other_thing();
+    });
+}";
+        assert_eq!(do_indent(input), expected);
+    }
+
+    #[test]
+    fn test_multiple_top_level_fns() {
+        let input = "\
+fn foo() {
+        let x = 1;
+}
+
+fn bar() {
+        let y = 2;
+}
+
+fn baz() {
+        let z = 3;
+}";
+        let expected = "\
+fn foo() {
+    let x = 1;
+}
+
+fn bar() {
+    let y = 2;
+}
+
+fn baz() {
+    let z = 3;
+}";
+
+        assert_eq!(do_indent(input), expected);
+    }
+}
+
+/// Indent lines [start_line..=end_line] in `text`.
+/// tab_width is used only for tab->spaces expansion when measuring indent.
+pub fn indent_region_impl(text: &str, start_line: usize, end_line: usize, indent_size: usize) -> Cow<'_, str> {
+    fn count_indent(line: &str) -> usize {
+        line.chars().take_while(|c| *c == ' ' || *c == '\t').count()
+    }
+
+    // Strip trailing line comments before checking what a line opens/closes with.
+    // Naive find("//") is fine for indentation purposes.
+    fn strip_comment(l: &str) -> &str {
+        if let Some(idx) = l.find("//") { &l[..idx] } else { l }
+    }
+
+    fn is_bare_brace(l: &str) -> bool {
+        strip_comment(l).trim() == "{"
+    }
+
+    // Only dot-chains are treated as continuations; anything else is
+    // just wrong indentation that should snap to current_expected.
+    fn is_continuation(l: &str) -> bool {
+        matches!(
+            l.chars().find(|c| !c.is_whitespace()),
+            Some('.')
+        )
+    }
+
+    let lines = text.lines().collect::<Vec<_>>(); // @Memory @Speed
+    if lines.is_empty() {
+        return Cow::Borrowed(text)
+    }
+
+    let end_line = end_line.min(lines.len().saturating_sub(1));
+
+    let line_opens = |l: &str| {
+        let stripped = strip_comment(l);
+        stripped.trim() == "where" || matches!(
+            stripped.chars().filter(|c| !c.is_whitespace()).last(),
+            Some('{') | Some('(') | Some('[')
+        )
+    };
+    let line_closes = |l: &str| matches!(
+        l.chars().find(|c| !c.is_whitespace()),
+        Some('}') | Some(')') | Some(']')
+    );
+
+    let first_line_is_opener = start_line == 0
+        && count_indent(lines[0]) == 0
+        && line_opens(lines[0]);
+    let reindent_start = if first_line_is_opener { 1 } else { start_line };
+    if reindent_start > end_line {
+        return Cow::Borrowed(text)
+    }
+
+    let context_line = if first_line_is_opener {
+        Some(lines[0])
+    } else {
+        (0..reindent_start).rev()
+            .find(|&l| lines[l].chars().any(|c| !c.is_whitespace()))
+            .map(|l| lines[l])
+    };
+
+    let mut current_expected = match context_line {
+        None => 0,
+        Some(cl) => {
+            let ci = count_indent(cl);
+            if line_opens(cl) { ci + indent_size } else { ci }
+        }
+    };
+
+    //
+    // Stack stores (opener_visual_indent, current_expected_to_restore).
+    // When we see a closer we pop to find where to place it and what
+    // current_expected becomes, decoupling visual position from bracket depth.
+    //
+    let mut stack: Vec<(usize, usize)> = Default::default();  // @Memory @Speed
+    if first_line_is_opener {
+        stack.push((0, 0));
+    }
+
+    let mut last_old   = context_line.map(count_indent).unwrap_or(0);
+    let mut last_new    = last_old;
+    let mut last_opened = context_line.map(|cl| line_opens(cl)).unwrap_or(false);
+
+    let mut continuation_indent = None;
+
+    let mut out = String::with_capacity(text.len());  // @Memory @Speed
+    for (i, &line) in lines.iter().enumerate() {
+        if i > 0 { out.push('\n') }
+
+        let in_range = i >= reindent_start && i <= end_line;
+        let is_blank = line.chars().all(|c| c.is_whitespace());
+
+        if !in_range || is_blank {
+            out.push_str(line);
+            continue;
+        }
+
+        let old    = count_indent(line);
+        let closes = line_closes(line) || is_bare_brace(line);
+        let opens  = line_opens(line);
+
+        if closes {
+            continuation_indent = None;
+
+            let new_indent = if let Some((opener_indent, restore)) = stack.pop() {
+                current_expected = restore;
+                opener_indent
+            } else {
+                current_expected = current_expected.saturating_sub(indent_size);
+                current_expected
+            };
+
+            for _ in 0..new_indent { out.push(' ') }
+            out.push_str(line.trim_start());
+
+            if opens {
+                stack.push((new_indent, current_expected));
+                current_expected = new_indent + indent_size;
+            }
+
+            last_old    = old;
+            last_new    = new_indent;
+            last_opened = opens;
+            continue;
+        }
+
+        //
+        // Non-closer: dot-continuation preserves relative offset, everything
+        // else snaps to the bracket-tracked level.
+        //
+        let new_indent = if is_continuation(line) && !last_opened {
+            *continuation_indent.get_or_insert_with(|| {
+                (last_new as i32 + old as i32 - last_old as i32).max(0) as usize
+            })
+        } else {
+            continuation_indent = None;
+            current_expected
+        };
+
+        for _ in 0..new_indent { out.push(' ') }
+        out.push_str(line.trim_start());
+
+        if opens {
+            stack.push((new_indent, current_expected));
+            current_expected = new_indent + indent_size;
+        }
+
+        last_old   = old;
+        last_new    = new_indent;
+        last_opened = opens;
+    }
+
+    if text.ends_with('\n') { out.push('\n') }
+    Cow::Owned(out)
+}
+
+#[command]
+pub fn indent_region(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    let cursor_char = view.cursor.char_index;
+
+    let (start_char, end_char) = if let Some(anchor) = view.cursor.anchor_char_index {
+        let c = view.cursor.char_index;
+        if anchor <= c { (anchor, c) } else { (c, anchor) }
+    } else {
+        let line  = buf.text.char_to_line(view.cursor.char_index);
+        let start = buf.text.line_to_char(line);
+        let end   = buf.text.line_to_char((line + 1).min(buf.text.len_lines()));
+        (start, end)
+    };
+
+    let start_line = buf.text.char_to_line(start_char);
+    let end_line   = buf.text.char_to_line(end_char);
+
+    let total_bytes = buf.text.len_bytes();
+    buf.flatten_rope_into_scratch(0, total_bytes);
+
+    view.cursor.unset_anchor();
+
+    let text = &buf.scratch_space_to_flatten_rope_into;
+    let reindented = indent_region_impl(
+        text, start_line, end_line, 4  // :Configuration
+    );
+    if &reindented == text {
+        return;
+    }
+
+    let cursor_line = buf.text.char_to_line(cursor_char);
+    let cursor_col  = cursor_char - buf.text.line_to_char(cursor_line);
+
+    buf.text     = reindented.into();
+    buf.is_dirty = true;
+
+    let cursor_line = cursor_line.min(buf.text.len_lines().saturating_sub(1));
+    let line_start  = buf.text.line_to_char(cursor_line);
+    let line_len    = buf.text.line(cursor_line).len_chars();
+    view.cursor.char_index = (line_start + cursor_col).min(line_start + line_len.saturating_sub(1));
 }
 
 #[command]
@@ -1613,7 +2601,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         let view = &editor.views[view_id];
         let panel_color = Color::hex(0x1a1a2e);
         if Some(editor.active_panel) == view.panel_id() { // @PaletteRefactor
-            (panel_color, Some(Color::hex(0x5a4a2a)))  // active: gold border
+            (panel_color, Some(Color::hex(0x312815)))  // active: gold border
         } else {
             (panel_color.darken(0.5), None)            // inactive: no border
         }
