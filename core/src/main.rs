@@ -56,8 +56,6 @@ struct App {
 
     editor: Editor,
 
-    refresh_rate_millihertz: u32,
-
     command_table: CommandTable,
     keymap:        Keymap,
 
@@ -88,7 +86,6 @@ impl App {
             keymap: Keymap::empty(&mut command_table),
             command_table,
 
-            refresh_rate_millihertz: u32::MAX,
             mods: Default::default(),
         }
     }
@@ -161,7 +158,7 @@ impl ApplicationHandler<UserEvent> for App {
         editor.win_w = gpu.win_w;
         editor.win_h = gpu.win_h;
 
-        self.refresh_rate_millihertz = win.current_monitor()
+        editor.refresh_rate_millihertz = win.current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
             .unwrap_or(60*1000); // 60Hz
 
@@ -720,10 +717,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 let t1 = Instant::now();
-                {
-                    render_messager(gpu, editor);
-                    draw_metrics(editor, gpu, self.refresh_rate_millihertz);
-                }
+                render_messager(gpu, editor);
                 editor.render_us_acc += t1.elapsed().as_micros() as f32;
 
                 for buffer in editor.buffers.values_mut() {

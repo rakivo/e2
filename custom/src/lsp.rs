@@ -42,7 +42,9 @@ impl PendingRequest {
 
 pub type RequestId = u64;
 
-pub struct LspClient {
+pub struct LspClient(Option<LspClientInner>);
+
+struct LspClientInner {
     stdin: ChildStdin,
     next_request_id: RequestId,
 
@@ -58,10 +60,14 @@ pub struct LspClient {
     // Keep child alive. Dropping it would close stdin and kill the server.
     _server_child: Child,
 
-    pub pending_goto: Option<PendingRequest>,
+    pending_goto: Option<PendingRequest>,
 }
 
 impl LspClient {
+    pub fn disabled() -> Self {
+        Self(None)
+    }
+
     // Spawn the LSP server process and send initialize/initialized.
     // Blocks until the server responds to initialize - this is the right
     // place to block because the editor isn't ready to use LSP yet anyway.
@@ -72,19 +78,19 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("failed to spawn LSP server");
+            .expect("Failed to spawn LSP server");
 
         let stdout = server_child.stdout.take().unwrap();
         let stdin  = server_child.stdin.take().unwrap();
 
-        let pending = Default::default();
+        let pending: Arc<Mutex<HashMap<RequestId, Sender<Value>>>> = Default::default();
 
         {
             let pending = Arc::clone(&pending);
             std::thread::spawn(move || reader_thread(stdout, pending));
         }
 
-        let mut client = Self {
+        let mut inner = LspClientInner {
             stdin,
             next_request_id: 1,
             pending,
@@ -93,13 +99,16 @@ impl LspClient {
             pending_goto: None,
         };
 
-        client.initialize(workspace_root);
-        client
+        inner.initialize(workspace_root);
+        Self(Some(inner))
     }
+
+    #[inline] fn inner(&mut self) -> Option<&mut LspClientInner> { self.0.as_mut() }
 
     // Writes the file text into `send_buf` with in-place JSON escaping
     pub fn did_open_buf(&mut self, path: &str, text: &str) {
-        self.send_buf.clear();
+        let Some(c) = self.inner() else { return };
+        c.send_buf.clear();
 
         let uri  = file_uri(path);
         let lang = lang_id(path);
@@ -110,20 +119,21 @@ impl LspClient {
         //   "params":
         //   {"textDocument":{"uri":"...","languageId":"...","version":1,"text":"<TEXT>"}}
         // }
-        write!(self.send_buf,
+        write!(c.send_buf,
                "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\",\"languageId\":\"{}\",\"version\":1,\"text\":",
                uri, lang
         ).unwrap();
-        self.send_buf.push(b'"');
-        write_json_string(text, &mut self.send_buf);
-        self.send_buf.extend_from_slice(b"\"}}}"); // close: textDocument, params, root
+        c.send_buf.push(b'"');
+        write_json_string(text, &mut c.send_buf);
+        c.send_buf.extend_from_slice(b"\"}}}"); // close: textDocument, params, root
 
-        _ = flush_send_buf(&mut self.stdin, &self.send_buf);
+        _ = flush_send_buf(&mut c.stdin, &c.send_buf);
     }
 
     #[inline]
     pub fn did_change_buf(&mut self, path: &str, text: &str, version: i32) {
-        self.send_buf.clear();
+        let Some(c) = self.inner() else { return };
+        c.send_buf.clear();
 
         let uri = file_uri(path);
 
@@ -132,21 +142,22 @@ impl LspClient {
         //     "method":"textDocument/didChange",
         //     "params": {"textDocument":{"uri":"...","version":N},"contentChanges":[{"text":"<TEXT>"}]}
         // }
-        _ = write!(self.send_buf,
+        _ = write!(c.send_buf,
                "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\",\"version\":{}}},\"contentChanges\":[{{\"text\":",
                uri, version
         );
-        self.send_buf.push(b'"');
-        write_json_string(text, &mut self.send_buf);
-        self.send_buf.extend_from_slice(b"\"}]}}"); // close: contentChanges obj, array, params, root
+        c.send_buf.push(b'"');
+        write_json_string(text, &mut c.send_buf);
+        c.send_buf.extend_from_slice(b"\"}]}}"); // close: contentChanges obj, array, params, root
 
-        _ = flush_send_buf(&mut self.stdin, &self.send_buf);
+        _ = flush_send_buf(&mut c.stdin, &c.send_buf);
     }
 
     #[allow(unused)]
     #[inline]
     pub fn did_close(&mut self, path: &str) {
-        self.notify("textDocument/didClose", json!({
+        let Some(c) = self.inner() else { return };
+        c.notify("textDocument/didClose", json!({
             "textDocument": { "uri": file_uri(path) }
         }));
     }
@@ -158,35 +169,41 @@ impl LspClient {
         line:      u32,
         character: u32,
     ) {
-        let rq = self.request_async("textDocument/definition", json!({
+        let Some(c) = self.inner() else { return };
+        let rq = c.request_async("textDocument/definition", json!({
             "textDocument": { "uri": file_uri(path) },
             "position": { "line": line, "character": character }
         }));
-
-        self.pending_goto = Some(rq);
+        c.pending_goto = Some(rq);
     }
 
     #[inline]
     pub fn poll_goto_definition(&mut self) -> Option<Location> {
-        let val = self.pending_goto.as_ref()?.poll()?;
-        self.pending_goto = None;
+        let c = self.inner()?;
+        let val = c.pending_goto.as_ref()?.poll()?;
+        c.pending_goto = None;
         parse_location(val)
     }
 
     #[inline]
     pub fn goto_definition_is_some(&self) -> bool {
-        self.pending_goto.as_ref().map_or(false, |g| g.is_empty())
+        self.0.as_ref()
+            .and_then(|c| c.pending_goto.as_ref())
+            .map_or(false, |g| g.is_empty())
     }
 
     // Call this before dropping the client.
     // Blocks on the shutdown response - that is correct per the LSP spec.
     #[inline]
     pub fn shutdown_blocking(&mut self) {
-        let req = self.request_async("shutdown", json!(null));
+        let Some(c) = self.inner() else { return };
+        let req = c.request_async("shutdown", json!(null));
         req.wait();
-        self.notify("exit", json!(null));
+        c.notify("exit", json!(null));
     }
+}
 
+impl LspClientInner {
     #[inline]
     fn initialize(&mut self, root: &str) {
         let root_uri = format!("file://{root}");

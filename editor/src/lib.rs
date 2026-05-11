@@ -2006,6 +2006,8 @@ pub struct Editor {
     pub frame_count:     u32,
     pub fps:             f32,
 
+    pub refresh_rate_millihertz: u32,
+
     pub last_fps_time:   Instant,
     pub last_frame_time: Instant,
     pub last_input_time: Instant,
@@ -2082,6 +2084,7 @@ impl Editor {
             logger_config,
             hooks: Default::default(),
             last_input_time: Instant::now(),
+            refresh_rate_millihertz: u32::MAX,
             win_h: 0.0,
             win_w: 0.0,
             root_buffer,
@@ -2224,7 +2227,7 @@ impl Editor {
         win.set_cursor_visible(true);
     }
 
-    pub fn view_and_buffer(&mut self, view_id: ViewId) -> (&View, &Buffer) {
+    pub fn view_and_buffer(&self, view_id: ViewId) -> (&View, &Buffer) {
         let buf_id = self.views[view_id].buffer_id;
         let view   = &self.views[view_id];
         let buffer = &self.buffers[buf_id];
@@ -2243,7 +2246,7 @@ impl Editor {
         self.view_and_buffer_mut(view_id)
     }
 
-    pub fn active_view_and_buffer(&mut self) -> (&View, &Buffer) {
+    pub fn active_view_and_buffer(&self) -> (&View, &Buffer) {
         let view_id = self.active_view_id();
         self.view_and_buffer(view_id)
     }

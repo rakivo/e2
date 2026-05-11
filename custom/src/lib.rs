@@ -132,6 +132,8 @@ custom_data! {
             // If you know your types are gonna use virtual dispatch, put them inside the `transient {}` block below.
             //
 
+            do_draw_metrics: bool,
+
             lister: Lister,
             commander: Commander,
 
@@ -467,11 +469,40 @@ pub fn basic_character(cx: &mut CommandContext) {
 }
 
 #[command]
+pub fn toggle_draw_metrics(cx: &mut CommandContext) {
+    *cx.editor.do_draw_metrics_mut() = !cx.editor.do_draw_metrics();
+}
+
+#[command]
+pub fn start_language_server(cx: &mut CommandContext) {
+    *cx.editor.lsp_mut() = LspClient::start("rust-analyzer", &[], ".");
+
+    cx.editor.messager.push("Started language server", cx.gpu);
+}
+
+#[command]
+pub fn kill_language_server(cx: &mut CommandContext) {
+    *cx.editor.lsp_mut() = LspClient::disabled();
+
+    cx.editor.messager.push("Killed language server", cx.gpu);
+}
+
+#[command]
 pub fn tab(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     let cursor = &mut view.cursor;
     cursor.unset_anchor();
     buf.insert_literal("    ", &mut view.cursor);
+}
+
+#[command]
+pub fn recenter_top_bottom(cx: &mut CommandContext) {
+    let line_h = cx.editor.line_h();
+    let (view, buf) = cx.editor.active_view_and_buffer();
+    let (line, _) = buf.cursor_line_col(&view.cursor);
+    let rect = cx.editor.panels[view.panel_id].rect;
+    let (view, _buf) = cx.editor.active_view_and_buffer_mut();
+    view.scroll_to_cursor_centered(line, line_h, rect);
 }
 
 #[command]
@@ -1957,6 +1988,7 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
 
     cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build")); // nocheckin
     cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition")); // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom")); // nocheckin
     cx.keymap.bind(KeyCombo::char_mods('\\', Mods { alt: true, ctrl: true, ..Default::default() }), cx.command_table.intern("indent_region")); // nocheckin
 
     setup_hooks(cx);
@@ -1972,10 +2004,12 @@ fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
     }
 
     editor.set_custom_data(CustomData {
+        do_draw_metrics: false,
+
         lister: Lister::new(),
         commander: Commander::new(),
 
-        lsp: LspClient::start("rust-analyzer", &[], ".")
+        lsp: LspClient::disabled()
     });
     editor.set_custom_transient_data(CustomDataTransient {});
 
@@ -2644,6 +2678,12 @@ fn setup_hooks(cx: &mut CommandContext) {
             {
                 render_lister_foreground(gpu, editor);
             }
+            editor.render_us_acc += t1.elapsed().as_micros() as f32;
+        }
+
+        if *editor.do_draw_metrics() {
+            let t1 = Instant::now();
+            draw_metrics(editor, gpu, editor.refresh_rate_millihertz);
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
         }
 
