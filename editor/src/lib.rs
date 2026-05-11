@@ -449,6 +449,8 @@ macro_rules! define_base_and_scale {
     };
 }
 
+pub const ADDITIONAL_BOTTOM_SCROLL_SPACE: f32 = 50.0;
+
 define_base_and_scale! {
     const BASE_LINE_HEIGHT:   f32 = 16.35;
     const BASE_FONT_SIZE:     f32 = 15.0;
@@ -838,7 +840,11 @@ pub fn build_text_layout(
         first_line = first_line.saturating_sub(prelex_line_count);
     }
 
-    let line_count = last_line.max(first_line) - first_line; // guard just in case
+    let total_lines = editor.buffers[buffer_id].text.len_lines() as u32;
+    first_line = first_line.min(total_lines);
+    last_line  = last_line.min(total_lines);
+
+    let line_count = last_line.max(first_line) - first_line;
 
     //
     // @Speed @Note:
@@ -1818,7 +1824,7 @@ impl View {
     #[inline]
     pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top    = line as f32 * line_h;
-        let cursor_bottom = cursor_top + line_h;
+        let cursor_bottom = cursor_top + line_h + ADDITIONAL_BOTTOM_SCROLL_SPACE;
 
         // Only scroll when cursor is fully off screen - no margin
         if cursor_top < self.scroll {
@@ -2148,6 +2154,22 @@ impl Editor {
         self.recompute_buffer_display_names();
 
         buffer_id
+    }
+
+    #[inline]
+    pub fn max_scroll_of_impl(&self, line_count: u32, rect: Rect) -> f32 {
+        ((line_count as f32 * self.line_h()) - rect.h).max(0.0) + ADDITIONAL_BOTTOM_SCROLL_SPACE
+    }
+
+    #[inline]
+    pub fn max_scroll_of(&self, view_id: ViewId) -> f32 {
+        let (view, buf) = self.view_and_buffer(view_id);
+        let panel_id = view.panel_id().unwrap();
+
+        let line_count = buf.text.len_lines();
+        let rect = self.panel(panel_id).rect;
+
+        self.max_scroll_of_impl(line_count as _, rect)
     }
 
     #[inline]
@@ -2504,6 +2526,8 @@ impl Editor {
             self.most_recently_used_buffers.remove(pos);
         }
         self.most_recently_used_buffers.insert(0, id);
+
+        self.buffers[id].prelex_the_whole_file();
     }
 
     pub fn set_active_panel(&mut self, panel_id: PanelId) {
@@ -3117,7 +3141,7 @@ pub fn force_layouts_from_all_views_to_rebuild(editor: &mut Editor) {
     }
 }
 
-pub fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
+pub fn scroll_page(editor: &mut Editor, direction: i32) {
     let line_h   = editor.line_h();
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
@@ -3144,7 +3168,7 @@ pub fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     // Only scroll if cursor is now outside the visible region
     let scroll     = editor.views[view_id].scroll;
     let cursor_y   = new_line as f32 * line_h;
-    let max_scroll = ((total as f32 * line_h) - rect.h).max(0.0);
+    let max_scroll = editor.max_scroll_of(view_id);
 
     let new_scroll = if cursor_y < scroll {
         // Cursor above viewport, scroll up to show it

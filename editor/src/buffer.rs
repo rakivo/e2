@@ -68,9 +68,10 @@ pub struct Buffer {
     pub last_delete: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
 
     pub scratch_space_to_flatten_rope_into: String,
+    pub internal_extend_cache_to_scratch:   Vec<(u32, LexState)>,
 
     pub visible_tokens: Vec<Token>,
-    pub comment_cache:  Vec<(usize, LexState)>, // (byte_offset, state_at_that_offset)
+    pub comment_cache:  Vec<(u32, LexState)>, // (byte_offset, state_at_that_offset)
 
     pub currently_animated_deletions:  SmallVec<[AnimatedDeletion;  2]>,
 
@@ -84,17 +85,23 @@ pub struct Buffer {
 impl Buffer {
     pub fn new() -> Self {
         Buffer {
+            internal_extend_cache_to_scratch: Vec::with_capacity(1024), // 8KB
+
             next_paste_id: 1,
             next_copy_id:  PASTE_ANIMATION_MAX_ID as u8 + 1, // starts at 8
+
             ..Default::default()
         }
+    }
+
+    pub fn prelex_the_whole_file(&mut self) {
+        self.extend_cache_to(self.text.len_bytes());
     }
 
     pub fn from_file(path: impl Into<Box<Path>>) -> std::io::Result<Self> {
         let path = path.into();
 
         let text = Rope::from_reader(std::fs::File::open(&path)?)?;
-
         Ok(Self { text, path: Some(path), ..Self::new() })
     }
 
@@ -289,32 +296,96 @@ impl Buffer {
 
     fn invalidate_cache_from_char(&mut self, char_index: usize) {
         let byte = self.text.char_to_byte(char_index);
-        let keep = self.comment_cache.partition_point(|(b, _)| *b < byte);
+        let keep = self.comment_cache.partition_point(|(b, _)| *b < byte as u32);
+        // Currently correct, keeps entries strictly before the edit byte.
+        // But if an entry lands exactly ON the edit byte, it's stale and must go.
+        // partition_point with < already excludes the == case, so this is fine.
         self.comment_cache.truncate(keep);
     }
 
     fn extend_cache_to(&mut self, target_byte: usize) {
-        let (resume_byte, resume_state) = self.comment_cache
-            .last()
-            .copied()
-            .unwrap_or((0, LexState::Normal));
+        const CHECKPOINT_INTERVAL: u32 = 1024;  // nocheckin @Tune
 
-        if resume_byte > target_byte { return; }
+        let target_byte = target_byte as u32;
 
-        // Flatten to contiguous buffer to avoid chunk-boundary mid-token splits
-        self.flatten_rope_into_scratch(resume_byte, target_byte);
+        let start_index = self.comment_cache
+            .partition_point(|(b, _)| *b <= target_byte)
+            .saturating_sub(1);
 
-        let end_state = lex_from(&self.scratch_space_to_flatten_rope_into, resume_byte, resume_state, None);
-        self.comment_cache.push((target_byte, end_state));
+        let (
+            mut resume_byte, mut resume_state
+        ) = if self.comment_cache.is_empty()
+            || self.comment_cache[start_index].0 > target_byte
+        {
+            (0, LexState::Normal)
+        } else {
+            self.comment_cache[start_index]
+        };
+
+        if resume_byte >= target_byte {
+            return;
+        }
+
+        //
+        // Insert checkpoints from resume_byte up to target_byte
+        // Find insertion point to keep cache sorted
+        //
+        let insert_at = self.comment_cache
+            .partition_point(|(b, _)| *b <= resume_byte);
+
+        self.internal_extend_cache_to_scratch.clear();
+        while resume_byte < target_byte {
+            let chunk_end = (resume_byte + CHECKPOINT_INTERVAL).min(target_byte);
+
+            self.flatten_rope_into_scratch(resume_byte as _, chunk_end as _);
+            resume_state = lex_from(
+                &self.scratch_space_to_flatten_rope_into,
+                resume_byte as _,
+                resume_state,
+                None,
+            );
+
+            resume_byte = chunk_end;
+            self.internal_extend_cache_to_scratch.push((resume_byte as _, resume_state));
+        }
+
+        self.comment_cache.splice(
+            insert_at..insert_at,
+            self.internal_extend_cache_to_scratch.iter().copied()
+        );
     }
 
     fn state_at_byte(&mut self, target_byte: usize) -> LexState {
         self.extend_cache_to(target_byte);
+
+        let target_byte = target_byte as u32;
+
         let index = self.comment_cache
-            .partition_point(|(b, _)| *b <= target_byte)
+            .partition_point(|(b, _)| *b < target_byte)
             .saturating_sub(1);
 
-        self.comment_cache[index].1
+        let (checkpoint_byte, checkpoint_state) = self.comment_cache
+            .get(index)
+            .copied()
+            .unwrap_or((0, LexState::Normal));
+
+        if checkpoint_byte > target_byte {
+            // extend_cache_to should have prevented this, but be safe
+            return LexState::Normal;
+        }
+
+        if checkpoint_byte == target_byte {
+            return checkpoint_state;
+        }
+
+        // Lex forward from checkpoint to exact target byte
+        self.flatten_rope_into_scratch(checkpoint_byte as _, target_byte as _);
+        lex_from(
+            &self.scratch_space_to_flatten_rope_into,
+            checkpoint_byte as _,
+            checkpoint_state,
+            None,
+        )
     }
 
     pub fn cursor_line_col(&self, cursor: &Cursor) -> (u32, u32) {
@@ -342,6 +413,8 @@ impl Buffer {
         let line_start  = self.text.line_to_char(cursor_line);
         let line_len    = self.text.line(cursor_line).len_chars();
         cursor.char_index = (line_start + cursor_col).min(line_start + line_len.saturating_sub(1));
+
+        self.invalidate_cache_from_char(0); // @Speed
     }
 
     pub fn insert_char(&mut self, c: char, cursor: &mut Cursor) {

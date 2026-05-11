@@ -230,9 +230,9 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<f32> {
     }
 
     let result = std::fs::write(path, &out);
-    let time   = t0.elapsed().as_micros() as f32;
+    let time   = t0.elapsed().as_millis() as f32;
     if result.is_ok() {
-        println!("[Saved session in {time}us]");
+        println!("[Saved session in {time}ms]");
     }
     result.map(|_| time)
 }
@@ -320,7 +320,7 @@ pub fn load_session<'a>(data: &'a [u8]) -> Option<Session<'a>> {
         chunks.push(SessionChunk { id, data });
     }
 
-    println!("[Loaded session in {time}us]", time = t0.elapsed().as_micros() as f32);
+    println!("[Loaded session in {time}ms]", time = t0.elapsed().as_millis() as f32);
 
     Some(Session { cwd, leaves, active_index, root, buffers, chunks, views })
 }
@@ -404,8 +404,8 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
         editor.buffers[buf_id].is_dirty          = true;
 
         {
-            let rect       = editor.panels[editor.active_panel].rect;
-            let max_scroll = ((total_lines as f32 * line_h) - rect.h).max(0.0);
+            let rect = editor.panels[editor.active_panel].rect;
+            let max_scroll = editor.max_scroll_of_impl(total_lines, rect);
             let scroll     = (sv.scroll_anim / line_h).round() * line_h;
             let scroll     = scroll.clamp(0.0, max_scroll);
 
@@ -459,8 +459,8 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
         }
     }
 
-    let time = t0.elapsed().as_micros() as f32;
-    println!("[Applied session in {time}us]");
+    let time = t0.elapsed().as_millis() as f32;
+    println!("[Applied session in {time}ms]");
     editor.did_we_apply_any_sessions = true;
 
     time

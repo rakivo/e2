@@ -39,7 +39,7 @@ fn run_custom_layer_initialization(cx: &mut CommandContext, loaded: &mut LoadedL
     (loaded.init)(cx, loaded);
 
 
-    eprintln!("[Ran custom_layer_init in {}us]", t0.elapsed().as_micros() as f32);
+    eprintln!("[Ran custom_layer_init in {}ms]", t0.elapsed().as_millis() as f32);
 
     post_custom_layer_initialization(cx.editor);
 }
@@ -468,7 +468,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let old_scroll = editor.views[view_id].scroll;
                 let new_scroll = (old_scroll - dy * 4.55).max(0.0);
-                let max_scroll = ((total as f32 * line_h) - rect.h).max(0.0);
+                let max_scroll = editor.max_scroll_of(view_id);
                 editor.views[view_id].scroll = new_scroll.min(max_scroll);
 
                 // Drag cursor if it went off screen

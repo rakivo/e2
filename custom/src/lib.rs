@@ -170,12 +170,12 @@ pub fn move_down(cx: &mut CommandContext) {
 
 #[command]
 pub fn move_page_up(cx: &mut CommandContext) {
-    scroll_page(cx.editor, cx.gpu, -1);
+    scroll_page(cx.editor, -1);
 }
 
 #[command]
 pub fn move_page_down(cx: &mut CommandContext) {
-    scroll_page(cx.editor, cx.gpu, 1);
+    scroll_page(cx.editor, 1);
 }
 
 #[command]
@@ -1840,7 +1840,7 @@ pub fn indent_region_impl(text: &str, start_line: usize, end_line: usize, indent
 }
 
 #[command]
-pub fn indent_region(cx: &mut CommandContext) {
+pub fn indent_region(cx: &mut CommandContext) {  // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     let (start_char, end_char) = if let Some(anchor) = view.cursor.anchor_char_index {
@@ -1857,7 +1857,7 @@ pub fn indent_region(cx: &mut CommandContext) {
     let end_line   = buf.text.char_to_line(end_char);
 
     let total_bytes = buf.text.len_bytes();
-    buf.flatten_rope_into_scratch(0, total_bytes);
+    buf.flatten_rope_into_scratch(0, total_bytes);  // :BufferScratch
 
     view.cursor.unset_anchor();
 
@@ -1877,17 +1877,16 @@ pub fn save_session(cx: &mut CommandContext) {
     let path = default_session_path();
     let result = editor::session::save_session(cx.editor, &path);
 
+    let path = pretty_path(&path);
     match result {
         Ok(time) => {
-            let path = pretty_path(&path);
-            let message = format!("Saved session in {time}us at '{path}'");
+            let message = format!("Saved session in {time}ms at '{path}'");
             cx.editor.messager.push(&message, cx.gpu);
 
             cx.editor.audioer.play_startup_sound();
         }
 
         Err(e) => {
-            let path = pretty_path(&path);
             let message = format!("Couldn't save session at '{path}': {e}");
             cx.editor.messager.push(&message, cx.gpu);
         }
@@ -1970,7 +1969,7 @@ pub static COMMANDS: &[CommandEntry] = collect_commands!();
 
 #[export]
 pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
-    eprintln!("[Loaded commands count]: {}", loaded.commands.len());
+    eprintln!("[Loaded command count]: {}", loaded.commands.len());
 
     *cx.command_table = CommandTable::from_commands(loaded.commands);
     *cx.keymap = Keymap::default_keymap(&mut cx.command_table);
@@ -2015,7 +2014,7 @@ fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
         let time = apply_session(editor, session);
 
         let pretty = pretty_path(&session_path);
-        let message = format!("Applied session in {time}us from '{pretty}'");
+        let message = format!("Applied session in {time}ms from '{pretty}'");
         editor.messager.push(&message, gpu);
 
         did_we_apply_any_sessions = true;

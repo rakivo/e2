@@ -156,7 +156,7 @@ pub fn lex_from(
                 let c = bytes[p];
 
                 // :Tag  /  @Tag
-                if ((c == b':' && bytes.get(p-1) != Some(&b':')) || c == b'@')
+                if ((c == b':' && p > 0 && bytes.get(p-1) != Some(&b':')) || c == b'@')
                     && p + 1 < seg_end
                     && bytes[p + 1].is_ascii_uppercase()
                 {
@@ -564,7 +564,7 @@ pub fn lex_from(
                 // Punctuation
                 i += 1;
 
-                if ((b == b':' && bytes.get(i-2) != Some(&b':')) || b == b'@')
+                if ((b == b':' && i > 1 && bytes.get(i-2) != Some(&b':')) || b == b'@')
                     && i < len
                     && bytes[i].is_ascii_uppercase()
                 {
