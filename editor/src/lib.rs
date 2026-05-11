@@ -1824,7 +1824,7 @@ impl View {
     #[inline]
     pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top    = line as f32 * line_h;
-        let cursor_bottom = cursor_top + line_h + ADDITIONAL_BOTTOM_SCROLL_SPACE;
+        let cursor_bottom = cursor_top + line_h + (ADDITIONAL_BOTTOM_SCROLL_SPACE/2.0);
 
         // Only scroll when cursor is fully off screen - no margin
         if cursor_top < self.scroll {
