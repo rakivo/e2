@@ -159,20 +159,54 @@ pub struct Mods {  // @Memory: Make Mods bitflags
 }
 
 impl Mods {
-    pub fn ctrl()  -> Self { Self { ctrl:  true, ..Default::default() } }
-    pub fn alt()   -> Self { Self { alt:   true, ..Default::default() } }
-    pub fn shift() -> Self { Self { shift: true, ..Default::default() } }
+    pub fn ctrl()            -> Self { Self { ctrl:  true, ..Default::default() } }
+    pub fn alt()             -> Self { Self { alt:   true, ..Default::default() } }
+    pub fn shift()           -> Self { Self { shift: true, ..Default::default() } }
+    pub fn ctrl_and_shift()  -> Self { Self { ctrl:  true, shift: true, ..Default::default() } }
+    pub fn ctrl_and_alt()    -> Self { Self { ctrl:  true, alt:   true, ..Default::default() } }
+    pub fn alt_and_shift()   -> Self { Self { alt:   true, shift: true, ..Default::default() } }
+    pub fn ctrl_alt_shift()  -> Self { Self { ctrl:  true, alt:   true, shift: true, ..Default::default() } }
 }
 
-// Convenience constructors
 impl KeyCombo {
-    pub fn named(k: NamedKey) -> Self { Self::Named(k, Mods::default()) }
-    pub fn named_mods(k: NamedKey, mods: Mods) -> Self { Self::Named(k, mods) }
+    //
+    // Char variants
+    //
+    pub fn char(c: char)               -> Self { Self::Char(c, Mods::default()) }
+    pub fn char_mods(c: char, mods: Mods) -> Self { Self::Char(c, mods) }
+    pub fn ctrl(c: char)               -> Self { Self::Char(c, Mods::ctrl()) }
+    pub fn alt(c: char)                -> Self { Self::Char(c, Mods::alt()) }
+    pub fn shift(c: char)              -> Self { Self::Char(c, Mods::shift()) }
+    pub fn ctrl_shift(c: char)         -> Self { Self::Char(c, Mods::ctrl_and_shift()) }
+    pub fn ctrl_alt(c: char)           -> Self { Self::Char(c, Mods::ctrl_and_alt()) }
+    pub fn alt_shift(c: char)          -> Self { Self::Char(c, Mods::alt_and_shift()) }
+    pub fn ctrl_alt_shift(c: char)     -> Self { Self::Char(c, Mods::ctrl_alt_shift()) }
+
+    //
+    // Named variants
+    //
+    pub fn named(k: NamedKey)                    -> Self { Self::Named(k, Mods::default()) }
+    pub fn named_mods(k: NamedKey, mods: Mods)  -> Self { Self::Named(k, mods) }
+    pub fn named_ctrl(k: NamedKey)               -> Self { Self::Named(k, Mods::ctrl()) }
+    pub fn named_alt(k: NamedKey)                -> Self { Self::Named(k, Mods::alt()) }
+    pub fn named_shift(k: NamedKey)              -> Self { Self::Named(k, Mods::shift()) }
+    pub fn named_ctrl_shift(k: NamedKey)         -> Self { Self::Named(k, Mods::ctrl_and_shift()) }
+    pub fn named_ctrl_alt(k: NamedKey)           -> Self { Self::Named(k, Mods::ctrl_and_alt()) }
+    pub fn named_alt_shift(k: NamedKey)          -> Self { Self::Named(k, Mods::alt_and_shift()) }
+    pub fn named_ctrl_alt_shift(k: NamedKey)     -> Self { Self::Named(k, Mods::ctrl_alt_shift()) }
+
+    //
+    // Physical variants
+    //
+    pub fn physical(k: KeyCode)                   -> Self { Self::Physical(k, Mods::default()) }
     pub fn physical_mods(k: KeyCode, mods: Mods) -> Self { Self::Physical(k, mods) }
-    pub fn ctrl(c: char)  -> Self { Self::Char(c, Mods::ctrl()) }
-    pub fn char_mods(c: char, mods: Mods)  -> Self { Self::Char(c, mods) }
-    pub fn alt(c: char)   -> Self { Self::Char(c, Mods::alt()) }
-    pub fn physical(k: KeyCode) -> Self { Self::Physical(k, Mods::default()) }
+    pub fn physical_ctrl(k: KeyCode)              -> Self { Self::Physical(k, Mods::ctrl()) }
+    pub fn physical_alt(k: KeyCode)               -> Self { Self::Physical(k, Mods::alt()) }
+    pub fn physical_shift(k: KeyCode)             -> Self { Self::Physical(k, Mods::shift()) }
+    pub fn physical_ctrl_shift(k: KeyCode)        -> Self { Self::Physical(k, Mods::ctrl_and_shift()) }
+    pub fn physical_ctrl_alt(k: KeyCode)          -> Self { Self::Physical(k, Mods::ctrl_and_alt()) }
+    pub fn physical_alt_shift(k: KeyCode)         -> Self { Self::Physical(k, Mods::alt_and_shift()) }
+    pub fn physical_ctrl_alt_shift(k: KeyCode)    -> Self { Self::Physical(k, Mods::ctrl_alt_shift()) }
 }
 
 pub struct Keymap {
@@ -210,9 +244,10 @@ impl Keymap {
         km.bind(KeyCombo::named(Tab),        table.intern("tab"));
         km.bind(KeyCombo::named(Escape),     table.intern("unset_anchor"));
 
-        // ctrl+home/end need their own entries
-        km.bind(KeyCombo::Named(Home, Mods { ctrl: true, ..Default::default() }), table.intern("move_file_start"));
-        km.bind(KeyCombo::Named(End,  Mods { ctrl: true, ..Default::default() }), table.intern("move_file_end"));
+        km.bind(KeyCombo::named_ctrl(Home), table.intern("move_file_start"));
+        km.bind(KeyCombo::named_ctrl(End), table.intern("move_file_end"));
+        km.bind(KeyCombo::alt('<'), table.intern("move_file_start"));
+        km.bind(KeyCombo::alt('>'), table.intern("move_file_end"));
 
         // Editing
         km.bind(KeyCombo::named(Backspace), table.intern("delete_backward"));
@@ -271,11 +306,19 @@ impl Keymap {
     }
 
     pub fn lookup(&self, event: &KeyEvent, mods: Mods) -> Option<CommandAtom> {
-        let combo = match &event.logical_key {
-            Key::Named(k) => KeyCombo::Named(k.clone(), mods),
+        let (combo, mods) = match &event.logical_key {
+            Key::Named(k) => (KeyCombo::Named(k.clone(), mods), mods),
             Key::Character(s) => {
                 let c = s.chars().next()?;
-                KeyCombo::Char(c, mods)
+
+                //
+                // Shift is baked into the character already; strip it from mods
+                // so Alt+Shift+, matches a binding on Alt+'<'
+                //
+                let char_mods = Mods { shift: false, ..mods };
+
+                (KeyCombo::Char(c, char_mods), char_mods)
+
             }
             _ => return None,
         };

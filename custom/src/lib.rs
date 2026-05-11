@@ -1974,11 +1974,11 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     *cx.command_table = CommandTable::from_commands(loaded.commands);
     *cx.keymap = Keymap::default_keymap(&mut cx.command_table);
 
-    cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build")); // nocheckin
-    cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition")); // nocheckin
-    cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom")); // nocheckin
+    cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build"));            // nocheckin
+    cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));        // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));   // nocheckin
     cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk")); // nocheckin
-    cx.keymap.bind(KeyCombo::char_mods('\\', Mods { alt: true, ctrl: true, ..Default::default() }), cx.command_table.intern("indent_region")); // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('\\'), cx.command_table.intern("indent_region"));    // nocheckin
 
     setup_hooks(cx);
     editor_initialize_custom_data(cx.editor, cx.gpu);
