@@ -2526,8 +2526,6 @@ impl Editor {
             self.most_recently_used_buffers.remove(pos);
         }
         self.most_recently_used_buffers.insert(0, id);
-
-        self.buffers[id].prelex_the_whole_file();
     }
 
     pub fn set_active_panel(&mut self, panel_id: PanelId) {

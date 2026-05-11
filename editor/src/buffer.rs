@@ -94,10 +94,6 @@ impl Buffer {
         }
     }
 
-    pub fn prelex_the_whole_file(&mut self) {
-        self.extend_cache_to(self.text.len_bytes());
-    }
-
     pub fn from_file(path: impl Into<Box<Path>>) -> std::io::Result<Self> {
         let path = path.into();
 
