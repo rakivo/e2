@@ -14,13 +14,15 @@ pub struct CommandContext<'a> {
     pub command_table: &'a mut CommandTable,
     pub keymap:        &'a mut Keymap,
 
+    pub dont_reset_blink: bool,
+
     // @Cleanup: This shouldn't take in KeyEvent, make our own thing
     pub event_and_mods: Option<(&'a KeyEvent, Mods)>,
 }
 
 impl<'a> CommandContext<'a> {
     pub fn finish(&mut self) {
-        self.editor.command_finish();
+        self.editor.command_finish(self.dont_reset_blink);
     }
 }
 

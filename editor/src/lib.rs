@@ -830,12 +830,12 @@ pub fn build_text_layout(
     if delta > 0.0 {
         // We are scrolling DOWN (target is below current anim)
         // Add prelex by remaining distance
-        let prelex_line_count = (delta / line_h).clamp(20.0, 400.0) as u32;
+        let prelex_line_count = (delta / line_h).clamp(100.0, 400.0) as u32;
         last_line = last_line.saturating_add(prelex_line_count);
     } else if delta < 0.0 {
         // We are scrolling UP (target is above current anim)
         // Add prelex by remaining distance
-        let prelex_line_count = ((-delta) / line_h).clamp(20.0, 400.0) as u32;
+        let prelex_line_count = ((-delta) / line_h).clamp(100.0, 400.0) as u32;
         first_line = first_line.saturating_sub(prelex_line_count);
     }
 
@@ -2152,7 +2152,7 @@ impl Editor {
     }
 
     #[inline]
-    pub fn command_finish(&mut self) {
+    pub fn command_finish(&mut self, dont_reset_blink: bool) {
         { // @Hack
             let current_buffer_id = self.active_view().buffer_id;
             let current_buffer = &self.buffers[current_buffer_id];
@@ -2166,7 +2166,10 @@ impl Editor {
 
         adjust_cursors_after_buffer_mutation(self);
         scroll_to_cursor(self);
-        self.reset_blink();
+
+        if !dont_reset_blink {
+            self.reset_blink();
+        }
     }
 
     #[inline]
@@ -3129,14 +3132,9 @@ pub fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     let (cur_line, cur_col) = editor.buffers[buf_id]
         .cursor_line_col(&editor.views[view_id].cursor);
 
+    // Move cursor by a full page
     let new_line = ((cur_line as isize + delta).max(0) as usize)
         .min(total.saturating_sub(1)) as u32;
-
-    let max_scroll = ((total as f32 * line_h) - rect.h).max(0.0);
-    let new_scroll = (editor.views[view_id].scroll + delta as f32 * line_h)
-        .clamp(0.0, max_scroll);
-
-    editor.views[view_id].scroll = new_scroll;
 
     editor.buffers[buf_id].set_cursor_line_col(
         new_line, cur_col, &mut editor.views[view_id].cursor
@@ -3144,7 +3142,22 @@ pub fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     editor.views[view_id].cursor_target_line = new_line;
     editor.views[view_id].cursor_target_col  = cur_col;
 
-    editor.reset_blink();
+    // Only scroll if cursor is now outside the visible region
+    let scroll     = editor.views[view_id].scroll;
+    let cursor_y   = new_line as f32 * line_h;
+    let max_scroll = ((total as f32 * line_h) - rect.h).max(0.0);
+
+    let new_scroll = if cursor_y < scroll {
+        // Cursor above viewport, scroll up to show it
+        cursor_y
+    } else if cursor_y + line_h > scroll + rect.h {
+        // Cursor below viewport, scroll down to show it
+        cursor_y + line_h - rect.h
+    } else {
+        scroll
+    };
+
+    editor.views[view_id].scroll = new_scroll.clamp(0.0, max_scroll);
 }
 
 //

@@ -120,7 +120,8 @@ impl App {
                         gpu,
                         command_table: &mut self.command_table,
                         event_and_mods: None,
-                        keymap: &mut self.keymap
+                        keymap: &mut self.keymap,
+                        dont_reset_blink: true,
                     };
                     run_custom_layer_initialization(&mut cx, loaded);
                 }
@@ -169,6 +170,7 @@ impl ApplicationHandler<UserEvent> for App {
                 command_table: &mut self.command_table,
                 keymap: &mut self.keymap,
                 event_and_mods: None,
+                dont_reset_blink: true,
             };
             run_custom_layer_initialization(&mut cx, l);
         }
@@ -267,30 +269,39 @@ impl ApplicationHandler<UserEvent> for App {
         let mods = Mods { alt, ctrl, shift };
 
         macro_rules! make_command_context {
-            (@auto $event:expr) => {{
+            (@auto $event:expr, $dont_reset_blink:expr) => {{
                 CommandContext {
                     editor, gpu,
                     event_and_mods: $event,
                     command_table: &mut self.command_table,
                     keymap: &mut self.keymap,
+                    dont_reset_blink: $dont_reset_blink,
                 }
             }};
 
-            (@defer $event:expr) => {{
+            (@defer $event:expr, $dont_reset_blink:expr) => {{
                 core::mem::ManuallyDrop::new(CommandContext {
                     editor, gpu,
                     event_and_mods: $event,
                     command_table: &mut self.command_table,
                     keymap: &mut self.keymap,
+                    dont_reset_blink: $dont_reset_blink,
                 })
             }};
 
-            ()                     => { make_command_context!(@auto None) };
-            (None)                 => { make_command_context!(@auto None) };
-            (defer None)           => { make_command_context!(@defer None) };
-            (defer)                => { make_command_context!(@defer None) };
-            ($event:expr)          => { make_command_context!(@auto Some(($event, mods))) };
-            (defer $event:expr)    => { make_command_context!(@defer Some(($event, mods))) };
+            (reset )                     => { make_command_context!(@auto  None, false) };
+            (reset None)                 => { make_command_context!(@auto  None, false) };
+            (reset defer None)           => { make_command_context!(@defer None, false) };
+            (reset defer)                => { make_command_context!(@defer None, false) };
+            (reset $event:expr)          => { make_command_context!(@auto  Some(($event, mods)), false) };
+            (reset defer $event:expr)    => { make_command_context!(@defer Some(($event, mods)), false) };
+
+            ()                     => { make_command_context!(@auto  None, true) };
+            (None)                 => { make_command_context!(@auto  None, true) };
+            (defer None)           => { make_command_context!(@defer None, true) };
+            (defer)                => { make_command_context!(@defer None, true) };
+            ($event:expr)          => { make_command_context!(@auto  Some(($event, mods)), true) };
+            (defer $event:expr)    => { make_command_context!(@defer Some(($event, mods)), true) };
         }
 
         match event {
@@ -322,7 +333,7 @@ impl ApplicationHandler<UserEvent> for App {
                         should_short_circuit
                     ) = key_pressed.map_or(
                         (false, false),
-                        |f| f(&mut make_command_context!(&event))
+                        |f| f(&mut make_command_context!(reset &event))
                     );
 
                     should_request_redraw |= custom_window_redraw_requested;
@@ -349,7 +360,7 @@ impl ApplicationHandler<UserEvent> for App {
                             should_short_circuit
                         ) = pre_command_execution.map_or(
                             (false, false),
-                            |f| f(&mut make_command_context!(&event), command_atom)
+                            |f| f(&mut make_command_context!(reset &event), command_atom)
                         );
 
                         should_request_redraw |= custom_window_redraw_requested;
@@ -362,7 +373,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
 
                     {
-                        let mut cx = make_command_context!(&event);
+                        let mut cx = make_command_context!(reset &event);
                         (command.func)(&mut cx);
                     }
 
@@ -375,7 +386,7 @@ impl ApplicationHandler<UserEvent> for App {
                             should_short_circuit
                         ) = post_command_execution.map_or(
                             (false, false),
-                            |f| f(&mut make_command_context!(&event), command_atom)
+                            |f| f(&mut make_command_context!(reset &event), command_atom)
                         );
 
                         should_request_redraw |= custom_window_redraw_requested;
