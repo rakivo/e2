@@ -1,9 +1,5 @@
 #![feature(likely_unlikely)]
 
-// TODO: Paste animation continuation threshold
-
-// TODO: Talk to system clipboard
-
 // TODO: Mouse double left click should select the word
 
 // TODO: Multi-cursors
@@ -16,20 +12,11 @@
 // TODO: beginning-of-defun/end-of-defun
 // TODO: align-rexegp
 
-// TODO: Auto-indentation (minor)
-// TODO: Automatic session save
-
 // TODO: [messages] buffer
 
 // TODO: Lexer support for HERE strings
-// TODO: Lexer support for raw  strings
 
-// TODO: Lexing is buggy with large strings
-// For instance: if we only see the closing quote and the opening quote is off the screen,
-// currently it just highlights as if the closing quote was an opening one.
-// `
-// But the actual reliable solution to this would involve going back/forward into the file,
-// searching for a matching quote with a "state machine".
+// TODO: Lexer is STILL buggy with escapes in chars or strings
 
 // TODO: Make Buffer have distinct CANONICALIZED/RELATIVE path fields
 

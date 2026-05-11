@@ -468,7 +468,7 @@ pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
 #[inline]
 pub fn pop_clip(gpu: &mut Gpu) {
     gpu.clip_depth -= 1;
-    debug_assert!(gpu.clip_depth >= 0, "unbalanced pop_clip — more pops than pushes");
+    debug_assert!(gpu.clip_depth >= 0, "unbalanced pop_clip");
 
     let clip = if gpu.batch_count >= 2 {
         gpu.batch_pool[gpu.batch_count - 2].clip
@@ -567,10 +567,6 @@ pub fn draw_text_colored(
     let inv_sw = 1.0 / gpu.win_w;
     let inv_sh = 1.0 / gpu.win_h;
 
-    // Collect glyphs first so we can then hold &mut verts without aliasing.
-    // Stack-allocate for short strings; fall back to a bump on the caller's
-    // stack via a small fixed array. Typical UI strings are <128 chars.
-    // If you have a scratch Vec available on the caller, pass it in instead.
     gpu.glyph_scratch.clear();
     for c in text.chars() {
         let advance = match get_glyph(gpu, c, font_size) {
