@@ -584,9 +584,9 @@ pub fn cycle_buffers_right(cx: &mut CommandContext) {
 }
 
 #[command]
-pub fn write_buffer_to_disk(cx: &mut CommandContext) {
+pub fn write_buffer_onto_disk(cx: &mut CommandContext) {
     let buffer_id = cx.editor.active_view().buffer_id;
-    _ = editor_save_buffer_onto_disk(cx.editor, buffer_id);
+    _ = editor_write_buffer_onto_disk(cx.editor, buffer_id);
 }
 
 pub fn lister_item_list_from_command_table(cx: &CommandContext) -> Vec<ListerItem> {
@@ -1843,8 +1843,6 @@ pub fn indent_region_impl(text: &str, start_line: usize, end_line: usize, indent
 pub fn indent_region(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
-    let cursor_char = view.cursor.char_index;
-
     let (start_char, end_char) = if let Some(anchor) = view.cursor.anchor_char_index {
         let c = view.cursor.char_index;
         if anchor <= c { (anchor, c) } else { (c, anchor) }
@@ -1871,16 +1869,7 @@ pub fn indent_region(cx: &mut CommandContext) {
         return;
     }
 
-    let cursor_line = buf.text.char_to_line(cursor_char);
-    let cursor_col  = cursor_char - buf.text.line_to_char(cursor_line);
-
-    buf.text     = reindented.into();
-    buf.is_dirty = true;
-
-    let cursor_line = cursor_line.min(buf.text.len_lines().saturating_sub(1));
-    let line_start  = buf.text.line_to_char(cursor_line);
-    let line_len    = buf.text.line(cursor_line).len_chars();
-    view.cursor.char_index = (line_start + cursor_col).min(line_start + line_len.saturating_sub(1));
+    buf.reset_buffer_to(reindented.into(), &mut view.cursor);
 }
 
 #[command]
@@ -1989,6 +1978,7 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build")); // nocheckin
     cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition")); // nocheckin
     cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom")); // nocheckin
+    cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk")); // nocheckin
     cx.keymap.bind(KeyCombo::char_mods('\\', Mods { alt: true, ctrl: true, ..Default::default() }), cx.command_table.intern("indent_region")); // nocheckin
 
     setup_hooks(cx);
@@ -2704,7 +2694,10 @@ fn setup_hooks(cx: &mut CommandContext) {
         _ = write!(
             &mut editor.scratch_panel_bar,
 
-            "{}  {}:{}  {}", buffer.pretty_path, line+1, col+1, editor.scale
+            "{}  {}:{}  {}  {}",
+            buffer.pretty_path, line+1, col+1,
+            if buffer.has_unsaved_changes() { '*' } else { '-' },
+            (editor.scale / 0.25).ceil() * 0.25
         );
     });
 

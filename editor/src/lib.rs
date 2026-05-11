@@ -42,7 +42,6 @@ use command::{CommandContext, CommandAtom};
 use director::Director;
 
 use std::any::Any;
-use std::io::{BufWriter, Write};
 use std::num::NonZero;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -3160,26 +3159,8 @@ pub fn scroll_page(editor: &mut Editor, _gpu: &Gpu, direction: i32) {
     editor.views[view_id].scroll = new_scroll.clamp(0.0, max_scroll);
 }
 
-//
-// @Note @Speed: We might want to somehow parallelize this for very slow hard drives,
-// but besides from that, saving a 100mb file on my cheap ass SSD wasn't that slow at all.
-//
-pub fn editor_save_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) -> std::io::Result<()> {
-    let buffer = &editor.buffers[buffer_id];
-    let Some(path) = buffer.path.as_ref() else { return Ok(()) };
-
-    let tmp_path = path.with_extension("tmp");
-    let mut f = BufWriter::new(std::fs::File::create(&tmp_path)?);
-    for chunk in buffer.text.chunks() {
-        f.write(chunk.as_bytes())?;
-    }
-
-    f.flush()?;
-    drop(f);
-
-    std::fs::rename(&tmp_path, path)?;
-
-    Ok(())
+pub fn editor_write_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) -> std::io::Result<()> {
+    editor.buffers[buffer_id].write_onto_disk()
 }
 
 pub fn editor_handle_left_mouse_click(cx: &mut CommandContext) -> bool {

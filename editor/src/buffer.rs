@@ -1,6 +1,6 @@
 use crate::{COPY_ANIMATION_MAX_ID, PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
 
-use std::path::Path;
+use std::{io::{BufWriter, Write}, path::Path};
 
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -60,6 +60,9 @@ pub struct Buffer {
     pub pretty_path: Box<str>,
 
     pub is_dirty: bool,
+
+    pub last_save_generation: u64,
+    pub last_edit_generation: u64,
 
     pub last_insert: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
     pub last_delete: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
@@ -239,6 +242,29 @@ impl Buffer {
         }
     }
 
+    pub fn write_onto_disk(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.as_ref() else { return Ok(()) };
+
+        let tmp_path = path.with_extension("tmp");
+        let mut f = BufWriter::new(std::fs::File::create(&tmp_path)?);
+        for chunk in self.text.chunks() {
+            f.write(chunk.as_bytes())?;
+        }
+
+        f.flush()?;
+        drop(f);
+
+        std::fs::rename(&tmp_path, path)?;
+
+        self.last_save_generation = self.last_edit_generation;
+
+        Ok(())
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.last_save_generation != self.last_edit_generation
+    }
+
     pub fn lex_visible(&mut self, start_line: usize, end_line: usize) { // :BufferScratch
         let start_byte = self.text.try_line_to_byte(start_line).unwrap_or(0);
         let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes());
@@ -302,6 +328,22 @@ impl Buffer {
         (line as u32, (index - line_start) as u32)
     }
 
+    pub fn reset_buffer_to(&mut self, text: Rope, cursor: &mut Cursor) {
+        let cursor_char = cursor.char_index;
+
+        let cursor_line = self.text.char_to_line(cursor_char);
+        let cursor_col  = cursor_char - self.text.line_to_char(cursor_line);
+
+        self.text     = text.into();
+        self.is_dirty = true;
+        self.last_edit_generation += 1;
+
+        let cursor_line = cursor_line.min(self.text.len_lines().saturating_sub(1));
+        let line_start  = self.text.line_to_char(cursor_line);
+        let line_len    = self.text.line(cursor_line).len_chars();
+        cursor.char_index = (line_start + cursor_col).min(line_start + line_len.saturating_sub(1));
+    }
+
     pub fn insert_char(&mut self, c: char, cursor: &mut Cursor) {
         let index = cursor.char_index.min(self.text.len_chars());
         let byte  = self.text.char_to_byte(index);
@@ -314,6 +356,7 @@ impl Buffer {
         cursor.preferred_col = None;
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
         self.last_insert = Some((index, 1));
     }
 
@@ -326,6 +369,7 @@ impl Buffer {
         self.adjust_animated_regions_for_insert(byte, c.len_utf8());
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
         self.last_insert = Some((index, 1));
     }
 
@@ -347,6 +391,8 @@ impl Buffer {
         self.adjust_animated_regions_for_insert(byte, byte_len);
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
+
         let len: u32 = l.chars().map(|c| c.len_utf8() as u32).sum();
         self.last_insert = Some((index, len as u32));
     }
@@ -367,6 +413,7 @@ impl Buffer {
         cursor.preferred_col = None;
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
         self.last_delete = Some((index, 1));
     }
 
@@ -385,6 +432,7 @@ impl Buffer {
         cursor.preferred_col = None;
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
         self.last_delete = Some((cursor.char_index, 1));
     }
 
@@ -411,6 +459,7 @@ impl Buffer {
         cursor.preferred_col = None;
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
         self.last_delete = Some((start, (i-start) as u32));
     }
 
@@ -437,6 +486,7 @@ impl Buffer {
         cursor.preferred_col = None;
 
         self.is_dirty = true;
+        self.last_edit_generation += 1;
         self.last_delete = Some((i, (end-i) as u32));
     }
 
@@ -461,6 +511,7 @@ impl Buffer {
             cursor.char_index = start;
 
             self.is_dirty = true;
+            self.last_edit_generation += 1;
             self.last_delete = Some((start, (end-start) as u32));
         }
 
@@ -489,6 +540,8 @@ impl Buffer {
 
     pub fn clear(&mut self) {
         self.is_dirty = true;
+        self.last_edit_generation = Default::default();
+        self.last_save_generation = Default::default();
         self.text = Rope::new();
         self.comment_cache.clear();
         self.last_delete = None;
