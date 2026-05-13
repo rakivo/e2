@@ -493,7 +493,7 @@ pub fn pop_clip(gpu: &mut Gpu) {
 //
 //
 
-/// 4 rects, 24 verts - reserve once for all of them.
+/// 4 rects, 24 verts
 #[inline(always)]
 pub fn draw_rect_outline(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, thickness: f32, color: Color) {
     let inv_sw = 1.0 / gpu.win_w;

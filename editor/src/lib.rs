@@ -1,4 +1,5 @@
 #![feature(likely_unlikely)]
+#![allow(non_camel_case_types)]
 
 // TODO: Mouse double left click should select the word
 
@@ -31,6 +32,8 @@ pub mod lexer;
 pub mod session;
 pub mod audioer;
 pub mod messager;
+pub mod ts;
+pub mod atum;
 
 use audioer::Audioer;
 use lexer::token_color;
@@ -40,6 +43,7 @@ use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
 use command::{CommandContext, CommandAtom};
 use director::Director;
+use ts::TreeSitter;
 
 use std::any::Any;
 use std::num::NonZero;
@@ -52,7 +56,7 @@ use std::collections::VecDeque;
 use std::ops::{BitOr, BitAnd, BitOrAssign, BitAndAssign};
 
 use cranelift_entity::packed_option::ReservedValue;
-use cranelift_entity::{EntityRef, PrimaryMap};
+use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use smallstr::SmallString;
 use smallvec::SmallVec;
 use wgpu::naga::{FastHashMap, FastHashSet};
@@ -1383,6 +1387,90 @@ pub fn render_text_layout(
         }
     }
 
+    if let Some(ll) = layout.line_for_buffer_line(cursor_line)
+        && let Some(overlay) = &view.overlay.current
+    {
+        let cursor_glyph_w =
+            layout.glyph_width_at_col(cursor_col, min_cursor_w, ll)
+            .max(min_cursor_w);
+
+        let crect = context.cursor_rect(cursor_glyph_w);
+
+        let Some(info) = crate::ts::lookup_overlay(
+            overlay,
+            &editor.tree_sitter.func_table,
+            &editor.tree_sitter.atom_table
+        ) else {
+            return;
+        };
+
+        let pad_x     = 6.0;
+        let pad_y_top = 4.0;
+        let pad_y_bot = 6.0;
+        let font_size = 14.0;
+
+        let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
+
+        // pre-measure total scratch size and record (start, end, is_active) per param
+        struct PieceRange { start: usize, end: usize, active: bool }
+        let mut param_ranges: SmallVec<[PieceRange; 8]> = SmallVec::new();
+
+        for (i, param) in info.params.iter().enumerate() {
+            let name     = editor.tree_sitter.atom_table.lookup_ref(param.name);
+            let type_str = editor.tree_sitter.atom_table.lookup_ref(param.type_str);
+            let start = scratch.len();
+            scratch.extend_from_slice(name.as_bytes());
+            scratch.extend_from_slice(b": ");
+            scratch.extend_from_slice(type_str.as_bytes());
+            let end = scratch.len();
+            param_ranges.push(PieceRange { start, end, active: i == overlay.arg_index as usize });
+        }
+
+        // now scratch is done growing, safe to slice
+        let func_name = editor.tree_sitter.atom_table.lookup_ref(overlay.call_kind.function_name());
+        let mut pieces: SmallVec<[(&str, bool); 16]> = SmallVec::new();
+        pieces.push((func_name.as_str(), false));
+        pieces.push(("(", false));
+        for (i, pr) in param_ranges.iter().enumerate() {
+            if i > 0 { pieces.push((", ", false)); }
+            let s = unsafe { std::str::from_utf8_unchecked(&scratch[pr.start..pr.end]) };
+            pieces.push((s, pr.active));
+        }
+        pieces.push((")", false));
+
+        // measure
+        let mut text_w: f32 = 0.0;
+        for (text, _) in &pieces {
+            text_w += gpu::measure_str(gpu, text, font_size);
+        }
+        let overlay_w = text_w + pad_x * 2.0;
+        let overlay_h = font_size + pad_y_top + pad_y_bot;
+
+        // position
+        let margin = 8.0;
+        let mut ox = crect.x + 14.0;
+        let mut oy = crect.y - overlay_h - 6.0;
+        if ox + overlay_w > rect.x + rect.w - margin { ox = rect.x + rect.w - overlay_w - margin; }
+        if oy < rect.y + margin { oy = crect.y + crect.h + 6.0; }
+
+        // draw
+        gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E));
+        gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A));
+
+        // text
+        let mut tx = ox + pad_x;
+        let ty = oy + pad_y_top + font_size;
+        for (text, active) in &pieces {
+            let color = if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) };
+            gpu::draw_text(gpu, text, tx, ty, font_size, color);
+            if *active {
+                let w = gpu::measure_str(gpu, text, font_size);
+                gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D));
+            }
+            tx += gpu::measure_str(gpu, text, font_size);
+        }
+    }
+
     if let Some(hook) = editor.hooks.drew_text_about_to_return {
         hook(editor, gpu, view_id, &context);
     }
@@ -1746,6 +1834,7 @@ pub struct View {
     pub cursor: Cursor,
     pub layout: Option<TextLayout>,
 
+    pub overlay: crate::ts::OverlayState,
     pub persistent_state_per_buffer: FastHashMap<BufferId, ViewState>,
 }
 
@@ -1759,6 +1848,7 @@ impl View {
             cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: scroll,
             persistent_state_per_buffer: Default::default(),
+            overlay: Default::default(),
             panel_id: PanelId::reserved_value()  // Set on first layout
         }
     }
@@ -1987,6 +2077,8 @@ pub struct Editor {
 
     pub logger_config: EditorLoggerConfig,
 
+    pub tree_sitter: TreeSitter,
+
     // Scale for font/line-height
     pub scale: f32,
     pub win_w: f32,
@@ -2007,6 +2099,8 @@ pub struct Editor {
     pub is_cursor_visible:  bool,
 
     pub clipboard:       Option<arboard::Clipboard>,
+
+    pub last_cursor_position: SecondaryMap<ViewId, u32>,
 
     pub frame_count:     u32,
     pub fps:             f32,
@@ -2120,11 +2214,13 @@ impl Editor {
             canonicalized_current_working_directory,
             most_recently_used_buffers: VecDeque::with_capacity(32),
             clipboard: arboard::Clipboard::new().ok(),
+            last_cursor_position: Default::default(),
             audioer,
             director: Director::new(),
             messager: Messager::new(),
             did_we_apply_any_sessions: false,
             redraw_reasons: Vec::with_capacity(64),
+            tree_sitter: crate::ts::spawn(),
         }
     }
 
@@ -2139,7 +2235,14 @@ impl Editor {
     }
 
     #[inline]
-    pub fn push_buffer(&mut self, buffer: Buffer) -> BufferId {
+    pub fn push_buffer(&mut self, mut buffer: Buffer) -> BufferId {
+        if let Some(path) = &buffer.path &&
+           let Some(filestem) = path.file_stem() &&
+           let Some(filestem) = filestem.to_str()
+        {
+            buffer.filestem_atom = self.tree_sitter.atom_table.intern(filestem);
+        }
+
         let buffer_id = self.buffers.push(buffer);
         self.mru_register_new_buffer(buffer_id);
 
@@ -2152,6 +2255,7 @@ impl Editor {
         }
 
         self.recompute_buffer_display_names();
+        self.tree_sitter.send_init(buffer_id, self.buffers[buffer_id].text.clone()); // nocheckin
 
         buffer_id
     }
@@ -2174,10 +2278,26 @@ impl Editor {
 
     #[inline]
     pub fn command_finish(&mut self, dont_reset_blink: bool) {
-        { // @Hack
+        adjust_cursors_after_buffer_mutation(self);
+        scroll_to_cursor(self);
+
+        if !dont_reset_blink {
+            self.reset_blink();
+        }
+    }
+
+    /// Returns true if should request redraw
+    #[inline]
+    pub fn window_event_finish(&mut self) -> bool {
+        let mut redraw = false;
+
+        // @Hack
+        {
             let current_buffer_id = self.active_view().buffer_id;
             let current_buffer = &self.buffers[current_buffer_id];
-            let modified = current_buffer.last_delete.is_some() || current_buffer.last_insert.is_some();
+            let modified = current_buffer.last_delete.is_some() ||
+                current_buffer.last_insert.is_some();
+
             if modified {
                 if let Some(hook) = self.hooks.modified_file {
                     hook(self, current_buffer_id);
@@ -2185,12 +2305,96 @@ impl Editor {
             }
         }
 
-        adjust_cursors_after_buffer_mutation(self);
-        scroll_to_cursor(self);
+        // @Hack :TreeSitter
+        { // nocheckin
+            let (view, buf) = self.active_view_and_buffer_mut();
+            let view_id     = view.id;
+            let buffer_id   = view.buffer_id;
+            let char_index  = view.cursor.char_index;
+            let cursor_byte = buf.text.char_to_byte(char_index);
+            let insert_edit = buf.last_insert_to_input_edit();
+            let delete_edit = buf.last_delete_to_input_edit();
+            let rope        = buf.text.clone();
+            let last_pos    = self.last_cursor_position[view_id];
+            let (view, _buf) = self.active_view_and_buffer_mut();
 
-        if !dont_reset_blink {
-            self.reset_blink();
+            let needs_reset = if let Some(overlay) = &view.overlay.current {
+                // @Cutnpaste from find_call_overlay
+                cursor_byte <= overlay.opening_paren_byte as usize ||
+                    overlay.closing_paren_byte.map_or(false, |byte| cursor_byte > byte.get() as usize)
+            } else {
+                false
+            };
+            if needs_reset {
+                view.overlay.current = None;
+            }
+
+            let needs_cursor_query = insert_edit.is_some()
+                || delete_edit.is_some()
+                || char_index as u32 != last_pos;
+
+            if let Some(ref edit) = insert_edit {
+                view.overlay.on_edit(edit);
+            }
+            if let Some(ref edit) = delete_edit {
+                view.overlay.on_edit(edit);
+            }
+
+            if let Some(edit) = insert_edit {
+                self.tree_sitter.send_edit(buffer_id, edit, rope.clone());
+            }
+            if let Some(edit) = delete_edit {
+                self.tree_sitter.send_edit(buffer_id, edit, rope.clone());
+            }
+
+            if needs_cursor_query {
+                if let Some(overlay) = self.tree_sitter.query_cursor_overlay(buffer_id, cursor_byte, &rope) {
+                    let (view, _buf) = self.active_view_and_buffer_mut();
+                    view.overlay.current = Some(overlay);
+                    redraw |= true;
+                }
+            }
         }
+
+        redraw
+    }
+
+    pub fn always_on_update(&mut self) -> ShouldRequestFrameRedraw {
+        let mut redraw = ShouldRequestFrameRedraw::No;
+
+        // @Cleanup
+        {
+            while let Ok(result) = self.tree_sitter.result.try_recv() {
+                let buffer_filename = self.buffers[result.buffer_id].filestem_atom;
+                for info in result.functions {
+                    self.tree_sitter.func_table.insert(info, buffer_filename);
+                }
+
+                // Update overlay result for the view that made the cursor query
+                if let Some(overlay_result) = result.overlay {
+                    for view in self.views.values_mut() {
+                        if view.buffer_id == result.buffer_id {
+                            redraw = redraw.or_msg("Overlay update", &mut self.redraw_reasons);
+
+                            view.overlay.current = Some(overlay_result);
+                            break;  // Cursor query came from one specific view
+                        }
+                    }
+                } else {
+                    // Bg thread found no call expression at cursor, clear overlay
+                    for view in self.views.values_mut() {
+                        if view.buffer_id == result.buffer_id {
+                            redraw = redraw.or_msg("Overlay update", &mut self.redraw_reasons);
+
+                            view.overlay.current = None;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        redraw
     }
 
     #[inline]
@@ -2522,6 +2726,7 @@ impl Editor {
 
     pub fn mru_focus(&mut self, id: BufferId) {
         if self.buffer_cycle_index.is_some() { return; }
+
         if let Some(pos) = self.most_recently_used_buffers.iter().position(|&x| x == id) {
             self.most_recently_used_buffers.remove(pos);
         }

@@ -144,115 +144,8 @@ enum UserEvent {
     ExitRequested,
 }
 
-impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, el: &ActiveEventLoop) {
-        let win: Arc<_> = el.create_window(
-            Window::default_attributes()
-                .with_title("naysayer")
-                .with_decorations(false)
-        ).unwrap().into();
-
-        let mut gpu = gpu::init(Arc::clone(&win));
-        gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
-
-        let editor = &mut self.editor;
-        editor.win_w = gpu.win_w;
-        editor.win_h = gpu.win_h;
-
-        editor.refresh_rate_millihertz = win.current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-            .unwrap_or(60*1000); // 60Hz
-
-        if let Some(l) = &mut self.loaded {
-            let mut cx = CommandContext {
-                editor,
-                gpu: &mut gpu,
-                command_table: &mut self.command_table,
-                keymap: &mut self.keymap,
-                event_and_mods: None,
-                dont_reset_blink: true,
-            };
-            run_custom_layer_initialization(&mut cx, l);
-        }
-
-        post_custom_layer_initialization(editor);
-
-        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
-
-        self.gpu    = Some(gpu);
-        self.window = Some(win);
-    }
-
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
-        self.try_reload();
-
-        let Some(win) = &self.window else { return };
-
-        let editor = &mut self.editor;
-
-        if editor.hooks.inside_about_to_wait_should_request_redraw.map_or(
-            Default::default(),
-            |f| f(editor)
-        ).is_yes() {
-            win.request_redraw();
-            return;
-        }
-
-        let since_input = editor.last_input_time.elapsed().as_millis();
-
-        if since_input < BLINK_START_DELAY_MS {
-            //
-            // Waiting to start blinking - wake up when delay expires
-            //
-            let ms_until = BLINK_START_DELAY_MS - since_input;
-            el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(ms_until as u64)
-            ));
-
-        } else if since_input > BLINK_STOP_IDLE_MS {
-            //
-            // Idle too long - just wait for input
-            //
-            el.set_control_flow(ControlFlow::Wait);
-
-        } else {
-            //
-            // Actively blinking - wake up at next blink transition
-            //
-            let elapsed = editor.blink_epoch.elapsed().as_millis();
-            let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
-            let phase   = elapsed % cycle;
-            let ms_until = if phase < BLINK_ON_MS {
-                BLINK_ON_MS - phase
-            } else {
-                cycle - phase
-            };
-
-            el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(ms_until as u64)
-            ));
-
-            win.request_redraw();
-        }
-    }
-
-    fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
-        match event {
-            UserEvent::ExitRequested => {
-                el.exit();
-            }
-        }
-    }
-
-    fn exiting(&mut self, _el: &ActiveEventLoop) {
-        if let Some(hook) = self.editor.hooks.exiting {
-            hook(&mut self.editor);
-        }
-
-        _ = save_session(&self.editor, &default_session_path());
-    }
-
-    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+impl App {
+    fn window_event_impl(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.mods = *m;
             return;
@@ -586,6 +479,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let now = Instant::now();
                 let dt = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
+
                 editor.last_frame_time = now;
                 editor.frame_count += 1;
 
@@ -593,6 +487,8 @@ impl ApplicationHandler<UserEvent> for App {
 
                 editor.messager.tick(dt);
                 editor.messager.evict_expired(MESSAGE_DURATION_IN_MILLISECONDS);
+
+                redraw |= editor.always_on_update();
 
                 let elapsed = editor.last_fps_time.elapsed().as_secs_f32();
                 if elapsed >= 0.5 {
@@ -638,6 +534,11 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let mut leaf_panels = Default::default();
                 collect_leaves(editor, editor.root_panel, &mut leaf_panels);
+
+                for (_panel_id, view_id, ..) in &leaf_panels {
+                    let char_index = editor.views[*view_id].cursor.char_index;
+                    editor.last_cursor_position.insert(*view_id, char_index as _);
+                }
 
                 if let Some(about_to_rebuild_dirty_layouts_hook) = editor.hooks.about_to_rebuild_dirty_layouts {
                     let mut cx = make_command_context!(defer);
@@ -767,6 +668,129 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             _ => {}
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let win: Arc<_> = el.create_window(
+            Window::default_attributes()
+                .with_title("naysayer")
+                .with_decorations(false)
+        ).unwrap().into();
+
+        let mut gpu = gpu::init(Arc::clone(&win));
+        gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
+
+        let editor = &mut self.editor;
+        editor.win_w = gpu.win_w;
+        editor.win_h = gpu.win_h;
+
+        editor.refresh_rate_millihertz = win.current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .unwrap_or(60*1000); // 60Hz
+
+        if let Some(l) = &mut self.loaded {
+            let mut cx = CommandContext {
+                editor,
+                gpu: &mut gpu,
+                command_table: &mut self.command_table,
+                keymap: &mut self.keymap,
+                event_and_mods: None,
+                dont_reset_blink: true,
+            };
+            run_custom_layer_initialization(&mut cx, l);
+        }
+
+        post_custom_layer_initialization(editor);
+
+        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
+
+        self.gpu    = Some(gpu);
+        self.window = Some(win);
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.try_reload();
+
+        let editor = &mut self.editor;
+        let always_on_should_request_redraw = editor.always_on_update().is_yes();
+
+        let Some(win) = &self.window else { return };
+
+        if always_on_should_request_redraw {
+            win.request_redraw();
+        }
+
+        if editor.hooks.inside_about_to_wait_should_request_redraw.map_or(
+            Default::default(),
+            |f| f(editor)
+        ).is_yes() {
+            win.request_redraw();
+            return;
+        }
+
+        let since_input = editor.last_input_time.elapsed().as_millis();
+
+        if since_input < BLINK_START_DELAY_MS {
+            //
+            // Waiting to start blinking - wake up when delay expires
+            //
+            let ms_until = BLINK_START_DELAY_MS - since_input;
+            el.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(ms_until as u64)
+            ));
+
+        } else if since_input > BLINK_STOP_IDLE_MS {
+            //
+            // Idle too long - just wait for input
+            //
+            el.set_control_flow(ControlFlow::Wait);
+
+        } else {
+            //
+            // Actively blinking - wake up at next blink transition
+            //
+            let elapsed = editor.blink_epoch.elapsed().as_millis();
+            let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
+            let phase   = elapsed % cycle;
+            let ms_until = if phase < BLINK_ON_MS {
+                BLINK_ON_MS - phase
+            } else {
+                cycle - phase
+            };
+
+            el.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(ms_until as u64)
+            ));
+
+            win.request_redraw();
+        }
+    }
+
+    fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::ExitRequested => {
+                el.exit();
+            }
+        }
+    }
+
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        if let Some(hook) = self.editor.hooks.exiting {
+            hook(&mut self.editor);
+        }
+
+        _ = save_session(&self.editor, &default_session_path());
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        self.window_event_impl(el, window_id, event);
+        if self.editor.window_event_finish() {
+            if let Some(win) = &self.window {
+                win.request_redraw();
+            }
         }
     }
 }

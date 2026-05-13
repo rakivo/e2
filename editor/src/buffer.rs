@@ -1,4 +1,4 @@
-use crate::{COPY_ANIMATION_MAX_ID, PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}};
+use crate::{COPY_ANIMATION_MAX_ID, PASTE_ANIMATION_MAX_ID, lexer::{LexState, Token, lex_from}, ts::{e2_InputEdit, e2_Point}};
 
 use std::{io::{BufWriter, Write}, path::Path};
 
@@ -78,6 +78,8 @@ pub struct Buffer {
     pub next_copy_id:  u8, // Starts at 8, wraps at  COPY_ANIMATION_MAX_ID+1
     pub next_paste_id: u8, // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
 
+    pub filestem_atom: crate::atum::Atom,
+
     pub currently_animated_copies: SmallVec<[AnimatedRegion; 4]>, // copy,  ids 9..=15
     pub currently_animated_pastes: SmallVec<[AnimatedRegion; 4]>, // paste, ids 1..=8
 }
@@ -108,6 +110,48 @@ impl Buffer {
         let byte_len   = byte_end - byte_start;
 
         self.animate_paste(byte_start as _, byte_len as _);
+    }
+
+    pub fn byte_to_point(&self, byte: usize) -> e2_Point {
+        let line = self.text.byte_to_line(byte);
+        let col  = byte - self.text.line_to_byte(line);
+        e2_Point::new(line, col)
+    }
+
+    pub fn last_insert_to_input_edit(&self) -> Option<e2_InputEdit> {
+        let (char_index, byte_len) = self.last_insert?;
+
+        let byte_len = byte_len as usize;
+        let byte = self.text.char_to_byte(char_index);
+
+        Some(e2_InputEdit {
+            new_end_byte: (byte + byte_len) as _,
+            new_end_position: self.byte_to_point(byte + byte_len),
+
+            start_position: self.byte_to_point(byte),
+            start_byte: byte as _,
+
+            old_end_byte: byte as _,
+            old_end_position: self.byte_to_point(byte),
+        })
+    }
+
+    pub fn last_delete_to_input_edit(&self) -> Option<e2_InputEdit> {
+        let (char_index, byte_len) = self.last_delete?;
+
+        let byte_len = byte_len as usize;
+        let byte_start = self.text.char_to_byte(char_index);
+
+        Some(e2_InputEdit {
+            new_end_byte: byte_start as _,
+            new_end_position: self.byte_to_point(byte_start),
+
+            start_position: self.byte_to_point(byte_start),
+            start_byte: byte_start as _,
+
+            old_end_byte: byte_start as _,
+            old_end_position: self.byte_to_point(byte_start + byte_len)
+        })
     }
 
     fn animate_region(
@@ -426,7 +470,7 @@ impl Buffer {
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
-        self.last_insert = Some((index, 1));
+        self.last_insert = Some((index, c.len_utf8() as _));
     }
 
     pub fn insert_char_after(&mut self, c: char, cursor: &mut Cursor) {
@@ -439,7 +483,7 @@ impl Buffer {
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
-        self.last_insert = Some((index, 1));
+        self.last_insert = Some((index, c.len_utf8() as _));
     }
 
     pub fn insert_literal(&mut self, l: &str, cursor: &mut Cursor) {
@@ -483,7 +527,7 @@ impl Buffer {
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
-        self.last_delete = Some((index, 1));
+        self.last_delete = Some((index, byte_len as _));
     }
 
     pub fn delete_forward(&mut self, cursor: &mut Cursor) {
@@ -502,7 +546,7 @@ impl Buffer {
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
-        self.last_delete = Some((cursor.char_index, 1));
+        self.last_delete = Some((cursor.char_index, byte_len as _));
     }
 
     pub fn delete_word_forward(&mut self, cursor: &mut Cursor) {

@@ -218,8 +218,8 @@ impl Director {
             //
             if chunk.generation < entry.generation { continue }
 
-            if let Some(e) = chunk.error {
-                eprintln!("scan error for {:?}: {}", chunk.path, e);
+            if let Some(_e) = chunk.error {
+                // eprintln!("Scan error for {:?}: {}", chunk.path, e);
                 entry.state = ScanState::Failed;
                 any_new = true;
                 continue;
@@ -253,6 +253,8 @@ impl Director {
     /// Never blocks - returns None if not yet ready.
     #[inline]
     pub fn get(&mut self, path: &Path) -> Option<&DirEntries> {
+        if path.to_str().map_or(false, str::is_empty) { return None };
+
         let needs_scan = match self.entries.get(path) {
             None         => true,
             Some(cached) => {
@@ -270,12 +272,14 @@ impl Director {
             .map(|c| &c.entries)
     }
 
+    #[inline]
     pub fn kick_scan(
         &mut self,
         path: impl Into<Arc<Path>>,
         is_recursive: bool, is_high_priority: bool, is_user_initiated: bool
     ) {
         let path = path.into();
+        if path.to_str().map_or(false, str::is_empty) { return };
 
         let generation = self.entries.get(&path)
             .map(|c| c.generation + 1)
