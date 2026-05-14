@@ -1431,10 +1431,11 @@ pub fn render_text_layout(
             return;
         };
 
+        // :Configuration
         let pad_x     = 6.0;
         let pad_y_top = 4.0;
         let pad_y_bot = 6.0;
-        let font_size = 14.0;
+        let font_size = editor.font_size() * 0.75;
 
         let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
 
@@ -1455,9 +1456,6 @@ pub fn render_text_layout(
             param_ranges.push(PieceRange { start, end, active: i == overlay.arg_index as usize });
         }
 
-        //
-        // Now scratch is done growing, safe to slice
-        //
         let func_name = editor.tree_sitter.atom_table.lookup_ref(overlay.call_kind.function_name());
         let mut pieces: SmallVec<[(&str, bool); 16]> = SmallVec::new();
         pieces.push((func_name.as_str(), false));
@@ -1474,6 +1472,7 @@ pub fn render_text_layout(
         //
         // Measure
         //
+
         let mut text_w: f32 = 0.0;
         for (text, _) in &pieces {
             text_w += gpu::measure_str(gpu, text, font_size);
@@ -1484,6 +1483,7 @@ pub fn render_text_layout(
         //
         // Position
         //
+
         let margin = 8.0;
         let mut ox = crect.x + 14.0;
         let mut oy = crect.y - overlay_h - 6.0;
@@ -1493,21 +1493,25 @@ pub fn render_text_layout(
         //
         // Draw
         //
-        gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E));
-        gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A));
 
-        //
-        // Text
-        //
+        let   bg_opacity = 0.59;
+        let text_opacity = 0.80;
+
+        gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E).with_alpha(bg_opacity));
+        gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A).with_alpha(bg_opacity));
+
         let mut tx = ox + pad_x;
         let ty = oy + pad_y_top + font_size;
         for (text, active) in &pieces {
-            let color = if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) };
+            let color =
+                if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) }.with_alpha(text_opacity);
+
             gpu::draw_text(gpu, text, tx, ty, font_size, color);
             if *active {
                 let w = gpu::measure_str(gpu, text, font_size);
-                gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D));
+                gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D).with_alpha(text_opacity));
             }
+
             tx += gpu::measure_str(gpu, text, font_size);
         }
     }
