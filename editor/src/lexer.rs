@@ -528,35 +528,50 @@ pub fn lex_from(
             }
 
             C_TICK => {
-                // Lifetimes vs Char literals
-                let is_lifetime = if i + 1 < len {
-                    let next = bytes[i+1];
-                    (next.is_ascii_alphabetic() || next == b'_') && bytes.get(i + 2) != Some(&b'\'')
-                } else {
-                    false
-                };
+                //
+                // Scan forward to find a closing ' OR a newline on this line
+                //
 
-                if is_lifetime {
-                    i += 2;
-                    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                        i += 1;
+                let mut j = i + 1;
+                let mut found_closing_quote = false;
+
+                while j < len && bytes[j] != b'\n' {
+                    if bytes[j] == b'\'' {
+                        found_closing_quote = true;
+                        j += 1;
+                        break;
                     }
 
-                    push!(TokenKind::Default, start, i);
-                } else {
-                    // Char literal logic
-                    i += 1;
-                    while i < len {
-                        if let Some(hit) = memchr::memchr2(b'\'', b'\\', &bytes[i..]) {
-                            i += hit;
-                            if bytes[i] == b'\\' { i += 2; } else { i += 1; break; }
-                        } else {
-                            i = len;
-                            break;
-                        }
+                    if bytes[j] == b'\\' {
+                        j += 1;  // Skip the escaped character
                     }
 
+                    j += 1;
+                }
+
+                if found_closing_quote {
+                    //
+                    // It's a character literal (e.g., 'a' or 'multi char')
+                    //
+                    i = j;
                     push!(TokenKind::String, start, i);
+                } else {
+                    //
+                    // No closing quote found on this line,
+                    // check if the start looks like a lifetime identifier
+                    //
+                    if i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
+                        i += 1;  // Skip the '
+                        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                            i += 1;
+                        }
+                        push!(TokenKind::Default, start, i);
+                    } else {
+                        // Just a stray quote mark,
+                        // consume only the ' to prevent "spreading" to the end of the file
+                        i += 1;
+                        push!(TokenKind::Punct, start, i);
+                    }
                 }
             }
 
