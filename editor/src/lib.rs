@@ -1435,7 +1435,7 @@ pub fn render_text_layout(
         let pad_x     = 6.0;
         let pad_y_top = 4.0;
         let pad_y_bot = 6.0;
-        let font_size = editor.font_size() * 0.75;
+        let font_size = editor.font_size() * 0.85;
 
         let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
 
