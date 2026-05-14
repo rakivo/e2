@@ -2443,6 +2443,9 @@ impl Editor {
         // Reset the edits!
         //
         for buffer in self.buffers.values_mut() {
+            // Reset inside adjust_cursors_after_buffer_mutation
+            // buffer.last_insert = None;
+            // buffer.last_delete = None;
             buffer.ts_edits_in_this_frame.clear();
         }
 
@@ -3645,7 +3648,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
     let mut adjusted_views: SmallVec<[ViewId; 24]> = SmallVec::new();
 
     for (buffer_id, buffer) in editor.buffers.iter_mut() {
-        if let Some((at, len)) = buffer.last_insert {
+        if let Some((at, len)) = buffer.last_insert.take() {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
                 if vid == active_view_id       { continue }
@@ -3661,7 +3664,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
             }
         }
 
-        if let Some((at, len)) = buffer.last_delete {
+        if let Some((at, len)) = buffer.last_delete.take() {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
                 if vid == active_view_id       { continue }
