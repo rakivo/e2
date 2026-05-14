@@ -7,8 +7,16 @@ edition = "2024"
 # profiling
 tracy = ["tracy-client/enable"]
 
+# allocators
+mimalloc = ["dep:mimalloc", "custom/mimalloc"]
+dhat = ["dep:dhat", "custom/dhat"]
+
 [dependencies]
 editor = { path = "../editor" }
+custom = { path = "../custom" }
+
+mimalloc = { version = "=0.1.47", optional = true }
+dhat = { version = "0.3.3", default-features = false, optional = true }
 
 winit              .workspace = true
 crossbeam-channel  .workspace = true

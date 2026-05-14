@@ -1,16 +1,12 @@
-// @Speed @Note: I really did try using custom allocators,
-// but they don't seem to work when there's a dynamic library (ABI?)
-// boundary involved.
-//
-// Worth looking into though.
-//
-// #[cfg(feature = "dhat")]
-// #[global_allocator]
-// static ALLOC: dhat::Alloc = dhat::Alloc;
-//
-// #[cfg(feature = "mimalloc")]
-// #[global_allocator]
-// static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// @Important @Note: Must match the allocator `custom` uses
+
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use editor::color::Color;
 use editor::*;
@@ -789,6 +785,10 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    // @Note: This crashes for some reason?
+    // #[cfg(feature = "dhat")]
+    // let _profiler = dhat::Profiler::new_heap();
+
     let _client = tracy_client::Client::start();
 
     // @Note: We want to start Audio initialization as soon as possible,

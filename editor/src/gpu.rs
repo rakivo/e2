@@ -112,7 +112,6 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
-        flags: wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG,
         ..Default::default()
     });
 
@@ -745,7 +744,7 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
     let total_verts = gpu.batch_pool.iter().map(|b| b.verts.len()).sum::<usize>();
     let byte_size = (total_verts * size_of::<Vert>()) as u64;
 
-    let mut draws = Vec::new();
+    let mut draws = SmallVec::<[Draw; 8]>::new();
 
     if byte_size > 0 {
         if byte_size > gpu.current_vertex_buffer_capacity {
@@ -789,16 +788,6 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
     let view   = output.texture.create_view(&Default::default());
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     {
-        let atlas_view = gpu.atlas_tex.create_view(&Default::default());
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &gpu.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gpu.atlas_sampler) },
-            ],
-        });
-
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
@@ -815,7 +804,7 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
         if !draws.is_empty() {
             pass.set_pipeline(&gpu.pipeline);
             // use this local bind_group instead of gpu.bind_group
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &gpu.bind_group, &[]);
             // pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
 

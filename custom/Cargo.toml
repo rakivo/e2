@@ -6,9 +6,17 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# allocators
+mimalloc = ["dep:mimalloc"]
+dhat = ["dep:dhat"]
+
 [dependencies]
 editor = { path = "../editor" }
 editor-macros = { path = "../editor-macros" }
+
+mimalloc = { version = "=0.1.47", optional = true }
+dhat = { version = "0.3.3", default-features = false, optional = true }
 
 rustc-edit-distance.workspace = true
 memchr             .workspace = true

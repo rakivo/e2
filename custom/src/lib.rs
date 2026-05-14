@@ -1,12 +1,12 @@
-// @Note: See @Note at the top of core/src/main.rs
-//
-// #[cfg(feature = "dhat")]
-// #[global_allocator]
-// static ALLOC: dhat::Alloc = dhat::Alloc;
-//
-// #[cfg(feature = "mimalloc")]
-// #[global_allocator]
-// static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// @Important @Note: Must match the allocator `core` uses
+
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod lsp;
 
