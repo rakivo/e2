@@ -43,7 +43,7 @@ use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
 use command::{CommandContext, CommandAtom};
 use director::Director;
-use ts::TreeSitter;
+use ts::{ParseResultKind, TreeSitter};
 
 use std::any::Any;
 use std::num::NonZero;
@@ -2401,16 +2401,8 @@ impl Editor {
                         }
                     }
                 }
-            }
 
-            //
-            // Send the edits to the background thread
-            //
-            {
-                let buf = self.active_buffer();
-                for &edit in &buf.ts_edits_in_this_frame {
-                    self.tree_sitter.send_edit(buffer_id, edit, rope.clone());
-                }
+                self.tree_sitter.send_reparse(buffer_id, rope.clone());
             }
 
             let (view, buf) = self.active_view_and_buffer_mut();
@@ -2460,25 +2452,18 @@ impl Editor {
         let mut redraw = ShouldRequestFrameRedraw::No;
 
         // @Cleanup :TreeSitter
-        {
-            while let Ok(result) = self.tree_sitter.result.try_recv() {
-                let buffer_filename = self.buffers[result.buffer_id].filestem_atom;
-                for info in result.functions {
-                    self.tree_sitter.func_table.insert(info, buffer_filename);
-                }
+        while let Ok(result) = self.tree_sitter.result.try_recv() {
+            let buffer_filename = self.buffers[result.buffer_id].filestem_atom;
+            if let ParseResultKind::FunctionsUpdate { functions } = result.kind {
+                self.tree_sitter.func_table.insert_batch(functions, buffer_filename);
+                continue;
+            }
 
-                // Update overlay result for the view that made the cursor query
-                if let Some(overlay_result) = result.overlay {
-                    for view in self.views.values_mut() {
-                        if view.buffer_id == result.buffer_id {
-                            redraw = redraw.or_msg("Overlay update", &mut self.redraw_reasons);
-
-                            view.overlay.current = Some(overlay_result);
-                            break;  // Cursor query came from one specific view
-                        }
-                    }
-                } else {
+            if let ParseResultKind::FuncCallOverlayUpdate { overlay } = result.kind {
+                let Some(overlay) = overlay else {
+                    //
                     // Bg thread found no call expression at cursor, clear overlay
+                    //
                     for view in self.views.values_mut() {
                         if view.buffer_id == result.buffer_id {
                             redraw = redraw.or_msg("Overlay update", &mut self.redraw_reasons);
@@ -2486,6 +2471,19 @@ impl Editor {
                             view.overlay.current = None;
                             break;
                         }
+                    }
+
+                    continue;
+                };
+
+                //
+                // Update overlay result for the view that made the cursor query
+                //
+                for view in self.views.values_mut() {
+                    if view.buffer_id == result.buffer_id {
+                        redraw = redraw.or_msg("Overlay update", &mut self.redraw_reasons);
+
+                        view.overlay.current = Some(overlay.clone());  // @Clone
                     }
                 }
             }

@@ -231,6 +231,102 @@ pub fn move_to_first_character_in_current_line(cx: &mut CommandContext) {
     view.cursor.preferred_col = None;
 }
 
+macro_rules! ts_nav_command {
+    ($name:ident, $nav_fn:path) => {
+        #[command]
+        pub fn $name(cx: &mut CommandContext) {
+            let (view, buf) = cx.editor.active_view_and_buffer_mut();
+            let buffer_id   = view.buffer_id;
+            let char_index  = view.cursor.char_index;
+            let cursor_byte = buf.text.char_to_byte(char_index);
+
+            let Some(tree) = cx.editor.tree_sitter.trees.get(&buffer_id) else { return };
+            let target_byte = $nav_fn(tree.root_node(), cursor_byte);
+            drop(tree);
+
+            if let Some(byte) = target_byte {
+                let (view, buf) = cx.editor.active_view_and_buffer_mut();
+                view.cursor.char_index    = buf.text.byte_to_char(byte);
+                view.cursor.preferred_col = None;
+            }
+        }
+    }
+}
+
+ts_nav_command!(jump_definition_prev,          editor::ts::jump_definition_prev);
+ts_nav_command!(jump_definition_next,          editor::ts::jump_definition_next);
+ts_nav_command!(jump_scope_prev,               editor::ts::jump_scope_prev);
+ts_nav_command!(jump_scope_next,               editor::ts::jump_scope_next);
+ts_nav_command!(jump_matching_delim_backward,  editor::ts::jump_matching_delim_backward);
+ts_nav_command!(jump_matching_delim_forward,   editor::ts::jump_matching_delim_forward);
+
+fn find_prev_blank_line(buf: &Buffer, from_char: usize) -> usize {
+    let text = &buf.text;
+    let current_line = text.char_to_line(from_char);
+
+    // search backward from line above current
+    let mut line = current_line.saturating_sub(1);
+    loop {
+        let line_text = text.line(line);
+        let is_blank = line_text.chars().all(|c| c == '\n' || c.is_whitespace());
+        if is_blank {
+            return text.line_to_char(line);
+        }
+        if line == 0 { return 0; }
+        line -= 1;
+    }
+}
+
+fn find_next_blank_line(buf: &Buffer, from_char: usize) -> usize {
+    let text = &buf.text;
+    let total_lines = text.len_lines();
+    let current_line = text.char_to_line(from_char);
+
+    let mut line = current_line + 1;
+    while line < total_lines {
+        let line_text = text.line(line);
+        let is_blank = line_text.chars().all(|c| c == '\n' || c.is_whitespace());
+        if is_blank {
+            return text.line_to_char(line);
+        }
+        line += 1;
+    }
+    text.len_chars()
+}
+
+#[command]
+pub fn move_backward_paragraph(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let target = find_prev_blank_line(buf, view.cursor.char_index);
+    view.cursor.char_index    = target;
+    view.cursor.preferred_col = None;
+}
+
+#[command]
+pub fn move_forward_paragraph(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let target = find_next_blank_line(buf, view.cursor.char_index);
+    view.cursor.char_index    = target;
+    view.cursor.preferred_col = None;
+}
+
+#[command]
+pub fn kill_paragraph_forward(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let from  = view.cursor.char_index;
+    let len   = buf.text.len_chars();
+    if from >= len { return; }
+
+    let target = find_next_blank_line(buf, from);
+    let end    = target.min(len);
+    if end == from { return; }
+
+    view.cursor.anchor_char_index = Some(end);
+    copy_impl(cx, false, false);
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.delete_selection_without_animation(&mut view.cursor);
+}
+
 #[command]
 pub fn delete_word_forward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
@@ -1974,11 +2070,24 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     *cx.command_table = CommandTable::from_commands(loaded.commands);
     *cx.keymap = Keymap::default_keymap(&mut cx.command_table);
 
-    cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build"));            // nocheckin
-    cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));        // nocheckin
-    cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));   // nocheckin
-    cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk")); // nocheckin
-    cx.keymap.bind(KeyCombo::ctrl_alt('\\'), cx.command_table.intern("indent_region"));    // nocheckin
+    cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build"));              // nocheckin
+    cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));          // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));     // nocheckin
+    cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk"));   // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('\\'), cx.command_table.intern("indent_region"));      // nocheckin
+
+    cx.keymap.bind(KeyCombo::ctrl_alt('p'), cx.command_table.intern("jump_scope_start")); // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('n'), cx.command_table.intern("jump_scope_end"));   // nocheckin
+
+    cx.keymap.bind(KeyCombo::ctrl_alt('a'), cx.command_table.intern("jump_definition_prev")); // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('e'), cx.command_table.intern("jump_definition_next"));   // nocheckin
+
+    cx.keymap.bind(KeyCombo::ctrl_alt('b'), cx.command_table.intern("jump_matching_delim_backward")); // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('f'), cx.command_table.intern("jump_matching_delim_forward"));   // nocheckin
+
+    cx.keymap.bind(KeyCombo::alt('{'), cx.command_table.intern("move_backward_paragraph"));   // nocheckin
+    cx.keymap.bind(KeyCombo::alt('}'), cx.command_table.intern("move_forward_paragraph"));    // nocheckin
+    cx.keymap.bind(KeyCombo::alt('k'), cx.command_table.intern("kill_paragraph_forward"));    // nocheckin
 
     setup_hooks(cx);
     editor_initialize_custom_data(cx.editor, cx.gpu);

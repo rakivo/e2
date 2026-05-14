@@ -84,32 +84,41 @@ pub enum ParserMessage {
         rope: Rope,
     },
 
-    Edit {
+    Reparse {
         buffer_id: BufferId,
-        edit: e2_InputEdit,
         rope: Rope,
     },
 }
 
 pub enum ParserQuery {
-    Cursor {
+    FuncCallOverlay {
         buffer_id: BufferId,
         cursor_byte: usize,
         rope: Rope,
     },
 }
 
+pub enum ParseResultKind {
+    FunctionsUpdate {
+        functions: Vec<FunctionInfo>
+    },
+
+    FuncCallOverlayUpdate {
+        overlay: Option<Overlay>,
+    },
+}
+
 pub struct ParseResult {
     pub buffer_id: BufferId,
-    pub functions: Vec<FunctionInfo>,
-    pub overlay:   Option<OverlayResult>,
+
+    pub kind: ParseResultKind,
 }
 
 #[derive(Debug, Clone)]
 pub enum CallKind {
     Bare(Atom),                  // bar()
     AssocOrPath(Atom, Atom),     // Foo::bar() or foo::bar() - check by_impl first, then by_module
-    FullPath([Atom; 4], Atom),   // foo::...::baz::bar()
+    FullPath([Atom; 4], Atom),   // foo::...::baz::bar() @Memory
     Method(Atom),                // .bar() - name only, ambiguous
 }
 
@@ -124,7 +133,7 @@ impl CallKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct OverlayResult {
+pub struct Overlay {
     pub call_kind: CallKind,
     pub arg_index: u16,
     pub opening_paren_byte: u32,
@@ -146,14 +155,14 @@ pub struct TreeSitter {
 
 impl TreeSitter {
     #[inline]
-    pub fn query_cursor_overlay_without_sending(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<OverlayResult> {
+    pub fn query_cursor_overlay_without_sending(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<Overlay> {
         let tree = self.trees.get(&buffer_id)?;
         let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte)?;
         find_call_overlay(node, cursor_byte, rope, &self.atom_table)
     }
 
     #[inline]
-    pub fn query_cursor_overlay(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<OverlayResult> {
+    pub fn query_cursor_overlay(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<Overlay> {
         if let Some(o) = self.query_cursor_overlay_without_sending(buffer_id, cursor_byte, rope) {
             return Some(o);
         }
@@ -164,8 +173,8 @@ impl TreeSitter {
     }
 
     #[inline]
-    pub fn send_edit(&self, buffer_id: BufferId, edit: e2_InputEdit, rope: Rope) {
-        _ = self.message_tx.send(ParserMessage::Edit { buffer_id, edit, rope });
+    pub fn send_reparse(&self, buffer_id: BufferId, rope: Rope) {
+        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, rope });
     }
 
     #[inline]
@@ -175,7 +184,7 @@ impl TreeSitter {
 
     #[inline]
     pub fn send_cursor_query(&self, buffer_id: BufferId, cursor_byte: usize, rope: Rope) {
-        _ = self.query_tx.send(ParserQuery::Cursor { buffer_id, cursor_byte, rope });
+        _ = self.query_tx.send(ParserQuery::FuncCallOverlay { buffer_id, cursor_byte, rope });
     }
 }
 
@@ -198,75 +207,73 @@ pub fn spawn() -> TreeSitter {
 fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, result_tx: Sender<ParseResult>, table: Arc<AtomTable>, trees: Arc<DashMap<BufferId, Tree>>) {
     let mut parser  = Parser::new();
 
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
+    parser.set_language(&tree_sitter_rust::LANGUAGE.into())
         .expect("failed to load Rust grammar");
+
+    fn rope_chunk_callback<'a>(rope: &'a Rope, byte: usize) -> &'a [u8] {
+        if byte >= rope.len_bytes() { return &[]; }
+        let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
+        &chunk.as_bytes()[(byte - chunk_start)..]
+    }
 
     loop {
         crossbeam_channel::select! {
             recv(query_rx) -> q => match q {
-                Ok(ParserQuery::Cursor { buffer_id, cursor_byte, rope }) => {
+                Ok(ParserQuery::FuncCallOverlay { buffer_id, cursor_byte, rope }) => {
                     let Some(tree) = trees.get(&buffer_id) else { continue };
 
                     let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte);
                     let overlay = node.and_then(|n| find_call_overlay(n, cursor_byte, &rope, &table));
-                    _ = result_tx.send(ParseResult { buffer_id, functions: vec![], overlay });
+
+                    _ = result_tx.send(ParseResult {
+                        buffer_id,
+                        kind: ParseResultKind::FuncCallOverlayUpdate { overlay }
+                    });
                 }
 
                 _ => {}
             },
 
             recv(edit_rx) -> msg => match msg {
-                Ok(ParserMessage::Edit { buffer_id, edit, rope }) => {
-                    let old_tree = trees.get(&buffer_id).map(|m| m.value().clone());
+                Ok(ParserMessage::Reparse { buffer_id, rope }) => {
+                    //
+                    // Grab the already-edited tree as hint, main thread already called tree.edit() on it
+                    //
+                    let old_tree = trees.get(&buffer_id).as_deref().cloned();
 
-                    let mut tree_to_parse = None;
-                    if let Some(mut cloned_tree) = old_tree {
-                        cloned_tree.edit(&edit.into());
-                        tree_to_parse = Some(cloned_tree);
-                    }
-
-                    let mut callback = |byte: usize, _point: Point| {
-                        // Guard against Tree-Sitter probing the end of the document
-                        if byte >= rope.len_bytes() {
-                            return &[][..];
-                        }
-
-                        let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
-                        &chunk.as_bytes()[(byte - chunk_start)..]
-                    };
+                    let mut callback = |byte: usize, _point: Point| rope_chunk_callback(&rope, byte);
 
                     let Some(new_tree) = parser.parse_with_options(
                         &mut callback,
-                        tree_to_parse.as_ref(),
-                        None,
-                    ) else { continue };
+                        old_tree.as_ref(),
+                        None
+                    ) else {
+                        continue
+                    };
 
                     let functions = collect_functions(new_tree.root_node(), &rope, buffer_id, &table);
                     trees.insert(buffer_id, new_tree);
 
-                    _ = result_tx.send(ParseResult { buffer_id, functions, overlay: None });
+                    _ = result_tx.send(ParseResult {
+                        buffer_id,
+                        kind: ParseResultKind::FunctionsUpdate { functions }
+                    });
                 }
 
                 Ok(ParserMessage::Initialize { buffer_id, rope }) => {
                     if trees.contains_key(&buffer_id) { continue; }
 
-                    let mut callback = |byte: usize, _point: Point| {
-                        // Guard against Tree-Sitter probing the end of the document
-                        if byte >= rope.len_bytes() {
-                            return &[][..];
-                        }
-
-                        let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
-                        &chunk.as_bytes()[(byte - chunk_start)..]
-                    };
+                    let mut callback = |byte: usize, _point: Point| rope_chunk_callback(&rope, byte);
 
                     let Some(tree) = parser.parse_with_options(&mut callback, None, None) else { continue };
 
                     let functions = collect_functions(tree.root_node(), &rope, buffer_id, &table);
                     trees.insert(buffer_id, tree);
 
-                    _ = result_tx.send(ParseResult { buffer_id, functions, overlay: None });
+                    _ = result_tx.send(ParseResult {
+                        buffer_id,
+                        kind: ParseResultKind::FunctionsUpdate { functions }
+                    });
                 }
 
                 _ => {}
@@ -330,41 +337,51 @@ impl FunctionTable {
         }
     }
 
-    #[inline]
-    pub fn insert(&mut self, info: FunctionInfo, buffer_filename: Atom) -> FuncRef {
-        let name      = info.name;
-        let impl_name = info.impl_name;
-        let buffer_id = info.buffer_id;
+    pub fn insert_batch(&mut self, infos: Vec<FunctionInfo>, buffer_stem: Atom) {
+        // pre-reserve capacity in all maps
+        let n = infos.len();
+        self.by_name.reserve(n);
+        self.by_impl.reserve(n);
+        self.by_module.reserve(n);
 
-        let effective_module: &[Atom] = if info.module.is_empty() {
-            std::slice::from_ref(&buffer_filename)
-        } else {
-            &info.module
-        };
-        let module_hash = hash_module(&effective_module);
+        for info in infos {
+            let name      = info.name;
+            let impl_name = info.impl_name;
+            let module    = info.module.clone();
+            let buffer_id = info.buffer_id;
 
-        let func = if let Some(slot) = self.free_list.pop() {
-            let new_gen = self.fns[slot].generation.wrapping_add(1).max(1);
-            self.fns[slot] = FunctionInfo { generation: new_gen, ..info };
-            slot
-        } else {
-            self.fns.push(info)
-        };
+            let effective_module: &[Atom] = if module.is_empty() {
+                std::slice::from_ref(&buffer_stem)
+            } else {
+                &module
+            };
+            let module_hash = hash_module(effective_module);
 
-        let generation = self.fns[func].generation;
-        let r = FuncRef { id: func, generation };
+            let func = if let Some(slot) = self.free_list.pop() {
+                let new_gen = self.fns[slot].generation.wrapping_add(1).max(1);
+                self.fns[slot] = FunctionInfo { generation: new_gen, ..info };
+                slot
+            } else {
+                self.fns.push(info)
+            };
 
-        self.by_name.entry(name).or_default().push(r);
+            let generation = self.fns[func].generation;
+            let r = FuncRef { id: func, generation };
 
-        if let Some(impl_atom) = impl_name {
-            self.by_impl.insert((impl_atom, name), r);
+            self.by_name.entry(name).or_insert_with(|| SmallVec::new()).push(r);
+
+            if let Some(impl_atom) = impl_name {
+                self.by_impl.insert((impl_atom, name), r);
+            }
+
+            self.by_module.insert((module_hash, name), r);
+            self.by_buffer.entry(buffer_id).or_insert_with(Vec::new).push(func);
         }
+    }
 
-        self.by_module.insert((module_hash, name), r);
-
-        self.by_buffer.entry(buffer_id).or_default().push(func);
-
-        r
+    pub fn replace_buffer_batch(&mut self, buffer_id: BufferId, buffer_stem: Atom, new_fns: Vec<FunctionInfo>) {
+        self.remove_buffer(buffer_id);
+        self.insert_batch(new_fns, buffer_stem);
     }
 
     #[inline]
@@ -402,15 +419,6 @@ impl FunctionTable {
             }
 
             self.free_list.push(func);
-        }
-    }
-
-    // Convenience: remove old buffer entries then insert all new ones atomically
-    #[inline]
-    pub fn replace_buffer(&mut self, buffer_id: BufferId, buffer_filename: Atom, new_fns: Vec<FunctionInfo>) {
-        self.remove_buffer(buffer_id);
-        for info in new_fns {
-            self.insert(info, buffer_filename);
         }
     }
 
@@ -566,7 +574,7 @@ fn rope_slice_to_atom(source: &Rope, start_byte: usize, end_byte: usize, table: 
 
 #[derive(Debug, Clone, Default)]
 pub struct OverlayState {
-    pub current: Option<OverlayResult>,
+    pub current: Option<Overlay>,
 }
 
 impl OverlayState {
@@ -597,7 +605,7 @@ impl OverlayState {
     }
 }
 
-fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &Rope, table: &AtomTable) -> Option<OverlayResult> {
+fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &Rope, table: &AtomTable) -> Option<Overlay> {
     loop {
         if node.kind() == "call_expression" {
             let fn_node = node.child_by_field_name("function")?;
@@ -621,7 +629,7 @@ fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &Rope, table: &
             let call_kind = parse_call_kind(fn_node, source, table);
             let arg_index = count_arg_index(args, cursor_byte) as u16;
 
-            return Some(OverlayResult { call_kind, arg_index, opening_paren_byte, closing_paren_byte });
+            return Some(Overlay { call_kind, arg_index, opening_paren_byte, closing_paren_byte });
         }
 
         if let Some(parent) = node.parent() {
@@ -725,7 +733,7 @@ fn count_arg_index(args_node: Node, cursor_byte: usize) -> usize {
 }
 
 pub fn lookup_overlay<'a>(
-    result: &OverlayResult,
+    result: &Overlay,
     func_table:  &'a FunctionTable,
     _atom_table: &AtomTable
 ) -> Option<&'a FunctionInfo> {
@@ -745,12 +753,12 @@ pub fn lookup_overlay<'a>(
     func_table.get(func_ref)
 }
 
-pub fn overlay_needs_reset(o: &OverlayResult, edit: &e2_InputEdit) -> bool {
+pub fn overlay_needs_reset(o: &Overlay, edit: &e2_InputEdit) -> bool {
                                               edit.start_byte < o.opening_paren_byte ||
     o.closing_paren_byte.map_or(false, |byte| edit.start_byte > byte.get())
 }
 
-pub fn overlay_needs_reset_cursor_byte(o: &OverlayResult, cursor_byte: u32) -> bool {
+pub fn overlay_needs_reset_cursor_byte(o: &Overlay, cursor_byte: u32) -> bool {
                                               cursor_byte < o.opening_paren_byte ||
     o.closing_paren_byte.map_or(false, |byte| cursor_byte > byte.get())
 }
@@ -767,7 +775,7 @@ fn find_incomplete_call_overlay(
     cursor_byte: usize,
     source: &Rope,
     table: &AtomTable,
-) -> Option<OverlayResult> {
+) -> Option<Overlay> {
     let cursor_byte = cursor_byte.min(source.len_bytes());
 
     let open_paren_byte = find_opening_paren_before_cursor(source, cursor_byte, LOOKBACK_BYTES)?;
@@ -780,7 +788,7 @@ fn find_incomplete_call_overlay(
     let call_kind = parse_incomplete_call_kind(&callee.text, callee.start_byte, table)?;
     let arg_index = count_incomplete_arg_index(source, open_paren_byte, cursor_byte)?;
 
-    Some(OverlayResult {
+    Some(Overlay {
         call_kind,
         arg_index: arg_index as u16,
         opening_paren_byte: open_paren_byte as u32,
@@ -1416,4 +1424,304 @@ fn consume_rust_syntax_forward(
     }
 
     false
+}
+
+//
+// Shared predicates
+//
+
+pub fn is_definition_node(node: Node) -> bool {
+    if !node.is_named() { return false; }
+    matches!(node.kind(),
+        | "function_item"
+        | "impl_item"
+        | "mod_item"
+        | "trait_item"
+        | "struct_item"
+        | "enum_item"
+        | "static_item"
+        | "const_item"
+        | "macro_definition"
+        | "type_item"
+    )
+}
+
+pub fn is_scope_node(node: Node) -> bool {
+    if !node.is_named() { return false; }
+    matches!(node.kind(),
+        | "function_item"
+        | "impl_item"
+        | "mod_item"
+        | "trait_item"
+        | "struct_item"
+        | "enum_item"
+        | "static_item"
+        | "const_item"
+        | "macro_definition"
+        | "macro_invocation"
+        | "block"
+        | "unsafe_block"
+        | "declaration_list"
+        | "for_expression"
+        | "while_expression"
+        | "loop_expression"
+        | "if_expression"
+        | "else_clause"
+        | "match_expression"
+        | "match_arm"
+        | "closure_expression"
+    )
+}
+
+pub fn scope_end_byte(node: Node) -> usize {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(child.kind(),
+            | "block"
+            | "declaration_list"
+            | "enum_variant_list"
+            | "field_declaration_list"
+            | "token_tree"
+        ) {
+            return child.end_byte().saturating_sub(1);
+        }
+    }
+    node.end_byte().saturating_sub(1)
+}
+
+//
+// Core traversal primitives - O(depth + distance), no allocation
+//
+
+// Walk forward in document order from `node`, skipping `node` itself.
+// Visits children before siblings (pre-order).
+fn next_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    // descend into first child if any
+    if node.child_count() > 0 {
+        return node.child(0);
+    }
+    // otherwise walk up until we find a next sibling
+    ascend_to_next_sibling(node)
+}
+
+fn ascend_to_next_sibling(mut node: Node) -> Option<Node> {
+    loop {
+        if let Some(sib) = node.next_sibling() {
+            return Some(sib);
+        }
+        node = node.parent()?;
+    }
+}
+
+// Walk backward in document order from `node`, skipping `node` itself.
+// This is the reverse pre-order: prev sibling's rightmost leaf, then parent.
+fn prev_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    if let Some(sib) = node.prev_sibling() {
+        // rightmost leaf of the previous sibling
+        return Some(rightmost_leaf(sib));
+    }
+    node.parent()
+}
+
+fn rightmost_leaf(mut node: Node) -> Node {
+    loop {
+        let c = node.child_count();
+        if c == 0 { return node; }
+        node = node.child((c - 1) as _).unwrap();
+    }
+}
+
+fn next_named_matching<'a, F>(start: Node<'a>, pred: F) -> Option<Node<'a>>
+where F: Fn(Node<'a>) -> bool {
+    let mut cur = next_node(start);
+    while let Some(n) = cur {
+        if n.is_named() && pred(n) { return Some(n); }
+        cur = next_node(n);
+    }
+    None
+}
+
+fn prev_named_matching<'a, F>(start: Node<'a>, pred: F) -> Option<Node<'a>>
+where F: Fn(Node<'a>) -> bool {
+    let mut cur = prev_node(start);
+    while let Some(n) = cur {
+        if n.is_named() && pred(n) { return Some(n); }
+        cur = prev_node(n);
+    }
+    None
+}
+
+fn find_enclosing<'a, F>(mut node: Node<'a>, pred: F) -> Option<Node<'a>>
+where F: Fn(Node<'a>) -> bool {
+    loop {
+        node = node.parent()?;
+        if pred(node) { return Some(node); }
+    }
+}
+
+//
+// jump_definition_prev / next
+//
+
+pub fn jump_definition_next(root: Node, cursor_byte: usize) -> Option<usize> {
+    let leaf = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+
+    // Start search from the node whose start is strictly after cursor
+    let start = if leaf.start_byte() > cursor_byte { leaf } else {
+        // Find first node that starts after cursor
+        let mut n = leaf;
+        loop {
+            match next_node(n) {
+                Some(next) if next.start_byte() > cursor_byte => { n = next; break; }
+                Some(next) => n = next,
+                None => return None,
+            }
+        }
+        n
+    };
+
+    if is_definition_node(start) {
+        return Some(start.start_byte());
+    }
+
+    next_named_matching(start, is_definition_node).map(|n| n.start_byte())
+}
+
+pub fn jump_definition_prev(root: Node, cursor_byte: usize) -> Option<usize> {
+    let leaf = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+    prev_named_matching(leaf, |n| is_definition_node(n) && n.start_byte() < cursor_byte)
+        .map(|n| n.start_byte())
+}
+
+//
+// jump_sexp_prev / next
+//
+
+pub fn jump_scope_next(root: Node, cursor_byte: usize) -> Option<usize> {
+    let leaf = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+    if let Some(n) = next_named_matching(leaf, |n| is_scope_node(n) && n.start_byte() > cursor_byte) {
+        return Some(n.start_byte());
+    }
+    // no next scope - jump to end of enclosing scope
+    find_enclosing(leaf, is_scope_node).map(scope_end_byte)
+}
+
+pub fn jump_scope_prev(root: Node, cursor_byte: usize) -> Option<usize> {
+    let leaf = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+    if let Some(n) = prev_named_matching(leaf, |n| is_scope_node(n) && n.start_byte() < cursor_byte) {
+        return Some(n.start_byte());
+    }
+    // no prev scope - jump to start of enclosing scope
+    find_enclosing(leaf, is_scope_node).map(|n| n.start_byte())
+}
+
+//
+// jump_matching_delim_backward / forward O(depth)
+//
+
+pub fn jump_matching_delim_forward(root: Node, cursor_byte: usize) -> Option<usize> {
+    let node = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+    if let Some(close) = matching_close_from(node, cursor_byte) {
+        return Some(close);
+    }
+    find_enclosing_delim_end(node)
+}
+
+pub fn jump_matching_delim_backward(root: Node, cursor_byte: usize) -> Option<usize> {
+    let node = root.descendant_for_byte_range(
+        cursor_byte.saturating_sub(1),
+        cursor_byte.saturating_sub(1),
+    )?;
+    if let Some(open) = matching_open_from(node, cursor_byte) {
+        return Some(open);
+    }
+    find_enclosing_delim_start(node)
+}
+
+fn matching_close_from(mut node: Node, cursor_byte: usize) -> Option<usize> {
+    loop {
+        if let Some(end) = child_open_delim(node, cursor_byte) { return Some(end); }
+        node = node.parent()?;
+    }
+}
+
+fn matching_open_from(mut node: Node, cursor_byte: usize) -> Option<usize> {
+    loop {
+        if let Some(start) = child_close_delim(node, cursor_byte) { return Some(start); }
+        node = node.parent()?;
+    }
+}
+
+fn find_enclosing_delim_end(mut node: Node) -> Option<usize> {
+    loop {
+        if let Some(end) = last_close_child(node) { return Some(end); }
+        node = node.parent()?;
+    }
+}
+
+fn find_enclosing_delim_start(mut node: Node) -> Option<usize> {
+    loop {
+        if let Some(start) = first_open_child(node) { return Some(start); }
+        node = node.parent()?;
+    }
+}
+
+fn child_open_delim(node: Node, at_byte: usize) -> Option<usize> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() { return None; }
+    loop {
+        let c = cursor.node();
+        if matches!(c.kind(), "(" | "[" | "{") && c.start_byte() == at_byte {
+            // found open - now find the matching close by walking rest of children
+            while cursor.goto_next_sibling() {
+                let c = cursor.node();
+                if matches!(c.kind(), ")" | "]" | "}") {
+                    return Some(c.end_byte());
+                }
+            }
+            return None;
+        }
+        if !cursor.goto_next_sibling() { break; }
+    }
+    None
+}
+
+fn child_close_delim(node: Node, at_byte: usize) -> Option<usize> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() { return None; }
+    let mut open_byte = None;
+    loop {
+        let c = cursor.node();
+        if matches!(c.kind(), "(" | "[" | "{") {
+            open_byte = Some(c.start_byte());
+        }
+        if matches!(c.kind(), ")" | "]" | "}") && c.end_byte() == at_byte {
+            return open_byte;
+        }
+        if !cursor.goto_next_sibling() { break; }
+    }
+    None
+}
+
+fn first_open_child(node: Node) -> Option<usize> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() { return None; }
+    loop {
+        let c = cursor.node();
+        if matches!(c.kind(), "(" | "[" | "{") { return Some(c.start_byte()); }
+        if !cursor.goto_next_sibling() { break; }
+    }
+    None
+}
+
+fn last_close_child(node: Node) -> Option<usize> {
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() { return None; }
+    let mut found = None;
+    loop {
+        let c = cursor.node();
+        if matches!(c.kind(), ")" | "]" | "}") { found = Some(c.end_byte()); }
+        if !cursor.goto_next_sibling() { break; }
+    }
+    found
 }
