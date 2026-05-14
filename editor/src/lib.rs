@@ -422,7 +422,8 @@ pub const fn palette() -> Palette {
     Palette {
         bg:               Color::hex(0x0f0b05),
         selection:        Color::hex(0x112c4f),
-        cursor:           Color::hex(0xc3a983),
+        // cursor:           Color::hex(0xc3a983),
+        cursor:           Color::hex(0xff0014),
         current_line:     Color::hex(0x231b0e),
         cursor_text:      Color::rgba(13, 13, 13, 255),
         paren_match:      Color::rgba(190, 128, 133, 200),
@@ -1316,6 +1317,25 @@ pub fn render_text_layout(
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         let crect = context.cursor_rect(cursor_glyph_w);
+
+        const TRAIL_STEPS: usize = 40;
+
+        let dist = ((crect.x - view.cursor_ghost_x).powi(2) + (crect.y - view.cursor_ghost_y).powi(2)).sqrt();
+
+        if dist > 2.0 {
+            for i in 0..TRAIL_STEPS {
+                let t = i as f32 / TRAIL_STEPS as f32; // 0 = ghost, 1 = cursor
+                let x = view.cursor_ghost_x + (crect.x - view.cursor_ghost_x) * t;
+                let y = view.cursor_ghost_y + (crect.y - view.cursor_ghost_y) * t;
+                let alpha = t * 0.4; // linear, fades to nothing at ghost end
+                let w = cursor_glyph_w * 0.6; // @Tune, same size throughout
+                let h = crect.h * 0.7;        // @Tune
+                let y_centered = y + (crect.h - h) * 0.5;
+                let x_centered = x + (crect.w - w) * 0.5;
+                gpu::draw_rect(gpu, x_centered, y_centered, w, h, palette().cursor.with_alpha(alpha));
+            }
+        }
+
         gpu::draw_rect(gpu, crect.x, crect.y, crect.w, crect.h, palette().cursor);
     }
 
@@ -1834,6 +1854,9 @@ pub struct View {
     pub cursor: Cursor,
     pub layout: Option<TextLayout>,
 
+    pub cursor_ghost_x: f32,
+    pub cursor_ghost_y: f32,
+
     pub overlay: crate::ts::OverlayState,
     pub persistent_state_per_buffer: FastHashMap<BufferId, ViewState>,
 }
@@ -1842,6 +1865,8 @@ impl View {
     pub fn new_with_scroll(id: ViewId, buffer_id: BufferId, scroll: f32) -> Self {
         Self {
             id, buffer_id, scroll, cursor: Cursor::new(), layout: None,
+            cursor_ghost_y: 0.0,
+            cursor_ghost_x: 0.0,
             cursor_anim_x: f32::NAN,
             cursor_anim_y: f32::NAN,
             scroll_vel: 0.0,
@@ -1953,6 +1978,14 @@ impl View {
     pub fn line_to_screen_y(&self, line: u32, rect: Rect, line_h: f32) -> f32 {
         rect.y + line as f32 * line_h - self.scroll
     }
+}
+
+pub struct FlyingCursor {
+    pub x:        f32,
+    pub y:        f32,
+    pub target_x: f32,
+    pub target_y: f32,
+    pub alpha:    f32,  // Fades out as it arrives
 }
 
 #[derive(Default)]
@@ -2068,6 +2101,8 @@ pub struct Editor {
     // Root panel id - its rect always equals the window
     pub root_panel:    PanelId,
     pub root_buffer:   BufferId,
+
+    pub flying_cursor: Option<FlyingCursor>,
 
     pub scratch_paren:     Vec<char>,
     pub scratch_panel_bar: String,
@@ -2202,6 +2237,7 @@ impl Editor {
             is_our_window_focused: false,
             mouse_left_pressed: false,
             frame_count:   0,
+            flying_cursor: None,
             last_fps_time: Instant::now(),
             fps:           0.0,
             relex_us_acc:  0.0,
@@ -2673,9 +2709,22 @@ impl Editor {
 
         self.set_active_panel(to_switch_to);
 
+        let (to_x, to_y) = {
+            let active_view = self.active_view();
+            (active_view.cursor_anim_x, active_view.cursor_anim_y)
+        };
+        self.flying_cursor = Some(FlyingCursor {
+            x: from_x,
+            y: from_y,
+            target_x: to_x,
+            target_y: to_y,
+            alpha: 1.0,
+        });
+
+        // Also snap the new view's ghost to from position so trail flows naturally
         let active_view = self.active_view_mut();
-        active_view.cursor_anim_x = from_x;
-        active_view.cursor_anim_y = from_y;
+        active_view.cursor_ghost_x = from_x;
+        active_view.cursor_ghost_y = from_y;
     }
 
     pub fn next_buffer(&mut self) -> BufferId {
@@ -3218,6 +3267,51 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
             // } else {
             //     view.cursor_anim_x = target_x;
             // }
+        }
+
+        let gx = view.cursor_ghost_x;
+        let gy = view.cursor_ghost_y;
+        let tx = view.cursor_anim_x;
+        let ty = view.cursor_anim_y;
+
+        let dx = tx - gx;
+        let dy = ty - gy;
+
+        if dx.abs() > epsilon || dy.abs() > epsilon {
+            const GHOST_RATE: f32 = 18.0; // @Tune - lower = longer/slower trail
+
+            view.cursor_ghost_x += dx * (1.0 - (-GHOST_RATE * dt).exp());
+            view.cursor_ghost_y += dy * (1.0 - (-GHOST_RATE * dt).exp());
+            should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+                "Cursor ghost trail", &mut editor.redraw_reasons
+            ));
+        } else {
+            view.cursor_ghost_x = tx;
+            view.cursor_ghost_y = ty;
+        }
+    }
+
+    if let Some(fc) = &mut editor.flying_cursor {
+        const FLYING_RATE: f32 = 40.0; // @Tune
+        const FLYING_FADE: f32 = 3.0;  // @Tune, How fast it fades on arrival
+
+        let dx = fc.target_x - fc.x;
+        let dy = fc.target_y - fc.y;
+        fc.x += dx * (1.0 - (-FLYING_RATE * dt).exp());
+        fc.y += dy * (1.0 - (-FLYING_RATE * dt).exp());
+
+        let dist = (dx * dx + dy * dy).sqrt();
+        // Start fading once close
+        if dist < line_h * 2.0 {
+            fc.alpha -= FLYING_FADE * dt;
+        }
+
+        if fc.alpha <= 0.0 {
+            editor.flying_cursor = None;
+        } else {
+            should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+                "Flying cursor", &mut editor.redraw_reasons
+            ));
         }
     }
 

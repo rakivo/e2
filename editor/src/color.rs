@@ -71,6 +71,11 @@ impl Color {
         Color { r, g, b, a }
     }
 
+    #[inline(always)]
+    pub fn with_alpha(self, alpha: f32) -> Self {
+        Self::rgba(self.r, self.g, self.b, (alpha * 255.0) as u8)
+    }
+
     #[inline]
     pub fn over(self, bg: Color) -> Color {
         let a = self.a as f32 / 255.0;

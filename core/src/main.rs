@@ -628,6 +628,24 @@ impl App {
                     redraw |= drew_all_leaf_panels_hook(&mut cx);
                 }
 
+                if let Some(fc) = &editor.flying_cursor {
+                    let line_h = editor.line_h();
+                    let font_size = editor.font_size();
+                    let min_cursor_w = editor.cursor_w();
+                    let space_width = gpu::get_glyph(gpu, ' ', font_size)
+                        .map(|g| g.advance)
+                        .unwrap_or(min_cursor_w * 4.0);
+                    let min_cursor_w = min_cursor_w.max(space_width);
+
+                    let w = min_cursor_w * 0.6;
+                    let h = line_h * 0.7;
+                    let x = fc.x + (w * 0.5);  // Center it
+                    let y = fc.y + (line_h - h) * 0.5;
+                    gpu::draw_rect(gpu, x, y, w, h, palette().cursor.with_alpha(fc.alpha * 0.6));
+
+                    redraw = redraw.or_msg("Flying cursor", &mut editor.redraw_reasons);
+                }
+
                 let t1 = Instant::now();
                 render_messager(gpu, editor);
                 editor.render_us_acc += t1.elapsed().as_micros() as f32;
