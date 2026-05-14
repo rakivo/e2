@@ -772,8 +772,12 @@ fn find_incomplete_call_overlay(
 
     let open_paren_byte = find_opening_paren_before_cursor(source, cursor_byte, LOOKBACK_BYTES)?;
     let callee = extract_callee_before_paren(source, open_paren_byte, LOOKBACK_BYTES)?;
-    let call_kind = parse_incomplete_call_kind(&callee.text, callee.start_byte, table)?;
 
+    if is_definition_context(source, callee.start_byte) {
+        return None;
+    }
+
+    let call_kind = parse_incomplete_call_kind(&callee.text, callee.start_byte, table)?;
     let arg_index = count_incomplete_arg_index(source, open_paren_byte, cursor_byte)?;
 
     Some(OverlayResult {
@@ -782,6 +786,25 @@ fn find_incomplete_call_overlay(
         opening_paren_byte: open_paren_byte as u32,
         closing_paren_byte: None,
     })
+}
+
+fn is_definition_context(source: &Rope, callee_start_byte: usize) -> bool {
+    let start = callee_start_byte.saturating_sub(32);
+    let window = source.byte_slice(start..callee_start_byte).to_string();
+
+    let trimmed = window.trim_end();
+
+    // Check if it ends with a definition keyword
+    for keyword in &["fn", "struct", "enum", "trait", "impl", "macro_rules!", "type", "mod"] {
+        if trimmed == *keyword || trimmed.ends_with(&format!(" {}", keyword))
+            || trimmed.ends_with(&format!("\t{}", keyword))
+            || trimmed.ends_with(&format!("\n{}", keyword))
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 struct CalleeSpan {
