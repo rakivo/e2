@@ -14,6 +14,7 @@ use smallstr::SmallString;
 use smallvec::SmallVec;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Default)]
 pub struct e2_Point {
     pub row:    u32,
     pub column: u32,
@@ -34,6 +35,7 @@ impl Into<Point> for e2_Point {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Default)]
 pub struct e2_InputEdit {
     pub start_byte:       u32,
     pub old_end_byte:     u32,
@@ -52,6 +54,26 @@ impl Into<InputEdit> for e2_InputEdit {
             start_position:   self.start_position.into(),
             old_end_position: self.old_end_position.into(),
             new_end_position: self.new_end_position.into(),
+        }
+    }
+}
+
+pub enum ByteOp {
+    Insert { at: usize, len: u32 },
+    Delete { at: usize, len: u32 },
+}
+
+impl e2_InputEdit {
+    pub fn as_byte_op(&self) -> ByteOp {
+        let at = self.start_byte as usize;
+
+        let del = self.old_end_byte.saturating_sub(self.start_byte);
+
+        if del == 0 {
+            let ins = self.new_end_byte.saturating_sub(self.start_byte);
+            ByteOp::Insert { at, len: ins }
+        } else {
+            ByteOp::Delete { at, len: del }
         }
     }
 }
@@ -87,7 +109,7 @@ pub struct ParseResult {
 pub enum CallKind {
     Bare(Atom),                  // bar()
     AssocOrPath(Atom, Atom),     // Foo::bar() or foo::bar() - check by_impl first, then by_module
-    FullPath(Box<[Atom]>, Atom), // foo::baz::bar()
+    FullPath([Atom; 4], Atom),   // foo::...::baz::bar()
     Method(Atom),                // .bar() - name only, ambiguous
 }
 
@@ -117,18 +139,20 @@ pub struct TreeSitter {
 
     // Shared tables for main-thread lookups
     pub atom_table: Arc<AtomTable>,
-    pub trees:  Arc<DashMap<BufferId, Tree>>,
+    pub trees:      Arc<DashMap<BufferId, Tree>>,
 
     pub func_table: FunctionTable,
 }
 
 impl TreeSitter {
+    #[inline]
     pub fn query_cursor_overlay_without_sending(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<OverlayResult> {
         let tree = self.trees.get(&buffer_id)?;
         let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte)?;
         find_call_overlay(node, cursor_byte, rope, &self.atom_table)
     }
 
+    #[inline]
     pub fn query_cursor_overlay(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<OverlayResult> {
         if let Some(o) = self.query_cursor_overlay_without_sending(buffer_id, cursor_byte, rope) {
             return Some(o);
@@ -139,14 +163,17 @@ impl TreeSitter {
         None
     }
 
+    #[inline]
     pub fn send_edit(&self, buffer_id: BufferId, edit: e2_InputEdit, rope: Rope) {
         _ = self.message_tx.send(ParserMessage::Edit { buffer_id, edit, rope });
     }
 
+    #[inline]
     pub fn send_init(&self, buffer_id: BufferId, rope: Rope) {
         _ = self.message_tx.send(ParserMessage::Initialize { buffer_id, rope });
     }
 
+    #[inline]
     pub fn send_cursor_query(&self, buffer_id: BufferId, cursor_byte: usize, rope: Rope) {
         _ = self.query_tx.send(ParserQuery::Cursor { buffer_id, cursor_byte, rope });
     }
@@ -180,6 +207,7 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
             recv(query_rx) -> q => match q {
                 Ok(ParserQuery::Cursor { buffer_id, cursor_byte, rope }) => {
                     let Some(tree) = trees.get(&buffer_id) else { continue };
+
                     let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte);
                     let overlay = node.and_then(|n| find_call_overlay(n, cursor_byte, &rope, &table));
                     _ = result_tx.send(ParseResult { buffer_id, functions: vec![], overlay });
@@ -190,19 +218,27 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
 
             recv(edit_rx) -> msg => match msg {
                 Ok(ParserMessage::Edit { buffer_id, edit, rope }) => {
-                    if let Some(mut tree) = trees.get_mut(&buffer_id) {
-                        tree.edit(&edit.into());
+                    let old_tree = trees.get(&buffer_id).map(|m| m.value().clone());
+
+                    let mut tree_to_parse = None;
+                    if let Some(mut cloned_tree) = old_tree {
+                        cloned_tree.edit(&edit.into());
+                        tree_to_parse = Some(cloned_tree);
                     }
 
-                    let old_tree = trees.get(&buffer_id);
                     let mut callback = |byte: usize, _point: Point| {
+                        // Guard against Tree-Sitter probing the end of the document
+                        if byte >= rope.len_bytes() {
+                            return &[][..];
+                        }
+
                         let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
                         &chunk.as_bytes()[(byte - chunk_start)..]
                     };
 
                     let Some(new_tree) = parser.parse_with_options(
                         &mut callback,
-                        old_tree.as_deref(),
+                        tree_to_parse.as_ref(),
                         None,
                     ) else { continue };
 
@@ -216,6 +252,11 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     if trees.contains_key(&buffer_id) { continue; }
 
                     let mut callback = |byte: usize, _point: Point| {
+                        // Guard against Tree-Sitter probing the end of the document
+                        if byte >= rope.len_bytes() {
+                            return &[][..];
+                        }
+
                         let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
                         &chunk.as_bytes()[(byte - chunk_start)..]
                     };
@@ -279,6 +320,7 @@ pub struct FunctionTable {
 }
 
 impl FunctionTable {
+    #[inline]
     pub fn get(&self, r: FuncRef) -> Option<&FunctionInfo> {
         let info = self.fns.get(r.id)?;
         if info.generation == r.generation && info.generation != 0 {
@@ -288,6 +330,7 @@ impl FunctionTable {
         }
     }
 
+    #[inline]
     pub fn insert(&mut self, info: FunctionInfo, buffer_filename: Atom) -> FuncRef {
         let name      = info.name;
         let impl_name = info.impl_name;
@@ -324,12 +367,13 @@ impl FunctionTable {
         r
     }
 
+    #[inline]
     pub fn remove_buffer(&mut self, buffer_id: BufferId) {
         let Some(funcs) = self.by_buffer.remove(&buffer_id) else { return };
 
         for func in funcs {
             let info = &mut self.fns[func];
-            if info.generation == 0 { continue; } // already dead
+            if info.generation == 0 { continue; }  // Already dead
 
             let name      = info.name;
             let impl_name = info.impl_name;
@@ -337,13 +381,13 @@ impl FunctionTable {
             let generation = info.generation;
             info.generation = 0; // mark dead
 
-            // remove from by_name
+            // Remove from by_name
             if let Some(refs) = self.by_name.get_mut(&name) {
                 refs.retain(|r| !(r.id == func && r.generation == generation));
                 if refs.is_empty() { self.by_name.remove(&name); }
             }
 
-            // remove from by_impl
+            // Remove from by_impl
             if let Some(impl_atom) = impl_name {
                 let key = (impl_atom, name);
                 if self.by_impl.get(&key).map_or(false, |r| r.id == func) {
@@ -351,7 +395,7 @@ impl FunctionTable {
                 }
             }
 
-            // remove from by_module
+            // Remove from by_module
             let key = (hash_module(&module), name);
             if self.by_module.get(&key).map_or(false, |r| r.id == func) {
                 self.by_module.remove(&key);
@@ -362,6 +406,7 @@ impl FunctionTable {
     }
 
     // Convenience: remove old buffer entries then insert all new ones atomically
+    #[inline]
     pub fn replace_buffer(&mut self, buffer_id: BufferId, buffer_filename: Atom, new_fns: Vec<FunctionInfo>) {
         self.remove_buffer(buffer_id);
         for info in new_fns {
@@ -369,6 +414,7 @@ impl FunctionTable {
         }
     }
 
+    #[inline]
     pub fn resolve_bare(&self, name: Atom) -> Option<FuncRef> {
         let refs = self.by_name.get(&name)?;
 
@@ -379,6 +425,7 @@ impl FunctionTable {
             .or_else(|| refs.first().copied())
     }
 
+    #[inline]
     pub fn resolve_method(&self, name: Atom) -> Option<FuncRef> {
         let refs = self.by_name.get(&name)?;
 
@@ -389,12 +436,14 @@ impl FunctionTable {
             .or_else(|| refs.first().copied())
     }
 
+    #[inline]
     pub fn resolve_assoc(&self, impl_name: Atom, fn_name: Atom) -> Option<FuncRef> {
         self.by_impl.get(&(impl_name, fn_name))
             .or_else(|| self.by_module.get(&(hash_module(&[impl_name]), fn_name)))
             .copied()
     }
 
+    #[inline]
     pub fn resolve_path(&self, module: &[Atom], fn_name: Atom) -> Option<FuncRef> {
         self.by_module.get(&(hash_module(module), fn_name))
             .copied()
@@ -430,43 +479,46 @@ fn visit_node(
     table:     &AtomTable,
 ) {
     match node.kind() {
-        "function_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let name   = rope_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
-                let params = collect_params(node, source, table);
-                out.push(FunctionInfo {
-                    generation: u32::MAX,
-                    name,
-                    params: params.into(),
-                    buffer_id,
-                    impl_name: ctx.impl_name,
-                    module:    ctx.module.clone().into(),
-                });
-            }
+        "function_item" => if let Some(name_node) = node.child_by_field_name("name") {
+            let name   = rope_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
+            let params = collect_params(node, source, table);
+            out.push(FunctionInfo {
+                generation: u32::MAX,
+                name,
+                params: params.into(),
+                buffer_id,
+                impl_name: ctx.impl_name,
+                module:    ctx.module.clone().into(),
+            });
         }
+
         "impl_item" => {
             let impl_name = node.child_by_field_name("type")
                 .map(|n| rope_slice_to_atom(source, n.start_byte(), n.end_byte(), table));
+
             let new_ctx = FuncContext { impl_name, module: ctx.module.clone() };
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 visit_node(child, source, buffer_id, &new_ctx, out, table);
             }
+
             return;
         }
-        "mod_item" => {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let mod_atom = rope_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
-                let mut new_module = Vec::from(ctx.module.clone());
-                new_module.push(mod_atom);
-                let new_ctx = FuncContext { impl_name: None, module: new_module.into() };
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    visit_node(child, source, buffer_id, &new_ctx, out, table);
-                }
-                return;
+
+        "mod_item" => if let Some(name_node) = node.child_by_field_name("name") {
+            let mod_atom = rope_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
+            let mut new_module = Vec::from(ctx.module.clone());
+            new_module.push(mod_atom);
+
+            let new_ctx = FuncContext { impl_name: None, module: new_module.into() };
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                visit_node(child, source, buffer_id, &new_ctx, out, table);
             }
+
+            return;
         }
+
         _ => {}
     }
 
@@ -519,12 +571,29 @@ pub struct OverlayState {
 
 impl OverlayState {
     // Just invalidates if edit precedes current call site
+    #[inline]
     pub fn on_edit(&mut self, edit: &e2_InputEdit) {
-        if let Some(ref o) = self.current {
-            if edit.start_byte <= o.opening_paren_byte {
-                self.current = None;
-            }
+        let needs_reset = self.needs_reset(edit);
+
+        if needs_reset {
+            self.current = None;
         }
+    }
+
+    #[inline]
+    pub fn needs_reset(&mut self, edit: &e2_InputEdit) -> bool {
+        self.current.as_ref().map_or(
+            false,
+            |o| overlay_needs_reset(o, edit)
+        )
+    }
+
+    #[inline]
+    pub fn needs_reset_cursor_byte(&mut self, cursor_byte: u32) -> bool {
+        self.current.as_ref().map_or(
+            false,
+            |o| overlay_needs_reset_cursor_byte(o, cursor_byte)
+        )
     }
 }
 
@@ -555,8 +624,14 @@ fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &Rope, table: &
             return Some(OverlayResult { call_kind, arg_index, opening_paren_byte, closing_paren_byte });
         }
 
-        node = node.parent()?;
+        if let Some(parent) = node.parent() {
+            node = parent;
+        } else {
+            break;
+        }
     }
+
+    find_incomplete_call_overlay(cursor_byte, source, table)
 }
 
 fn parse_call_kind(fn_node: Node, source: &Rope, table: &AtomTable) -> CallKind {
@@ -591,9 +666,16 @@ fn parse_call_kind(fn_node: Node, source: &Rope, table: &AtomTable) -> CallKind 
                     CallKind::AssocOrPath(prefix, name)
                 }
                 Some(path) => {
-                    // multi-segment: foo::baz::bar - collect all segments
-                    let segments = collect_path_segments(path, source, table);
-                    CallKind::FullPath(segments.into(), name)
+                    // multi-segment: foo::baz::bar
+                    let mut segments = collect_path_segments(path, source, table);
+                    // Prepend zeroes until len == 4
+                    while segments.len() < 4 {
+                        segments.insert(0, Atom(0));
+                    }
+                    let last4 = segments[segments.len() - 4..]
+                        .try_into()
+                        .unwrap();
+                    CallKind::FullPath(last4, name)
                 }
             }
         }
@@ -622,9 +704,11 @@ fn collect_path_segments_inner(node: Node, source: &Rope, table: &AtomTable, out
                 out.push(rope_slice_to_atom(source, name.start_byte(), name.end_byte(), table));
             }
         }
+
         "identifier" => {
             out.push(rope_slice_to_atom(source, node.start_byte(), node.end_byte(), table));
         }
+
         _ => {}
     }
 }
@@ -659,4 +743,654 @@ pub fn lookup_overlay<'a>(
     let func_ref = func_ref?;
 
     func_table.get(func_ref)
+}
+
+pub fn overlay_needs_reset(o: &OverlayResult, edit: &e2_InputEdit) -> bool {
+                                              edit.start_byte < o.opening_paren_byte ||
+    o.closing_paren_byte.map_or(false, |byte| edit.start_byte > byte.get())
+}
+
+pub fn overlay_needs_reset_cursor_byte(o: &OverlayResult, cursor_byte: u32) -> bool {
+                                              cursor_byte < o.opening_paren_byte ||
+    o.closing_paren_byte.map_or(false, |byte| cursor_byte > byte.get())
+}
+
+//
+//
+// Incomplete tree lookups!
+//
+//
+
+const LOOKBACK_BYTES: usize = 1024;
+
+fn find_incomplete_call_overlay(
+    cursor_byte: usize,
+    source: &Rope,
+    table: &AtomTable,
+) -> Option<OverlayResult> {
+    let cursor_byte = cursor_byte.min(source.len_bytes());
+
+    let open_paren_byte = find_opening_paren_before_cursor(source, cursor_byte, LOOKBACK_BYTES)?;
+    let callee = extract_callee_before_paren(source, open_paren_byte, LOOKBACK_BYTES)?;
+    let call_kind = parse_incomplete_call_kind(&callee.text, callee.start_byte, table)?;
+
+    let arg_index = count_incomplete_arg_index(source, open_paren_byte, cursor_byte)?;
+
+    Some(OverlayResult {
+        call_kind,
+        arg_index: arg_index as u16,
+        opening_paren_byte: open_paren_byte as u32,
+        closing_paren_byte: None,
+    })
+}
+
+struct CalleeSpan {
+    text: Box<str>,
+    start_byte: usize,
+}
+
+fn find_opening_paren_before_cursor( // @Memory
+    source: &Rope,
+    cursor_byte: usize,
+    lookback_bytes: usize,
+) -> Option<usize> {
+    let start = cursor_byte.saturating_sub(lookback_bytes);
+    let window = source.byte_slice(start..cursor_byte).to_string();
+
+    let mut depth = 0i32;
+    for (rel_byte, ch) in window.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    return Some(start + rel_byte);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn top_level_top_boundary(a: i32, b: i32, c: i32) -> bool {
+    a == 0 && b == 0 && c == 0
+}
+
+fn is_escaped(chars: &[(usize, char)], idx: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut i = idx;
+    while i > 0 {
+        if chars[i - 1].1 == '\\' {
+            backslashes += 1;
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    backslashes % 2 == 1
+}
+
+fn looks_like_char_literal_start(chars: &[(usize, char)], idx: usize) -> bool {
+    // Very small heuristic: `'x'`, `'\n'`, etc.
+    if idx + 1 >= chars.len() {
+        return false;
+    }
+
+    let next = chars[idx + 1].1;
+    next != '\'' && next != '\n'
+}
+
+fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTable) -> Option<CallKind> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return None;
+    }
+
+    if expr.contains("::") {
+        let parts: Vec<&str> = expr.split("::").map(str::trim).filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let name = parts.last().copied()?;
+        let name_start = expr.rfind(name)?;
+        let name_atom = rope_slice_to_atom_from_str(
+            expr, name_start, name_start + name.len(),
+            expr_start_byte,
+            table
+        );
+
+        match parts.len() {
+            1 => Some(CallKind::Bare(name_atom)),
+
+            2 => {
+                let prefix = parts[0];
+                let prefix_start = expr.find(prefix)?;
+                let prefix_atom = rope_slice_to_atom_from_str(
+                    expr, prefix_start, prefix_start + prefix.len(), expr_start_byte,
+                    table
+                );
+                Some(CallKind::AssocOrPath(prefix_atom, name_atom))
+            }
+
+            _ => {
+                let mut segs = Vec::with_capacity(4);
+                let mut pos = 0usize;
+                for part in &parts[..parts.len() - 1] {
+                    let rel = expr[pos..].find(part)?;
+                    let s = pos + rel;
+                    let e = s + part.len();
+                    segs.push(rope_slice_to_atom_from_str(expr, s, e, expr_start_byte, table));
+                    pos = e + 2;
+                }
+
+                while segs.len() < 4 {
+                    segs.insert(0, Atom(0));
+                }
+
+                let last4: [Atom; 4] = segs[segs.len() - 4..].try_into().ok()?;
+                Some(CallKind::FullPath(last4, name_atom))
+            }
+        }
+
+    } else if expr.contains('.') {
+        let name = expr.split('.').last()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let name_start = expr.rfind(name)?;
+        let atom = rope_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
+        Some(CallKind::Method(atom))
+
+    } else {
+        let name = expr.split_whitespace().last()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let name_start = expr.rfind(name)?;
+        let atom = rope_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
+        Some(CallKind::Bare(atom))
+    }
+}
+
+fn rope_slice_to_atom_from_str(
+    expr: &str,
+    start: usize,
+    end: usize,
+    _expr_start_byte: usize,
+    table: &AtomTable,
+) -> Atom {
+    let s = &expr[start..end];
+    table.intern(s)
+}
+
+fn extract_callee_before_paren( // @Memory @Refactor
+    source: &Rope,
+    open_paren_byte: usize,
+    lookback_bytes: usize,
+) -> Option<CalleeSpan> {
+    let start = open_paren_byte.saturating_sub(lookback_bytes);
+    let window = source.byte_slice(start..open_paren_byte).to_string();
+
+    let chars: Vec<(usize, char)> = window.char_indices().collect();
+    if chars.is_empty() {
+        return None;
+    }
+
+    let mut end = chars.len();
+    while end > 0 && chars[end - 1].1.is_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let mut paren_depth   = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut brace_depth   = 0i32;
+    let mut angle_depth   = 0i32;
+
+    let mut in_line_comment     = false;
+    let mut block_comment_depth = 0usize;
+    let mut in_string           = false;
+    let mut in_char             = false;
+    let mut raw_string_hashes   = None;
+    let mut in_pipe_params      = false;
+
+    let mut i = end;
+
+    while i > 0 {
+        if consume_rust_syntax_backward(
+            &chars,
+            &mut i,
+            &mut in_line_comment,
+            &mut block_comment_depth,
+            &mut in_string,
+            &mut in_char,
+            &mut raw_string_hashes,
+        ) {
+            continue;
+        }
+
+        let (_, ch) = chars[i - 1];
+        match ch {
+            ')' => paren_depth += 1,
+            ']' => bracket_depth += 1,
+            '}' => brace_depth += 1,
+            '>' => angle_depth += 1,
+
+            '(' => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                } else if top_level_top_boundary(bracket_depth, brace_depth, angle_depth) {
+                    break;
+                }
+            }
+            '[' => {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                } else if top_level_top_boundary(paren_depth, brace_depth, angle_depth) {
+                    break;
+                }
+            }
+            '{' => {
+                if brace_depth > 0 {
+                    brace_depth -= 1;
+                } else if top_level_top_boundary(paren_depth, bracket_depth, angle_depth) {
+                    break;
+                }
+            }
+            '<' => {
+                if angle_depth > 0 {
+                    angle_depth -= 1;
+                } else if top_level_top_boundary(paren_depth, bracket_depth, brace_depth) {
+                    break;
+                }
+            }
+
+            '|' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && brace_depth == 0 && angle_depth == 0 => {
+                // Heuristic: treat `|...|` closure params as one unit.
+                in_pipe_params = !in_pipe_params;
+            }
+
+            ',' | ';' | '=' | '+' | '-' | '*' | '/' | '%' | '&' | '^' | '?'
+                if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 && !in_pipe_params =>
+            {
+                break;
+            }
+
+            ':' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 && !in_pipe_params => {
+                if i >= 2 && chars[i - 2].1 == ':' {
+                    i -= 2;
+                    continue;
+                }
+                break;
+            }
+
+            '.' | '!' | '#' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 => {
+                // allowed in `foo.bar`, `foo!`, `r#foo`
+            }
+
+            c if c.is_whitespace() && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 && !in_pipe_params => {
+                break;
+            }
+
+            _ => {}
+        }
+
+        i -= 1;
+    }
+
+    let start_char = i;
+    let start_byte_rel = chars.get(start_char).map(|(b, _)| *b).unwrap_or(window.len());
+
+    let text: Box<str> = window[start_byte_rel..end].trim().into();
+    if text.is_empty() {
+        return None;
+    }
+
+    Some(CalleeSpan {
+        text,
+        start_byte: start + start_byte_rel,
+    })
+}
+
+fn count_incomplete_arg_index(  // @Memory @Refactor
+    source: &Rope,
+    open_paren_byte: usize,
+    cursor_byte: usize,
+) -> Option<usize> {
+    let cursor_byte = cursor_byte.min(source.len_bytes());
+    if cursor_byte <= open_paren_byte {
+        return Some(0);
+    }
+
+    let text = source.byte_slice(open_paren_byte + 1..cursor_byte).to_string();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+
+    let mut paren_depth   = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut brace_depth   = 0i32;
+    let mut angle_depth   = 0i32;
+
+    let mut in_line_comment     = false;
+    let mut block_comment_depth = 0usize;
+    let mut in_string           = false;
+    let mut in_char             = false;
+    let mut raw_string_hashes   = None;
+    let mut in_pipe_params      = false;
+
+    let mut commas = 0usize;
+    let mut i      = 0usize;
+
+    while i < chars.len() {
+        if consume_rust_syntax_forward(
+            &chars,
+            &mut i,
+            &mut in_line_comment,
+            &mut block_comment_depth,
+            &mut in_string,
+            &mut in_char,
+            &mut raw_string_hashes,
+        ) {
+            continue;
+        }
+
+        let (_, ch) = chars[i];
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+            }
+            '[' => bracket_depth += 1,
+            ']' => {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                }
+            }
+            '{' => brace_depth += 1,
+            '}' => {
+                if brace_depth > 0 {
+                    brace_depth -= 1;
+                }
+            }
+            '<' => angle_depth += 1,
+            '>' => {
+                if angle_depth > 0 {
+                    angle_depth -= 1;
+                }
+            }
+
+            '|' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 => {
+                in_pipe_params = !in_pipe_params;
+            }
+
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 && !in_pipe_params => {
+                commas += 1;
+            }
+
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    Some(commas)
+}
+
+fn consume_rust_syntax_backward(
+    chars: &[(usize, char)],
+    i: &mut usize,
+
+    in_line_comment: &mut bool,
+    block_comment_depth: &mut usize,
+    in_string: &mut bool,
+    in_char: &mut bool,
+    raw_string_hashes: &mut Option<usize>,
+) -> bool {
+    if *i < 1 {
+        return false;
+    }
+
+    let ch = chars[*i - 1].1;
+
+    if *in_line_comment {
+        if ch == '\n' {
+            *in_line_comment = false;
+        }
+
+        *i -= 1;
+        return true;
+    }
+
+    if *block_comment_depth > 0 {
+        if ch == '/' && *i >= 2 && chars[*i - 2].1 == '*' {
+            *block_comment_depth -= 1;
+            *i -= 2;
+            return true;
+        }
+
+        if ch == '*' && *i >= 2 && chars[*i - 2].1 == '/' {
+            *block_comment_depth += 1;
+            *i -= 2;
+            return true;
+        }
+
+        *i -= 1;
+        return true;
+    }
+
+    if let Some(hashes) = *raw_string_hashes {
+        if ch == '"' {
+            let mut ok = true;
+
+            for k in 0..hashes {
+                if *i + k >= chars.len() || chars[*i + k].1 != '#' {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if ok {
+                *raw_string_hashes = None;
+                *i -= 1;
+                return true;
+            }
+        }
+
+        *i -= 1;
+        return true;
+    }
+
+    if *in_string {
+        if ch == '"' && !is_escaped(chars, *i - 1) {
+            *in_string = false;
+        }
+
+        *i -= 1;
+        return true;
+    }
+
+    if *in_char {
+        if ch == '\'' && !is_escaped(chars, *i - 1) {
+            *in_char = false;
+        }
+
+        *i -= 1;
+        return true;
+    }
+
+    if ch == '/' && *i >= 2 {
+        let prev = chars[*i - 2].1;
+
+        if prev == '/' {
+            *in_line_comment = true;
+            *i -= 2;
+            return true;
+        }
+
+        if prev == '*' {
+            *block_comment_depth += 1;
+            *i -= 2;
+            return true;
+        }
+    }
+
+    if ch == '"' {
+        let mut hashes = 0usize;
+        let mut j = *i - 1;
+
+        while j > 0 && chars[j - 1].1 == '#' {
+            hashes += 1;
+            j -= 1;
+        }
+
+        if j > 0 && chars[j - 1].1 == 'r' {
+            *raw_string_hashes = Some(hashes);
+            *i -= 1;
+            return true;
+        } else {
+            *in_string = true;
+            *i -= 1;
+            return true;
+        }
+    }
+
+    if ch == '\'' && looks_like_char_literal_start(chars, *i - 1) {
+        *in_char = true;
+        *i -= 1;
+        return true;
+    }
+
+    false
+}
+
+fn consume_rust_syntax_forward(
+    chars: &[(usize, char)],
+    i: &mut usize,
+
+    in_line_comment: &mut bool,
+    block_comment_depth: &mut usize,
+    in_string: &mut bool,
+    in_char: &mut bool,
+    raw_string_hashes: &mut Option<usize>,
+) -> bool {
+    if *i >= chars.len() {
+        return false;
+    }
+
+    let ch = chars[*i].1;
+
+    if *in_line_comment {
+        if ch == '\n' {
+            *in_line_comment = false;
+        }
+        *i += 1;
+        return true;
+    }
+
+    if *block_comment_depth > 0 {
+        if ch == '/' && *i + 1 < chars.len() && chars[*i + 1].1 == '*' {
+            *block_comment_depth += 1;
+            *i += 2;
+            return true;
+        }
+
+        if ch == '*' && *i + 1 < chars.len() && chars[*i + 1].1 == '/' {
+            *block_comment_depth -= 1;
+            *i += 2;
+            return true;
+        }
+
+        *i += 1;
+        return true;
+    }
+
+    if let Some(hashes) = *raw_string_hashes {
+        if ch == '"' {
+            let mut ok = true;
+
+            for k in 0..hashes {
+                if *i + 1 + k >= chars.len() || chars[*i + 1 + k].1 != '#' {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if ok {
+                *raw_string_hashes = None;
+                *i += 1 + hashes;
+                return true;
+            }
+        }
+
+        *i += 1;
+        return true;
+    }
+
+    if *in_string {
+        if ch == '"' && !is_escaped(chars, *i) {
+            *in_string = false;
+        }
+
+        *i += 1;
+        return true;
+    }
+
+    if *in_char {
+        if ch == '\'' && !is_escaped(chars, *i) {
+            *in_char = false;
+        }
+
+        *i += 1;
+        return true;
+    }
+
+    if ch == '/' && *i + 1 < chars.len() {
+        let next = chars[*i + 1].1;
+
+        if next == '/' {
+            *in_line_comment = true;
+            *i += 2;
+            return true;
+        }
+
+        if next == '*' {
+            *block_comment_depth += 1;
+            *i += 2;
+            return true;
+        }
+    }
+
+    if ch == '"' {
+        let mut hashes = 0usize;
+        let mut j = *i;
+
+        while j > 0 && chars[j - 1].1 == '#' {
+            hashes += 1;
+            j -= 1;
+        }
+
+        if j > 0 && chars[j - 1].1 == 'r' {
+            *raw_string_hashes = Some(hashes);
+            *i += 1;
+            return true;
+        }
+
+        *in_string = true;
+        *i += 1;
+        return true;
+    }
+
+    if ch == '\'' && looks_like_char_literal_start(chars, *i) {
+        *in_char = true;
+        *i += 1;
+        return true;
+    }
+
+    false
 }

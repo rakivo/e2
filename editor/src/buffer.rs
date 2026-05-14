@@ -64,8 +64,11 @@ pub struct Buffer {
     pub last_save_generation: u64,
     pub last_edit_generation: u64,
 
+    // @Memory: Delete these fields
     pub last_insert: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
     pub last_delete: Option<(usize, u32)>, // (CHAR_index, BYTE_len)
+
+    pub ts_edits_in_this_frame: Vec<e2_InputEdit>,
 
     pub scratch_space_to_flatten_rope_into: String,
     pub internal_extend_cache_to_scratch:   Vec<(u32, LexState)>,
@@ -92,6 +95,8 @@ impl Buffer {
             next_paste_id: 1,
             next_copy_id:  PASTE_ANIMATION_MAX_ID as u8 + 1, // starts at 8
 
+            ts_edits_in_this_frame: Vec::with_capacity(8),
+
             ..Default::default()
         }
     }
@@ -112,46 +117,40 @@ impl Buffer {
         self.animate_paste(byte_start as _, byte_len as _);
     }
 
+    pub fn make_delete_edit(&self, byte_start: usize, byte_end: usize) -> e2_InputEdit {
+        let start_point   = self.byte_to_point(byte_start);
+        let old_end_point = self.byte_to_point(byte_end);
+        e2_InputEdit {
+            start_byte:       byte_start as _,
+            start_position:   start_point,
+            old_end_byte:     byte_end as _,
+            old_end_position: old_end_point,
+            new_end_byte:     byte_start as _,
+            new_end_position: start_point,
+        }
+    }
+
+    pub fn make_insert_edit(&self, byte_start: usize, byte_end_after: usize) -> e2_InputEdit {
+        let start_point   = self.byte_to_point(byte_start);
+        let new_end_point = self.byte_to_point(byte_end_after);
+        e2_InputEdit {
+            start_byte:       byte_start as _,
+            start_position:   start_point,
+            old_end_byte:     byte_start as _,
+            old_end_position: start_point,
+            new_end_byte:     byte_end_after as _,
+            new_end_position: new_end_point,
+        }
+    }
+
+    pub fn last_edit(&self) -> Option<&e2_InputEdit> {
+        self.ts_edits_in_this_frame.last()
+    }
+
     pub fn byte_to_point(&self, byte: usize) -> e2_Point {
         let line = self.text.byte_to_line(byte);
         let col  = byte - self.text.line_to_byte(line);
         e2_Point::new(line, col)
-    }
-
-    pub fn last_insert_to_input_edit(&self) -> Option<e2_InputEdit> {
-        let (char_index, byte_len) = self.last_insert?;
-
-        let byte_len = byte_len as usize;
-        let byte = self.text.char_to_byte(char_index);
-
-        Some(e2_InputEdit {
-            new_end_byte: (byte + byte_len) as _,
-            new_end_position: self.byte_to_point(byte + byte_len),
-
-            start_position: self.byte_to_point(byte),
-            start_byte: byte as _,
-
-            old_end_byte: byte as _,
-            old_end_position: self.byte_to_point(byte),
-        })
-    }
-
-    pub fn last_delete_to_input_edit(&self) -> Option<e2_InputEdit> {
-        let (char_index, byte_len) = self.last_delete?;
-
-        let byte_len = byte_len as usize;
-        let byte_start = self.text.char_to_byte(char_index);
-
-        Some(e2_InputEdit {
-            new_end_byte: byte_start as _,
-            new_end_position: self.byte_to_point(byte_start),
-
-            start_position: self.byte_to_point(byte_start),
-            start_byte: byte_start as _,
-
-            old_end_byte: byte_start as _,
-            old_end_position: self.byte_to_point(byte_start + byte_len)
-        })
     }
 
     fn animate_region(
@@ -455,6 +454,7 @@ impl Buffer {
         cursor.char_index = (line_start + cursor_col).min(line_start + line_len.saturating_sub(1));
 
         self.invalidate_cache_from_char(0); // @Speed
+        self.ts_edits_in_this_frame.clear();
     }
 
     pub fn insert_char(&mut self, c: char, cursor: &mut Cursor) {
@@ -464,6 +464,9 @@ impl Buffer {
         self.text.insert_char(index, c);
         self.invalidate_cache_from_char(index);
         self.adjust_animated_regions_for_insert(byte, c.len_utf8());
+
+        let byte_end = byte + c.len_utf8();
+        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end));
 
         cursor.char_index = index + 1;
         cursor.preferred_col = None;
@@ -480,6 +483,9 @@ impl Buffer {
         self.text.insert_char(index, c);
         self.invalidate_cache_from_char(index);
         self.adjust_animated_regions_for_insert(byte, c.len_utf8());
+
+        let byte_end = byte + c.len_utf8();
+        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end));
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
@@ -503,6 +509,9 @@ impl Buffer {
 
         self.adjust_animated_regions_for_insert(byte, byte_len);
 
+        let byte_end = byte + byte_len;
+        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end));
+
         self.is_dirty = true;
         self.last_edit_generation += 1;
 
@@ -517,6 +526,9 @@ impl Buffer {
 
         let byte_start = self.text.char_to_byte(index);
         let byte_len   = self.text.char(index).len_utf8();
+        let byte_end   = self.text.char_to_byte(cursor.char_index);
+
+        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
 
         self.text.remove(index..cursor.char_index);
         self.invalidate_cache_from_char(index);
@@ -536,6 +548,9 @@ impl Buffer {
 
         let byte_start = self.text.char_to_byte(cursor.char_index);
         let byte_len   = self.text.char(cursor.char_index).len_utf8();
+        let byte_end   = self.text.char_to_byte(cursor.char_index + 1);
+
+        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
 
         self.text.remove(cursor.char_index..cursor.char_index + 1);
         self.invalidate_cache_from_char(cursor.char_index);
@@ -564,6 +579,8 @@ impl Buffer {
         let byte_start = self.text.char_to_byte(start);
         let byte_end   = self.text.char_to_byte(i);
 
+        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+
         self.text.remove(start..i);
         self.invalidate_cache_from_char(start);
         self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
@@ -591,6 +608,8 @@ impl Buffer {
         let byte_start = self.text.char_to_byte(i);
         let byte_end   = self.text.char_to_byte(end);
 
+        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+
         self.text.remove(i..end);
         self.invalidate_cache_from_char(i);
         self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
@@ -615,6 +634,8 @@ impl Buffer {
         if start != end {
             let byte_start = self.text.char_to_byte(start);
             let byte_end   = self.text.char_to_byte(end);
+
+            self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
 
             self.text.remove(start..end);
             self.invalidate_cache_from_char(start);
@@ -657,6 +678,7 @@ impl Buffer {
         self.last_save_generation = Default::default();
         self.text = Rope::new();
         self.comment_cache.clear();
+        self.ts_edits_in_this_frame.clear();
         self.last_delete = None;
         self.last_insert = None;
     }
@@ -739,7 +761,7 @@ impl Buffer {
     }
 }
 
-#[inline]
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+#[inline(always)]
+pub fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
 }

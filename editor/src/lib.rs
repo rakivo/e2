@@ -1407,8 +1407,13 @@ pub fn render_text_layout(
         }
     }
 
-    if let Some(ll) = layout.line_for_buffer_line(cursor_line)
-        && let Some(overlay) = &view.overlay.current
+    // :TreeSitter
+    //
+    // Function call overlay
+    //
+    if is_this_view_focused &&
+        let Some(overlay) = &view.overlay.current &&
+        let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w =
             layout.glyph_width_at_col(cursor_col, min_cursor_w, ll)
@@ -1431,34 +1436,42 @@ pub fn render_text_layout(
 
         let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
 
-        // pre-measure total scratch size and record (start, end, is_active) per param
-        struct PieceRange { start: usize, end: usize, active: bool }
-        let mut param_ranges: SmallVec<[PieceRange; 8]> = SmallVec::new();
+        //
+        // Pre-measure total scratch size and record (start, end, is_active) per param
+        //
+        struct PieceRange { start: u32, end: u32, active: bool }
+        let mut param_ranges: SmallVec<[PieceRange; 8]> = Default::default();
 
         for (i, param) in info.params.iter().enumerate() {
             let name     = editor.tree_sitter.atom_table.lookup_ref(param.name);
             let type_str = editor.tree_sitter.atom_table.lookup_ref(param.type_str);
-            let start = scratch.len();
+            let start    = scratch.len() as _;
             scratch.extend_from_slice(name.as_bytes());
             scratch.extend_from_slice(b": ");
             scratch.extend_from_slice(type_str.as_bytes());
-            let end = scratch.len();
+            let end      = scratch.len() as _;
             param_ranges.push(PieceRange { start, end, active: i == overlay.arg_index as usize });
         }
 
-        // now scratch is done growing, safe to slice
+        //
+        // Now scratch is done growing, safe to slice
+        //
         let func_name = editor.tree_sitter.atom_table.lookup_ref(overlay.call_kind.function_name());
         let mut pieces: SmallVec<[(&str, bool); 16]> = SmallVec::new();
         pieces.push((func_name.as_str(), false));
         pieces.push(("(", false));
         for (i, pr) in param_ranges.iter().enumerate() {
             if i > 0 { pieces.push((", ", false)); }
-            let s = unsafe { std::str::from_utf8_unchecked(&scratch[pr.start..pr.end]) };
+            let s = unsafe {
+                std::str::from_utf8_unchecked(&scratch[pr.start as usize..pr.end as usize])
+            };
             pieces.push((s, pr.active));
         }
         pieces.push((")", false));
 
-        // measure
+        //
+        // Measure
+        //
         let mut text_w: f32 = 0.0;
         for (text, _) in &pieces {
             text_w += gpu::measure_str(gpu, text, font_size);
@@ -1466,18 +1479,24 @@ pub fn render_text_layout(
         let overlay_w = text_w + pad_x * 2.0;
         let overlay_h = font_size + pad_y_top + pad_y_bot;
 
-        // position
+        //
+        // Position
+        //
         let margin = 8.0;
         let mut ox = crect.x + 14.0;
         let mut oy = crect.y - overlay_h - 6.0;
         if ox + overlay_w > rect.x + rect.w - margin { ox = rect.x + rect.w - overlay_w - margin; }
         if oy < rect.y + margin { oy = crect.y + crect.h + 6.0; }
 
-        // draw
+        //
+        // Draw
+        //
         gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E));
         gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A));
 
-        // text
+        //
+        // Text
+        //
         let mut tx = ox + pad_x;
         let ty = oy + pad_y_top + font_size;
         for (text, active) in &pieces {
@@ -2331,8 +2350,7 @@ impl Editor {
         {
             let current_buffer_id = self.active_view().buffer_id;
             let current_buffer = &self.buffers[current_buffer_id];
-            let modified = current_buffer.last_delete.is_some() ||
-                current_buffer.last_insert.is_some();
+            let modified = !current_buffer.ts_edits_in_this_frame.is_empty();
 
             if modified {
                 if let Some(hook) = self.hooks.modified_file {
@@ -2342,54 +2360,82 @@ impl Editor {
         }
 
         // @Hack :TreeSitter
-        { // nocheckin
+        //
+        // @Important :FeelImprovement: Gate overlay appearance behind some user input,
+        // so that if the user jumps around the source code, overlays don't flicker around.
+        //
+        {
             let (view, buf) = self.active_view_and_buffer_mut();
             let view_id     = view.id;
             let buffer_id   = view.buffer_id;
             let char_index  = view.cursor.char_index;
             let cursor_byte = buf.text.char_to_byte(char_index);
-            let insert_edit = buf.last_insert_to_input_edit();
-            let delete_edit = buf.last_delete_to_input_edit();
             let rope        = buf.text.clone();
             let last_pos    = self.last_cursor_position[view_id];
-            let (view, _buf) = self.active_view_and_buffer_mut();
 
-            let needs_reset = if let Some(overlay) = &view.overlay.current {
-                // @Cutnpaste from find_call_overlay
-                cursor_byte <= overlay.opening_paren_byte as usize ||
-                    overlay.closing_paren_byte.map_or(false, |byte| cursor_byte > byte.get() as usize)
-            } else {
-                false
-            };
-            if needs_reset {
+            //
+            // Immediately shift the main thread tree coords
+            //
+            //
+            // @Note @Robustness: We should do tree versioning to avoid background thread
+            // mutating tree with an older version after this write from the main thread?
+            //
+            {
+                let buf = self.active_buffer();
+                if !buf.ts_edits_in_this_frame.is_empty() {
+                    if let Some(mut tree_mut) = self.tree_sitter.trees.get_mut(&buffer_id) {
+                        for &edit in &buf.ts_edits_in_this_frame {
+                            tree_mut.edit(&edit.into()); // @Speed
+                        }
+                    }
+                }
+            }
+
+            //
+            // Send the edits to the background thread as usual
+            //
+            {
+                let buf = self.active_buffer();
+                for &edit in &buf.ts_edits_in_this_frame {
+                    self.tree_sitter.send_edit(buffer_id, edit, rope.clone());
+                }
+            }
+
+            let (view, buf) = self.active_view_and_buffer_mut();
+
+            let needs_cursor_query = !buf.ts_edits_in_this_frame.is_empty()
+                || char_index as u32 != last_pos;
+
+            for edit in &buf.ts_edits_in_this_frame {
+                view.overlay.on_edit(&edit);
+            }
+
+            if view.overlay.needs_reset_cursor_byte(cursor_byte as _) {
                 view.overlay.current = None;
             }
 
-            let needs_cursor_query = insert_edit.is_some()
-                || delete_edit.is_some()
-                || char_index as u32 != last_pos;
-
-            if let Some(ref edit) = insert_edit {
-                view.overlay.on_edit(edit);
-            }
-            if let Some(ref edit) = delete_edit {
-                view.overlay.on_edit(edit);
-            }
-
-            if let Some(edit) = insert_edit {
-                self.tree_sitter.send_edit(buffer_id, edit, rope.clone());
-            }
-            if let Some(edit) = delete_edit {
-                self.tree_sitter.send_edit(buffer_id, edit, rope.clone());
-            }
-
+            //
+            // Query only after local invalidation
+            //
             if needs_cursor_query {
-                if let Some(overlay) = self.tree_sitter.query_cursor_overlay(buffer_id, cursor_byte, &rope) {
-                    let (view, _buf) = self.active_view_and_buffer_mut();
-                    view.overlay.current = Some(overlay);
+                let overlay = self.tree_sitter.query_cursor_overlay(buffer_id, cursor_byte, &rope);
+
+                let (view, _buf) = self.active_view_and_buffer_mut();
+                view.overlay.current = overlay;
+
+                if view.overlay.current.is_none() {
+                    redraw |= true;
+                } else {
                     redraw |= true;
                 }
             }
+        }
+
+        //
+        // Reset the edits!
+        //
+        for buffer in self.buffers.values_mut() {
+            buffer.ts_edits_in_this_frame.clear();
         }
 
         redraw
@@ -2398,7 +2444,7 @@ impl Editor {
     pub fn always_on_update(&mut self) -> ShouldRequestFrameRedraw {
         let mut redraw = ShouldRequestFrameRedraw::No;
 
-        // @Cleanup
+        // @Cleanup :TreeSitter
         {
             while let Ok(result) = self.tree_sitter.result.try_recv() {
                 let buffer_filename = self.buffers[result.buffer_id].filestem_atom;
@@ -3562,7 +3608,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
     let mut adjusted_views: SmallVec<[ViewId; 24]> = SmallVec::new();
 
     for (buffer_id, buffer) in editor.buffers.iter_mut() {
-        if let Some((at, len)) = buffer.last_insert.take() {
+        if let Some((at, len)) = buffer.last_insert {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
                 if vid == active_view_id       { continue }
@@ -3578,7 +3624,7 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
             }
         }
 
-        if let Some((at, len)) = buffer.last_delete.take() {
+        if let Some((at, len)) = buffer.last_delete {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
                 if vid == active_view_id       { continue }
