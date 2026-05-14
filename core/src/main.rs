@@ -529,9 +529,6 @@ impl App {
                     checked_reserve!(verts, reserve as usize, "vertex buffer");
                 }
 
-                let is_cursor_visible_due_to_blinking = editor.cursor_visible();
-                let active_panel = editor.active_panel;
-
                 let mut leaf_panels = Default::default();
                 collect_leaves(editor, editor.root_panel, &mut leaf_panels);
 
@@ -607,14 +604,7 @@ impl App {
                     let r = rect_including_bar;
                     gpu::push_clip(gpu, r.x, r.y, r.w, r.h);
 
-                    let show_cursor = if panel_id == active_panel {
-                        //
-                        // Only make cursor blink on the active panel.
-                        //
-                        is_cursor_visible_due_to_blinking
-                    } else {
-                        true
-                    };
+                    let show_cursor = editor.views[view_id].is_cursor_visible();
 
                     let t1 = Instant::now();
                     render_text_layout(editor, gpu, view_id, show_cursor);
@@ -659,11 +649,6 @@ impl App {
 
                 _ = gpu::submit_frame(gpu);
 
-                let new_cursor_visible = editor.cursor_visible();
-                let blink_changed = new_cursor_visible != editor.last_cursor_visible;
-                editor.last_cursor_visible = new_cursor_visible;
-
-                redraw = redraw.or_if(blink_changed, "Cursor blinking", &mut editor.redraw_reasons);
                 redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation", &mut editor.redraw_reasons);
                 redraw = redraw.or_if(editor.messager.count != 0, "Messager animation", &mut editor.redraw_reasons); // nocheckin
 
@@ -768,21 +753,11 @@ impl ApplicationHandler<UserEvent> for App {
 
         } else {
             //
-            // Actively blinking - wake up at next blink transition
+            // Actively blinking - wake up every ~16ms (60fps)
             //
-            let elapsed = editor.blink_epoch.elapsed().as_millis();
-            let cycle   = BLINK_ON_MS + BLINK_OFF_MS;
-            let phase   = elapsed % cycle;
-            let ms_until = if phase < BLINK_ON_MS {
-                BLINK_ON_MS - phase
-            } else {
-                cycle - phase
-            };
-
             el.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(ms_until as u64)
+                Instant::now() + Duration::from_millis(16)
             ));
-
             win.request_redraw();
         }
     }

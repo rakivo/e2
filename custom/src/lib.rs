@@ -2623,9 +2623,6 @@ fn setup_hooks(cx: &mut CommandContext) {
         let editor = &mut cx.editor;
         let gpu = &mut cx.gpu;
 
-        let is_cursor_visible_due_to_blinking = editor.cursor_visible();
-        let active_panel = editor.active_panel;
-
         if editor.lister().is_open() {
             //
             // Prepare lister bg
@@ -2645,17 +2642,9 @@ fn setup_hooks(cx: &mut CommandContext) {
             //
 
             let view_id = editor.lister().query_view;
-            let panel_id = editor.lister().query_panel;
             let rect = editor.panels[editor.lister().query_panel].rect_including_panel_bar;
 
-            let show_cursor = if panel_id == active_panel {
-                //
-                // Only make cursor blink on the active panel.
-                //
-                is_cursor_visible_due_to_blinking
-            } else {
-                true
-            };
+            let show_cursor = editor.views[view_id].is_cursor_visible();
 
             gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
             let t1 = Instant::now();

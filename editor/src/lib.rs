@@ -461,7 +461,7 @@ define_base_and_scale! {
     const BASE_FONT_SIZE:     f32 = 15.0;
     const BASE_CURSOR_HEIGHT: f32 = 2.0;
     const BASE_CURSOR_WIDTH:  f32 = 2.0;
-    const BASE_CURSOR_OUTLINE_THICKNESS: f32 = 1.5;
+    const BASE_CURSOR_OUTLINE_THICKNESS: f32 = 1.2;
     const BASE_PANEL_BAR_BORDER_THICKNESS: f32 = 1.0;
 }
 
@@ -1336,7 +1336,7 @@ pub fn render_text_layout(
             }
         }
 
-        gpu::draw_rect(gpu, crect.x, crect.y, crect.w, crect.h, palette().cursor);
+        gpu::draw_rect(gpu, crect.x, crect.y, crect.w, crect.h, palette().cursor.with_alpha(view.cursor_opacity));
     }
 
     if let Some(hook) = editor.hooks.drew_cursor_about_to_draw_text {
@@ -1379,6 +1379,8 @@ pub fn render_text_layout(
 
             let y = context.line_y(ll.buffer_line) + line_h;
 
+            // :Configuration
+            // let cursor_col_glyph_index = None;
             let cursor_col_glyph_index = if ll.buffer_line == cursor_line
                 && is_this_view_focused
                 && layout.cursor_style == CursorStyle::Block
@@ -1407,7 +1409,7 @@ pub fn render_text_layout(
         }
     }
 
-    // :TreeSitter
+    // :TreeSitter :Configuration
     //
     // Function call overlay
     //
@@ -1523,7 +1525,7 @@ pub fn render_text_layout(
     // Cursor (on the UNfocused view (outlined rectangle))
     //
     //
-    if show_cursor && !is_this_view_focused && layout.cursor_style == CursorStyle::Block
+    if !is_this_view_focused && layout.cursor_style == CursorStyle::Block
         && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
@@ -1867,14 +1869,16 @@ pub struct View {
     pub cursor_anim_x: f32,  // Animated cursor screen position @Redundant (We currently only animate cursor's Y movements)
     pub cursor_anim_y: f32,  // Animated cursor screen position
 
+    pub cursor_opacity: f32, // 0..1
+
+    pub cursor_ghost_x: f32,
+    pub cursor_ghost_y: f32,
+
     pub cursor_target_line: u32,
     pub cursor_target_col:  u32,
 
     pub cursor: Cursor,
     pub layout: Option<TextLayout>,
-
-    pub cursor_ghost_x: f32,
-    pub cursor_ghost_y: f32,
 
     pub overlay: crate::ts::OverlayState,
     pub persistent_state_per_buffer: FastHashMap<BufferId, ViewState>,
@@ -1891,6 +1895,7 @@ impl View {
             scroll_vel: 0.0,
             cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: scroll,
+            cursor_opacity: 1.0,
             persistent_state_per_buffer: Default::default(),
             overlay: Default::default(),
             panel_id: PanelId::reserved_value()  // Set on first layout
@@ -1899,6 +1904,11 @@ impl View {
 
     pub fn new(id: ViewId, buffer_id: BufferId) -> Self {
         Self::new_with_scroll(id, buffer_id, 0.0)
+    }
+
+    #[inline]
+    pub fn is_cursor_visible(&self) -> bool {
+        self.cursor_opacity > 0.3
     }
 
     #[inline]
@@ -2143,7 +2153,6 @@ pub struct Editor {
 
     // Cursor blink
     pub blink_epoch:         Instant,
-    pub last_cursor_visible: bool,
 
     pub last_messager_count: u32,
 
@@ -2241,7 +2250,6 @@ impl Editor {
             win_h: 0.0,
             win_w: 0.0,
             root_buffer,
-            last_cursor_visible: false,
             is_cursor_visible: true,
             buffer_cycle_index: None,
             custom_data: EditorCustomData::default(),
@@ -2392,7 +2400,7 @@ impl Editor {
             }
 
             //
-            // Send the edits to the background thread as usual
+            // Send the edits to the background thread
             //
             {
                 let buf = self.active_buffer();
@@ -2860,11 +2868,6 @@ impl Editor {
     #[inline] pub fn cursor_h(&self)  -> f32 { scale_base_cursor_height(self.scale) }
 
     #[inline]
-    pub fn cursor_visible(&self) -> bool {
-        cursor_visible(&self.blink_epoch, &self.last_input_time)
-    }
-
-    #[inline]
     pub fn reset_blink(&mut self) {
         self.blink_epoch     = Instant::now();
         self.last_input_time = Instant::now();
@@ -2899,11 +2902,8 @@ pub const SCALE_STEP: f32 = 0.25;
 pub const SCROLL_ANIM_RATE: f32 = 23.67;
 pub const CURSOR_ANIM_RATE: f32 = 99.420;
 
-pub const BLINK_ON_MS:  u128 = 530;
-pub const BLINK_OFF_MS: u128 = 370;
-
 pub const BLINK_START_DELAY_MS: u128 = 500;  // Start blinking after 500ms idle
-pub const BLINK_STOP_IDLE_MS:   u128 = 5000; // Stop  blinking after 5s    idle
+pub const BLINK_STOP_IDLE_MS:   u128 = 5700;
 
 pub const         DELETE_ANIM_DURATION: f32 = 0.115; // nocheckin @Tune
 
@@ -2942,24 +2942,6 @@ pub fn layout_update_currently_animated_regions(
             }
         }
     }
-}
-
-pub fn cursor_visible(epoch: &Instant, last_input: &Instant) -> bool {
-    let since_input = last_input.elapsed().as_millis();
-
-    // Typing: show solid cursor
-    if since_input < BLINK_START_DELAY_MS {
-        return true;
-    }
-
-    // Idle too long: show solid cursor
-    if since_input > BLINK_STOP_IDLE_MS {
-        return true;
-    }
-
-    // In between: blink
-    let elapsed = epoch.elapsed().as_millis() % (BLINK_ON_MS + BLINK_OFF_MS);
-    elapsed < BLINK_ON_MS
 }
 
 const NO_PARENT: u16 = u16::MAX;
@@ -3229,6 +3211,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
 
     let epsilon = 0.5f32;       // Stop animating when close enough
     let line_h  = editor.line_h();
+    let active_view_id = editor.active_view_id();
 
     for view in editor.views.values_mut() {
         //
@@ -3315,25 +3298,79 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
             // }
         }
 
-        let gx = view.cursor_ghost_x;
-        let gy = view.cursor_ghost_y;
-        let tx = view.cursor_anim_x;
-        let ty = view.cursor_anim_y;
+        //
+        // Cursor ghost trail
+        //
+        {
+            let gx = view.cursor_ghost_x;
+            let gy = view.cursor_ghost_y;
+            let tx = view.cursor_anim_x;
+            let ty = view.cursor_anim_y;
 
-        let dx = tx - gx;
-        let dy = ty - gy;
+            let dx = tx - gx;
+            let dy = ty - gy;
 
-        if dx.abs() > epsilon || dy.abs() > epsilon {
-            const GHOST_RATE: f32 = 18.0; // @Tune - lower = longer/slower trail
+            if dx.abs() > epsilon || dy.abs() > epsilon {
+                const GHOST_RATE: f32 = 25.0; // @Tune - lower = longer/slower trail
 
-            view.cursor_ghost_x += dx * (1.0 - (-GHOST_RATE * dt).exp());
-            view.cursor_ghost_y += dy * (1.0 - (-GHOST_RATE * dt).exp());
-            should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
-                "Cursor ghost trail", &mut editor.redraw_reasons
-            ));
-        } else {
-            view.cursor_ghost_x = tx;
-            view.cursor_ghost_y = ty;
+                view.cursor_ghost_x += dx * (1.0 - (-GHOST_RATE * dt).exp());
+                view.cursor_ghost_y += dy * (1.0 - (-GHOST_RATE * dt).exp());
+                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+                    "Cursor ghost trail", &mut editor.redraw_reasons
+                ));
+            } else {
+                view.cursor_ghost_x = tx;
+                view.cursor_ghost_y = ty;
+            }
+        }
+
+        // :Configuration
+        //
+        // Cursor opacity
+        //
+        {
+            let target_opacity = if active_view_id != view.id {
+                0.25
+            } else {
+                let since_input = editor.last_input_time.elapsed().as_millis();
+
+                if since_input < BLINK_START_DELAY_MS || since_input > BLINK_STOP_IDLE_MS {
+                    // Solid - just typed, or been idle too long
+                    1.0
+                } else {
+                    let t = editor.blink_epoch.elapsed().as_secs_f32();
+                    let period = 2.0 * std::f32::consts::PI / 6.0;
+                    let phase = (t % period) / period;
+                    let k = 0.15;
+                    let wave = if phase < k {
+                        phase / k
+                    } else if phase < 0.5 {
+                        1.0
+                    } else if phase < 0.5 + k {
+                        1.0 - (phase - 0.5) / k
+                    } else {
+                        0.0
+                    };
+                    wave * 0.8
+                }
+            };
+
+            let delta = target_opacity - view.cursor_opacity;
+
+            if delta.abs() > 0.01 {
+                let rate = 18.0;
+
+                view.cursor_opacity += delta * (1.0 - (-rate * dt).exp());
+
+                should_redraw = should_redraw.or(
+                    ShouldRequestFrameRedraw::yes(
+                        "Cursor opacity",
+                        &mut editor.redraw_reasons,
+                    )
+                );
+            } else {
+                view.cursor_opacity = target_opacity;
+            }
         }
     }
 
