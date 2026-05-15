@@ -231,15 +231,19 @@ pub fn lex_from(
         }};
     }
 
+    //
     // If we're resuming mid-block-comment, scan until we close it
+    //
     if cur_state == LexState::InBlockComment {
         let start = 0;
+        let mut closed = false;
         while i < len {
             if let Some(next_star) = memchr::memchr(b'*', &bytes[i..]) {
                 i += next_star;
                 if i + 1 < len && bytes[i + 1] == b'/' {
                     i += 2;
                     push_comment_with_notes!(start, i);
+                    closed = true;
                     break;
                 }
                 i += 1;
@@ -249,6 +253,12 @@ pub fn lex_from(
                 push_comment_with_notes!(start, i);
                 return LexState::InBlockComment;
             }
+        }
+
+        if !closed {
+            i = len;
+            push_comment_with_notes!(start, i);
+            return LexState::InBlockComment;
         }
 
         cur_state = LexState::Normal;
@@ -261,7 +271,10 @@ pub fn lex_from(
             if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
                 i += hit;
                 if bytes[i] == b'\\' {
-                    i += 2; // Skip \ and the next char
+                    i += 1; // Consume backslash
+                    if i < len {
+                        i += 1; // Consume escaped char only if it's in this buffer
+                    }
                 } else {
                     i += 1; // Closing "
                     closed = true;
@@ -364,7 +377,10 @@ pub fn lex_from(
                     if let Some(hit) = memchr::memchr2(b'"', b'\\', &bytes[i..]) {
                         i += hit;
                         if bytes[i] == b'\\' {
-                            i += 2; // Skip \ and the next char
+                            i += 1; // Consume backslash
+                            if i < len {
+                                i += 1; // Consume escaped char only if it's in this buffer
+                            }
                         } else {
                             i += 1; // Closing "
                             closed = true;
@@ -543,7 +559,10 @@ pub fn lex_from(
                     }
 
                     if bytes[j] == b'\\' {
-                        j += 1;  // Skip the escaped character
+                        j += 1; // Consume backslash
+                        if i < len {
+                            j += 1; // Consume escaped char only if it's in this buffer
+                        }
                     }
 
                     j += 1;

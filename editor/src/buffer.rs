@@ -76,7 +76,7 @@ pub struct Buffer {
     pub visible_tokens: Vec<Token>,
     pub comment_cache:  Vec<(u32, LexState)>, // (byte_offset, state_at_that_offset)
 
-    pub currently_animated_deletions:  SmallVec<[AnimatedDeletion;  2]>,
+    pub currently_animated_deletions: SmallVec<[AnimatedDeletion;  2]>,
 
     pub next_copy_id:  u8, // Starts at 8, wraps at  COPY_ANIMATION_MAX_ID+1
     pub next_paste_id: u8, // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
@@ -311,7 +311,7 @@ impl Buffer {
         self.last_save_generation != self.last_edit_generation
     }
 
-    pub fn lex_visible(&mut self, start_line: usize, end_line: usize) { // :BufferScratch
+    pub fn lex_visible(&mut self, start_line: usize, end_line: usize) {  // :BufferScratch
         let start_byte = self.text.try_line_to_byte(start_line).unwrap_or(0);
         let end_byte   = self.text.try_line_to_byte(end_line).unwrap_or(self.text.len_bytes());
 
@@ -322,7 +322,7 @@ impl Buffer {
         // :LexerDebug
         // eprintln!("lex_visible: lines {}..{} bytes {}..{} state={:?}", start_line, end_line, start_byte, end_byte, restart_state);
 
-        self.flatten_rope_into_scratch(start_byte, end_byte);
+        self.flatten_rope_into_scratch(start_byte, end_byte);  // :BufferScratch
 
         self.visible_tokens.clear();
         lex_from(
@@ -343,55 +343,46 @@ impl Buffer {
     }
 
     fn extend_cache_to(&mut self, target_byte: usize) {
-        const CHECKPOINT_INTERVAL: u32 = 1024;  // nocheckin @Tune
+        const CHECKPOINT_INTERVAL: u32 = 1024;
 
-        let target_byte = target_byte as u32;
+        let target_checkpoint = (target_byte as u32 / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
 
-        let start_index = self.comment_cache
-            .partition_point(|(b, _)| *b <= target_byte)
+        //
+        // Find where we already have valid data
+        //
+        let last_valid_index = self.comment_cache
+            .partition_point(|(b, _)| *b <= target_checkpoint)
             .saturating_sub(1);
 
-        let (
-            mut resume_byte, mut resume_state
-        ) = if self.comment_cache.is_empty()
-            || self.comment_cache[start_index].0 > target_byte
-        {
-            (0, LexState::Normal)
-        } else {
-            self.comment_cache[start_index]
-        };
+        let (mut resume_byte, mut resume_state) = self.comment_cache
+            .get(last_valid_index)
+            .copied()
+            .unwrap_or((0, LexState::Normal));
 
-        if resume_byte >= target_byte {
-            return;
-        }
+        if resume_byte >= target_checkpoint { return }
 
-        //
-        // Insert checkpoints from resume_byte up to target_byte
-        // Find insertion point to keep cache sorted
-        //
-        let insert_at = self.comment_cache
-            .partition_point(|(b, _)| *b <= resume_byte);
-
-        self.internal_extend_cache_to_scratch.clear();
-        while resume_byte < target_byte {
-            let chunk_end = (resume_byte + CHECKPOINT_INTERVAL).min(target_byte);
-
+        while resume_byte < target_checkpoint {
+            let chunk_end = resume_byte + CHECKPOINT_INTERVAL;
             self.flatten_rope_into_scratch(resume_byte as _, chunk_end as _);
+
             resume_state = lex_from(
                 &self.scratch_space_to_flatten_rope_into,
                 resume_byte as _,
                 resume_state,
                 None,
             );
-
             resume_byte = chunk_end;
-            self.internal_extend_cache_to_scratch.push((resume_byte as _, resume_state));
-        }
 
-        self.comment_cache.splice(
-            insert_at..insert_at,
-            self.internal_extend_cache_to_scratch.iter().copied()
-        );
+            //
+            // Overwrite or Insert
+            //
+            let index = self.comment_cache.partition_point(|(b, _)| *b < resume_byte);
+            if index < self.comment_cache.len() && self.comment_cache[index].0 == resume_byte {
+                self.comment_cache[index] = (resume_byte, resume_state);
+            } else {
+                self.comment_cache.insert(index, (resume_byte, resume_state));
+            }
+        }
     }
 
     fn state_at_byte(&mut self, target_byte: usize) -> LexState {
