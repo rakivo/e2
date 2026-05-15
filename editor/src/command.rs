@@ -1,8 +1,9 @@
 use std::{hash::Hash, ops::Deref, path::Path};
 
 use cranelift_entity::{PrimaryMap, entity_impl};
+use indexmap::IndexMap;
 use libloading::Library;
-use wgpu::naga::{FastHashMap, FastIndexMap};
+use rustc_hash::FxHashMap;
 use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
 use crate::{Editor, Hooks, gpu::Gpu};
@@ -88,16 +89,14 @@ pub struct CommandTable {
     strings: PrimaryMap<CommandAtom, Box<str>>,
 
     /// Reverse: string -> atom (for O(1) intern dedup)
-    index:   FastHashMap<Box<str>, CommandAtom>,
+    index:   FxHashMap<Box<str>, CommandAtom>,
 
-    cmds:    FastIndexMap<CommandAtom, CommandEntry>,
+    cmds:    IndexMap<CommandAtom, CommandEntry, rustc_hash::FxBuildHasher>,
 }
 
 impl Deref for CommandTable {
-    type Target = FastIndexMap<CommandAtom, CommandEntry>;
-    fn deref(&self) -> &Self::Target {
-        &self.cmds
-    }
+    type Target = IndexMap<CommandAtom, CommandEntry, rustc_hash::FxBuildHasher>;
+    fn deref(&self) -> &Self::Target { &self.cmds }
 }
 
 impl CommandTable {
@@ -210,7 +209,7 @@ impl KeyCombo {
 }
 
 pub struct Keymap {
-    pub bindings: FastHashMap<KeyCombo, CommandAtom>,
+    pub bindings: FxHashMap<KeyCombo, CommandAtom>,
 
     pub     basic_character_atom: CommandAtom,
     pub       switch_buffer_atom: CommandAtom,

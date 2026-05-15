@@ -451,15 +451,11 @@ impl App {
 
             WindowEvent::Resized(sz) => {
                 if sz.width > 0 && sz.height > 0 {
-                    gpu.win_w = sz.width  as f32;
-                    gpu.win_h = sz.height as f32;
+                    gpu.resize(sz.width, sz.height);
 
                     editor.win_w = gpu.win_w;
                     editor.win_h = gpu.win_h;
 
-                    gpu.surface_config.width  = sz.width;
-                    gpu.surface_config.height = sz.height;
-                    gpu.surface.configure(&gpu.device, &gpu.surface_config);
                     editor.layout_panels();
 
                     win.request_redraw();
@@ -643,7 +639,7 @@ impl App {
                     buffer.is_dirty = false;
                 }
 
-                _ = gpu::submit_frame(gpu);
+                _ = gpu.submit_frame();
 
                 redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation", &mut editor.redraw_reasons);
                 redraw = redraw.or_if(editor.messager.count != 0, "Messager animation", &mut editor.redraw_reasons); // nocheckin
@@ -679,7 +675,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .with_decorations(false)
         ).unwrap().into();
 
-        let mut gpu = gpu::init(Arc::clone(&win));
+        let mut gpu = Gpu::new(Arc::clone(&win));
         gpu.verts_mut().reserve(INITIAL_VERTEX_BUFFER_CAPACITY as _);
 
         let editor = &mut self.editor;

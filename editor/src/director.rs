@@ -5,8 +5,8 @@ use std::time::SystemTime;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crossbeam_channel::{Receiver, Sender};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use wgpu::naga::FastHashMap;
 
 const CHUNK_SIZE: usize = 64;  // @Tune
 
@@ -170,7 +170,7 @@ struct ScanChunk {
 }
 
 pub struct Director {
-    pub entries: FastHashMap<Arc<Path>, CachedDir>,
+    pub entries: FxHashMap<Arc<Path>, CachedDir>,
     receiver:    Receiver<ScanChunk>,
     queue:       Queue,
 }
@@ -193,7 +193,7 @@ impl Director {
         });
 
         Self {
-            entries:  FastHashMap::default(),
+            entries:  Default::default(),
             receiver: res_rx,
             queue,
         }

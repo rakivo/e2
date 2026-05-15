@@ -3,7 +3,7 @@ use std::io::Cursor;
 use std::thread;
 use crossbeam_channel::Sender;
 use rodio::{Decoder, DeviceSinkBuilder, Player};
-use wgpu::naga::FastHashMap;
+use rustc_hash::FxHashMap;
 
 const LISTER_ITEM_HOVER_SOUND: &[u8] = include_bytes!("../assets/lister-mouse-hover.wav");
 const           STARTUP_SOUND: &[u8] = include_bytes!("../assets/startup.wav");
@@ -44,7 +44,7 @@ impl Audioer {
             eprintln!("[Initialized audio in {}ms]", t.elapsed().as_millis() as f32);
 
             let mixer = handle.mixer();
-            let mut players = FastHashMap::default();
+            let mut players = FxHashMap::default();
 
             while let Ok(cmd) = rx.recv() {
                 players.retain(|_, p: &mut Player| !p.empty());

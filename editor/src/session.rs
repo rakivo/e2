@@ -35,8 +35,8 @@
 use std::path::Path;
 use std::time::Instant;
 
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use wgpu::naga::FastHashMap;
 
 use crate::buffer::Buffer;
 use crate::{BufferId, Editor, Panel, PanelId, PanelKind, PanelSplit, Rect, VIEW_MAIN, View, ViewId};
@@ -160,8 +160,8 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<f32> {
     //
     // Assign a stable serial index to every BufferId.
     //
-    let mut buffer_index: FastHashMap<BufferId, u32> =
-        FastHashMap::with_capacity_and_hasher(editor.buffers.len(), Default::default());
+    let mut buffer_index: FxHashMap<BufferId, u32> = Default::default();
+    buffer_index.reserve(editor.buffers.len());
 
     write_u32(&mut out, editor.buffers.len() as u32);
     for (buf_id, buf) in editor.buffers.iter() {
@@ -173,8 +173,8 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<f32> {
     //
     // Assign a stable serial index to every ViewId.
     //
-    let mut view_index: FastHashMap<ViewId, u32> =
-        FastHashMap::with_capacity_and_hasher(editor.views.len(), Default::default());
+    let mut view_index: FxHashMap<ViewId, u32> = Default::default();
+    view_index.reserve(editor.views.len());
 
     write_u32(&mut out, editor.views.len() as u32);
     for (view_id, view) in editor.views.iter() {
@@ -471,7 +471,7 @@ fn write_panel_tree(
     editor:      &Editor,
     panel_id:    PanelId,
     root_leaves: &[(PanelId, ViewId)],
-    _view_index: &FastHashMap<ViewId, u32>,
+    _view_index: &FxHashMap<ViewId, u32>,
 ) {
     match editor.panels[panel_id].kind {
         PanelKind::Leaf { .. } => {

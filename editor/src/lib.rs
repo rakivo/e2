@@ -44,6 +44,7 @@ use color::{Color, GpuColor};
 use command::{CommandContext, CommandAtom};
 use director::Director;
 use ts::{ParseResultKind, TreeSitter};
+use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
 
 use std::any::Any;
 use std::num::NonZero;
@@ -59,9 +60,8 @@ use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use smallstr::SmallString;
 use smallvec::SmallVec;
-use wgpu::naga::{FastHashMap, FastHashSet};
 use winit::window::Window;
-use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 macro_rules! hooks {
     (
@@ -171,13 +171,13 @@ hooks! {
         /// Returns: Same as left_mouse_clicked
         pub post_command_execution: fn (&mut CommandContext, CommandAtom)  -> (bool, bool),
 
-        pub dont_serialize_these_buffers_while_saving_session: FastHashSet<BufferId>,
+        pub dont_serialize_these_buffers_while_saving_session: FxHashSet<BufferId>,
 
         pub session_save_chunks: Vec<
         fn(
             &Editor,
-            &FastHashMap<ViewId, u32>,   // View serial index map
-            &FastHashMap<BufferId, u32>, // Buffer serial index map
+            &FxHashMap<ViewId, u32>,   // View serial index map
+            &FxHashMap<BufferId, u32>, // Buffer serial index map
         ) -> Option<(CustomChunkId, Vec<u8>)>>,
 
         pub session_restore_chunks: Vec<
@@ -1494,7 +1494,7 @@ pub fn render_text_layout(
         // Draw
         //
 
-        let   bg_opacity = 0.59;
+        let   bg_opacity = 0.62;
         let text_opacity = 0.80;
 
         gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E).with_alpha(bg_opacity));
@@ -1885,7 +1885,7 @@ pub struct View {
     pub layout: Option<TextLayout>,
 
     pub overlay: crate::ts::OverlayState,
-    pub persistent_state_per_buffer: FastHashMap<BufferId, ViewState>,
+    pub persistent_state_per_buffer: FxHashMap<BufferId, ViewState>,
 }
 
 impl View {
@@ -2126,7 +2126,7 @@ pub struct Editor {
     pub views:   PrimaryMap<ViewId,   View>,
     pub panels:  PrimaryMap<PanelId,  Panel>,
 
-    pub canonicalized_path_to_buffer_id: FastHashMap<Arc<Path>, BufferId>,
+    pub canonicalized_path_to_buffer_id: FxHashMap<Arc<Path>, BufferId>,
 
     // Which panel is active (receives keyboard input)
     pub active_panel:  PanelId,
@@ -2239,7 +2239,7 @@ impl Editor {
             .unwrap()
             .into();
 
-        let canonicalized_path_to_buffer_id = FastHashMap::with_capacity_and_hasher(128, Default::default());
+        let canonicalized_path_to_buffer_id = FxHashMap::with_capacity_and_hasher(128, Default::default());
 
         Self {
             buffers,
@@ -3143,7 +3143,7 @@ impl ShouldRequestFrameRedraw {
 }
 
 pub fn recompute_pretty_paths(buffers: &mut PrimaryMap<BufferId, Buffer>) {  // @Memory @Speed
-    let mut by_name: FastHashMap<String, Vec<BufferId>> = Default::default();
+    let mut by_name: FxHashMap<String, Vec<BufferId>> = Default::default();
     for (id, buf) in buffers.iter() {
         let Some(path) = &buf.path else { continue };
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };

@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["wayland", "x11"]
+
 # profiling
 tracy = ["tracy-client/enable"]
 
 # allocators
 mimalloc = ["dep:mimalloc", "custom/mimalloc"]
 dhat = ["dep:dhat", "custom/dhat"]
+
+wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
+x11     = ["winit/x11"]
 
 [dependencies]
 editor = { path = "../editor" }

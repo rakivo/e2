@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["wayland", "x11"]
+
 # profiling
 tracy = ["tracy-client/enable"]
+
+wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
+x11     = ["winit/x11"]
 
 [dependencies]
 memchr             .workspace = true
@@ -18,7 +23,6 @@ crossbeam-channel  .workspace = true
 libloading         .workspace = true
 tracy-client       .workspace = true
 
-pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2.11.0"
 ropey = "1.6.1"
@@ -27,7 +31,6 @@ swash = { version = "0.2.7", default-features = false, features = ["scale", "std
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
 dirs = { version = "6.0.0", default-features = false }
 arboard = { version = "3.6.1", features = ["wayland-data-control"], default-features = false }
-wgpu = { version = "28.0.0", default-features = false, features = ["vulkan", "wgsl", "std"] }
 tree-sitter-rust = "0.24.2"
 tree-sitter = "0.26.8"
 papaya = "0.2.4"
@@ -35,3 +38,8 @@ ecow = "0.2.6"
 dashmap = "6.1.0"
 rustc-hash = "2.1.2"
 nohash-hasher = "0.2.0"
+gpu-allocator = "0.28"
+raw-window-handle = "0.6"
+ash = { version = "0.38" }#, features = ["linked"] }
+ash-window = "0.13.0"
+indexmap = "2.14.0"

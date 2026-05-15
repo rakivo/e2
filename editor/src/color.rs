@@ -40,13 +40,6 @@ impl From<[f32; 4]> for Color {
     }
 }
 
-impl Into<wgpu::Color> for Color {
-    fn into(self) -> wgpu::Color {
-        let gpu: GpuColor = self.into();
-        gpu.into()
-    }
-}
-
 impl Color {
     #[inline(always)]
     pub const fn into_gpu(self) -> GpuColor {
@@ -118,16 +111,11 @@ pub struct GpuColor(pub [f32; 4]);
 
 impl Index<usize> for GpuColor {
     type Output = f32;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.0[index]
-    }
+    fn index(&self, index: usize) -> &Self::Output { &self.0[index] }
 }
 
 impl From<[f32; 4]> for GpuColor {
-    fn from(value: [f32; 4]) -> Self {
-        Self(value)
-    }
+    fn from(value: [f32; 4]) -> Self { Self(value) }
 }
 
 impl From<Color> for GpuColor {
@@ -139,17 +127,6 @@ impl From<Color> for GpuColor {
             b as f32 / 255.0 * a,
             a,
         ].into()
-    }
-}
-
-impl Into<wgpu::Color> for GpuColor {
-    fn into(self) -> wgpu::Color {
-        wgpu::Color {
-            r: self[0] as f64,
-            g: self[1] as f64,
-            b: self[2] as f64,
-            a: self[3] as f64,
-        }
     }
 }
 

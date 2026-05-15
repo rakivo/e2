@@ -7,9 +7,14 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [features]
+default = ["wayland", "x11"]
+
 # allocators
 mimalloc = ["dep:mimalloc"]
 dhat = ["dep:dhat"]
+
+wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
+x11     = ["winit/x11"]
 
 [dependencies]
 editor = { path = "../editor" }

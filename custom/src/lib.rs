@@ -2076,8 +2076,8 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk"));   // nocheckin
     cx.keymap.bind(KeyCombo::ctrl_alt('\\'), cx.command_table.intern("indent_region"));      // nocheckin
 
-    cx.keymap.bind(KeyCombo::ctrl_alt('p'), cx.command_table.intern("jump_scope_start")); // nocheckin
-    cx.keymap.bind(KeyCombo::ctrl_alt('n'), cx.command_table.intern("jump_scope_end"));   // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('p'), cx.command_table.intern("jump_scope_prev")); // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('n'), cx.command_table.intern("jump_scope_next"));   // nocheckin
 
     cx.keymap.bind(KeyCombo::ctrl_alt('a'), cx.command_table.intern("jump_definition_prev")); // nocheckin
     cx.keymap.bind(KeyCombo::ctrl_alt('e'), cx.command_table.intern("jump_definition_next"));   // nocheckin
