@@ -630,7 +630,6 @@ pub struct TextLayout {
 
     pub render_settings: TextLayoutRenderSettings,
 
-    pub view_scroll:       f32, // view.scroll
     pub line_h:            f32,
     pub font_size:         f32,
     pub first_buffer_line: u32,
@@ -681,29 +680,52 @@ impl TextLayout {
         self.lines.iter().find(|ll| ll.buffer_line == buffer_line && ll.wrap_index == 0)
     }
 
-    /// Screen X of the cursor at (buffer_line, col).  Kept for animate_views compat.
+    /// Screen X of the cursor at (buffer_line, col).
     #[inline]
-    pub fn cursor_x(&self, buffer_line: u32, col: u32) -> Option<f32> {
+    pub fn cursor_x(&self, buffer_line: u32, col: u32, scroll_anim_x: f32) -> Option<f32> {
         let ll = self.line_for_buffer_line(buffer_line)?;
-        Some(ll.x_for_col(self.rect.x + padding_left(self.should_pad_left_when_rendering), col, &self.glyphs))
+        Some(ll.x_for_col(
+            self.rect.x + padding_left(self.should_pad_left_when_rendering) - scroll_anim_x,
+            col,
+            &self.glyphs
+        ))
+    }
+
+    #[inline]
+    pub fn cursor_x_content(&self, buffer_line: u32, col: u32) -> Option<f32> {
+        let ll = self.line_for_buffer_line(buffer_line)?;
+        Some(ll.x_for_col(
+            self.rect.x + padding_left(self.should_pad_left_when_rendering),
+            col,
+            &self.glyphs,
+        ))
     }
 
     /// Full glyph screen rect at (buffer_line, col): [x0, y0, x1, y1].
     #[inline]
-    pub fn glyph_rect(&self, buffer_line: u32, col: u32, fallback_w: f32, scroll_anim: f32) -> Option<[f32; 4]> {
+    pub fn glyph_rect(
+        &self,
+        buffer_line: u32, col: u32,
+        fallback_w: f32,
+        scroll_anim: f32, scroll_anim_x: f32
+    ) -> Option<[f32; 4]> {
         let ll = self.line_for_buffer_line(buffer_line)?;
         let y = self.rect.y
             + (ll.buffer_line - self.first_buffer_line) as f32 * self.line_h
             - (scroll_anim % self.line_h);
 
-        let x0 = ll.x_for_col(self.rect.x + padding_left(self.should_pad_left_when_rendering), col, &self.glyphs);
+        let x0 = ll.x_for_col(
+            self.rect.x + padding_left(self.should_pad_left_when_rendering) - scroll_anim_x,
+            col,
+            &self.glyphs
+        );
         let x1 = x0 + ll.glyph_width_at_col(col, fallback_w, &self.glyphs);
         Some([x0, y, x1, y + self.line_h])
     }
 
     /// Hit-test (mx, my) -> (buffer_line, col).
     #[inline]
-    pub fn hit_test(&self, mx: f32, my: f32, scroll_anim: f32) -> (u32, u32) {
+    pub fn hit_test(&self, mx: f32, my: f32, scroll_anim: f32, scroll_anim_x: f32) -> (u32, u32) {
         if self.lines.is_empty() {
             return (self.first_buffer_line, 0);
         }
@@ -715,7 +737,11 @@ impl TextLayout {
         );
         let vis_index  = (line_index - self.first_buffer_line) as usize;
         let ll       = &self.lines[vis_index];
-        let col      = ll.col_for_screen_x(self.rect.x + padding_left(self.should_pad_left_when_rendering), mx, &self.glyphs);
+        let col      = ll.col_for_screen_x(
+            self.rect.x + padding_left(self.should_pad_left_when_rendering) - scroll_anim_x,
+            mx,
+            &self.glyphs
+        );
         (ll.buffer_line, col)
     }
 
@@ -868,7 +894,6 @@ pub fn build_text_layout(
     }
 
     let buffer = &editor.buffers[buffer_id];
-    let view   = &editor.views[view_id];
 
     let (mut lines, mut glyphs, mut line_offsets) = if let Some(mut old) = old_layout {
         old.lines.clear();
@@ -1049,7 +1074,6 @@ pub fn build_text_layout(
         line_offsets,
         render_settings,
         glyph_insertion_ids: Default::default(),
-        view_scroll: view.scroll,
         first_buffer_line: first_line,
     }
 }
@@ -1059,6 +1083,7 @@ pub fn build_text_layout(
 pub struct LayoutRenderingContext {
     pub view_id: ViewId,
     pub view_scroll_anim: f32,
+    pub view_scroll_anim_x: f32,
     pub view_cursor_anim_x: f32,
     pub view_cursor_anim_y: f32,
 
@@ -1096,7 +1121,7 @@ impl LayoutRenderingContext {
         };
 
         Rect {
-            x: self.view_cursor_anim_x,
+            x: self.view_cursor_anim_x - self.view_scroll_anim_x,
             y: self.view_cursor_anim_y + self.cursor_h,
             w: cursor_width,
             h: self.line_h + self.cursor_h,
@@ -1131,7 +1156,7 @@ pub fn render_text_layout(
     let cursor_h     = scale_base_cursor_height(scale);
     let cursor_outline_thickness = scale_base_cursor_outline_thickness(scale);
     let padding_left = padding_left(layout.should_pad_left_when_rendering);
-    let origin_x     = rect.x + padding_left;
+    let origin_x     = rect.x + padding_left - view.scroll_anim_x;
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
 
@@ -1157,6 +1182,7 @@ pub fn render_text_layout(
         rect,
         view_id,
         view_scroll_anim: view.scroll_anim,
+        view_scroll_anim_x: view.scroll_anim_x,
         cursor_h,
         cursor_w: scale_base_cursor_width(scale),
         layout_cursor_style: layout.cursor_style,
@@ -1320,13 +1346,16 @@ pub fn render_text_layout(
 
         const TRAIL_STEPS: usize = 40;
 
+        let ghost_x = view.cursor_ghost_x - view.scroll_anim_x;
+        let ghost_y = view.cursor_ghost_y;
+
         let dist = ((crect.x - view.cursor_ghost_x).powi(2) + (crect.y - view.cursor_ghost_y).powi(2)).sqrt();
 
         if dist > 2.0 {
             for i in 0..TRAIL_STEPS {
                 let t = i as f32 / TRAIL_STEPS as f32; // 0 = ghost, 1 = cursor
-                let x = view.cursor_ghost_x + (crect.x - view.cursor_ghost_x) * t;
-                let y = view.cursor_ghost_y + (crect.y - view.cursor_ghost_y) * t;
+                let x = ghost_x + (crect.x - ghost_x) * t;
+                let y = ghost_y + (crect.y - ghost_y) * t;
                 let alpha = t * 0.4; // linear, fades to nothing at ghost end
                 let w = cursor_glyph_w * 0.6; // @Tune, same size throughout
                 let h = crect.h * 0.7;        // @Tune
@@ -1857,6 +1886,7 @@ pub struct Panel {
 pub struct ViewState {
     pub cursor: Cursor,
     pub scroll: f32,
+    pub scroll_anim_x: f32, // @Redundant?
     pub scroll_anim: f32,
 }
 
@@ -1866,9 +1896,13 @@ pub struct View {
     pub buffer_id: BufferId,
     pub  panel_id: PanelId,
 
+    // Vertical scrolling
     pub scroll:        f32,  // Target scroll (set instantly on any scroll event)
     pub scroll_anim:   f32,  // Animated scroll (what actually gets rendered)
-    pub scroll_vel:    f32,
+
+    // Horizontal scrolling
+    pub scroll_x:      f32,
+    pub scroll_anim_x: f32,
 
     pub cursor_anim_x: f32,  // Animated cursor screen position @Redundant (We currently only animate cursor's Y movements)
     pub cursor_anim_y: f32,  // Animated cursor screen position
@@ -1894,9 +1928,10 @@ impl View {
             id, buffer_id, scroll, cursor: Cursor::new(), layout: None,
             cursor_ghost_y: 0.0,
             cursor_ghost_x: 0.0,
+            scroll_x: 0.0,
             cursor_anim_x: f32::NAN,
             cursor_anim_y: f32::NAN,
-            scroll_vel: 0.0,
+            scroll_anim_x: 0.0,
             cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: scroll,
             cursor_opacity: 1.0,
@@ -1946,6 +1981,7 @@ impl View {
             cursor: self.cursor,
             scroll: self.scroll,
             scroll_anim: self.scroll_anim,
+            scroll_anim_x: self.scroll_anim_x,
             // @Incomplete ...
         });
 
@@ -1962,15 +1998,23 @@ impl View {
             self.cursor = state.cursor;
             self.scroll = state.scroll;
             self.scroll_anim = state.scroll_anim;
+            self.scroll_anim_x = state.scroll_anim_x;
         } else {
             self.cursor = Cursor::new();
             self.scroll = 0.0;
             self.scroll_anim = 0.0;
+            self.scroll_anim_x = 0.0;
         }
     }
 
     #[inline]
-    pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, rect: Rect) {
+    pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        //
+        //
+        // Vertical scrolling
+        //
+        //
+
         let cursor_top    = line as f32 * line_h;
         let cursor_bottom = cursor_top + line_h + (ADDITIONAL_BOTTOM_SCROLL_SPACE/2.0);
 
@@ -1982,6 +2026,25 @@ impl View {
         let view_bottom = self.scroll + rect.h;
         if cursor_bottom > view_bottom {
             self.scroll = cursor_bottom - rect.h;
+        }
+
+        //
+        //
+        // Horizontal scrolling
+        //
+        //
+
+        // cursor_x is in content-space (origin_x + glyph.x), before scroll offset.
+        // We want it visible within [rect.x + padding_left, rect.x + rect.w].
+        let margin      = 8.0; // small lookahead so cursor isn't flush against the edge
+        let left_edge   = rect.x;
+        let right_edge  = rect.x + rect.w;
+        // cursor_x relative to the view left, after applying current scroll:
+        let screen_x    = cursor_x - self.scroll_x;
+        if screen_x < left_edge + margin {
+            self.scroll_x = (cursor_x - left_edge - margin).max(0.0);
+        } else if screen_x > right_edge - margin {
+            self.scroll_x = cursor_x - right_edge + margin;
         }
     }
 
@@ -2875,7 +2938,7 @@ impl Editor {
 
     pub fn snap_cursor_to_target(&mut self, view_id: ViewId, target_line: u32, target_col: u32, panel_rect: Rect) {
         if let Some(layout) = &self.views[view_id].layout {
-            if let Some(x) = layout.cursor_x(target_line, target_col) {
+            if let Some(x) = layout.cursor_x_content(target_line, target_col) {
                 let line_h = self.line_h();
                 let y = self.views[view_id].line_to_screen_y(target_line, panel_rect, line_h);
                 self.views[view_id].cursor_anim_x = x;
@@ -3246,12 +3309,13 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
         //
         //
 
+        // Vertical scrolling
         {
             let target = view.scroll;
             let delta  = target - view.scroll_anim;
 
             if delta.abs() > epsilon {
-                let speed = 20.0 + (delta.abs() / line_h).sqrt() * 3.0; // @Tune 3.0
+                let speed = 20.0 + (delta.abs() / line_h).sqrt() * 4.0; // @Tune
                 // let speed = (20.0 + delta.abs() / line_h * 0.5).min(35.0); // @Tune
                 view.scroll_anim += delta * (1.0 - (-speed * dt).exp());
                 should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
@@ -3259,10 +3323,25 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
                 ));
             } else {
                 view.scroll_anim = target;
-                view.scroll_vel  = 0.0;
             }
         }
 
+        // Horizontal scrolling
+        {
+            // @Cutnpaste from above
+            let target = view.scroll_x;
+            let delta  = target - view.scroll_anim_x;
+            if delta.abs() > epsilon {
+                let speed = 20.0 + (delta.abs() / line_h).sqrt() * 4.0; // @Tune
+                // let speed = (20.0 + delta.abs() / line_h * 0.5).min(35.0); // @Tune
+                view.scroll_anim_x += delta * (1.0 - (-speed * dt).exp());
+                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+                    "View scroll_x animation", &mut editor.redraw_reasons
+                ));
+            } else {
+                view.scroll_anim_x = target;
+            }
+        }
         //
         //
         // Cursor position
@@ -3273,7 +3352,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
 
         let (cursor_line, cursor_col) = (view.cursor_target_line, view.cursor_target_col);
 
-        if let Some(target_x) = layout.cursor_x(cursor_line, cursor_col) {
+        if let Some(target_x) = layout.cursor_x_content(cursor_line, cursor_col) {
             //
             // Compute target Y from scroll_anim so cursor tracks the animated scroll,
             // not the settled scroll position
@@ -3625,9 +3704,10 @@ pub fn editor_handle_left_mouse_click(cx: &mut CommandContext) -> bool {
     let rect        = cx.editor.panels[pid].rect;
     let buf_id      = cx.editor.views[view_id].buffer_id;
     let scroll_anim = cx.editor.views[view_id].scroll_anim;
+    let scroll_anim_x = cx.editor.views[view_id].scroll_anim_x;
 
     let (line, col) = if let Some(layout) = &cx.editor.views[view_id].layout {
-        layout.hit_test(mx, my, scroll_anim)
+        layout.hit_test(mx, my, scroll_anim, scroll_anim_x)
     } else {  // @Robustness
         let line_h = cx.editor.line_h();
         let line = ((my - rect.y + cx.editor.views[view_id].scroll) / line_h) as usize;
@@ -3740,18 +3820,22 @@ pub fn snap_cursor_to_target_point_in_active_view(editor: &mut Editor) {
 }
 
 pub fn scroll_to_cursor(editor: &mut Editor) {
-    let view_id = editor.active_view_id();
-    let (view, buf) = editor.active_view_and_buffer_mut();
-
-    let (line, col) = buf.cursor_line_col(&view.cursor);
-
-    let line_h   = editor.line_h();
+    let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
     let rect     = editor.panels[panel_id].rect;
+    let line_h   = editor.line_h();
 
-    editor.views[view_id].scroll_to_cursor(line, line_h, rect);
-    editor.views[view_id].cursor_target_col  = col;
-    editor.views[view_id].cursor_target_line = line;
+    let (view, buf) = editor.active_view_and_buffer_mut();
+    let (line, col) = buf.cursor_line_col(&view.cursor);
+
+    let cursor_x = view.layout.as_ref()
+        .and_then(|l| l.cursor_x_content(line, col))
+        .unwrap_or(rect.x);
+
+    let view = &mut editor.views[view_id];
+    view.scroll_to_cursor(line, line_h, cursor_x, rect);
+    view.cursor_target_col  = col;
+    view.cursor_target_line = line;
 }
 
 pub fn clear_buffer(editor: &mut Editor, buffer: BufferId) {

@@ -411,7 +411,6 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
 
             editor.views[view_id].scroll      = scroll;
             editor.views[view_id].scroll_anim = scroll;
-            editor.views[view_id].scroll_vel  = 0.0;
         }
 
         editor.buffers[buf_id].set_cursor_line_col(
