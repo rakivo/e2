@@ -2167,7 +2167,7 @@ pub struct Editor {
 
     pub clipboard:       Option<arboard::Clipboard>,
 
-    pub last_cursor_position: SecondaryMap<ViewId, u32>,
+    pub last_cursor_char_indexes: SecondaryMap<ViewId, u32>,
 
     pub frame_count:     u32,
     pub fps:             f32,
@@ -2281,7 +2281,7 @@ impl Editor {
             canonicalized_current_working_directory,
             most_recently_used_buffers: VecDeque::with_capacity(32),
             clipboard: arboard::Clipboard::new().ok(),
-            last_cursor_position: Default::default(),
+            last_cursor_char_indexes: Default::default(),
             audioer,
             director: Director::new(),
             messager: Messager::new(),
@@ -2322,7 +2322,8 @@ impl Editor {
         }
 
         self.recompute_buffer_display_names();
-        self.tree_sitter.send_init(buffer_id, self.buffers[buffer_id].text.clone()); // nocheckin
+        let buffer = &self.buffers[buffer_id];
+        self.tree_sitter.send_init(buffer_id, buffer.text.clone(), buffer.last_edit_generation); // nocheckin
 
         buffer_id
     }
@@ -2377,13 +2378,15 @@ impl Editor {
         // so that if the user jumps around the source code, overlays don't flicker around.
         //
         {
+            let _tracy = tracy::span!("tree_sitter_function_call_overlay_calculation");
+
             let (view, buf) = self.active_view_and_buffer_mut();
             let view_id     = view.id;
             let buffer_id   = view.buffer_id;
             let char_index  = view.cursor.char_index;
             let cursor_byte = buf.text.char_to_byte(char_index);
             let rope        = buf.text.clone();
-            let last_pos    = self.last_cursor_position[view_id];
+            let last_pos    = self.last_cursor_char_indexes[view_id];
 
             //
             // Immediately shift the main thread tree coords
@@ -2394,15 +2397,31 @@ impl Editor {
             //
             {
                 let buf = self.active_buffer();
-                if !buf.ts_edits_in_this_frame.is_empty() {
-                    if let Some(mut tree_mut) = self.tree_sitter.trees.get_mut(&buffer_id) {
-                        for &edit in &buf.ts_edits_in_this_frame {
-                            tree_mut.edit(&edit.into()); // @Speed
-                        }
-                    }
-                }
+                let buf_gen = buf.last_edit_generation;
+                let edits = &buf.ts_edits_in_this_frame;
 
-                self.tree_sitter.send_reparse(buffer_id, rope.clone());
+                if !edits.is_empty() {
+                    if let Some(mut tree_mut) = self.tree_sitter.trees.get_mut(&buffer_id) {
+                        //
+                        // Only apply edits that are newer than what the tree was parsed at.
+                        //
+                        let tree_gen  = tree_mut.buffer_last_edit_generation;
+                        let edit_base = buf_gen.saturating_sub(edits.len() as u64);
+                        let to_skip   = tree_gen.saturating_sub(edit_base) as usize;
+                        let to_apply  = &edits[to_skip.min(edits.len())..];
+
+                        for &edit in to_apply {
+                            tree_mut.edit(&edit.into());
+                        }
+
+                        //
+                        // Bump the tree's generation to match what we've applied
+                        //
+                        tree_mut.buffer_last_edit_generation = buf_gen;
+                    }
+
+                    self.tree_sitter.send_reparse(buffer_id, rope.clone(), buf_gen);
+                }
             }
 
             let (view, buf) = self.active_view_and_buffer_mut();
@@ -3143,6 +3162,8 @@ impl ShouldRequestFrameRedraw {
 }
 
 pub fn recompute_pretty_paths(buffers: &mut PrimaryMap<BufferId, Buffer>) {  // @Memory @Speed
+    let _tracy = tracy::span!("recompute_pretty_paths");
+
     let mut by_name: FxHashMap<String, Vec<BufferId>> = Default::default();
     for (id, buf) in buffers.iter() {
         let Some(path) = &buf.path else { continue };

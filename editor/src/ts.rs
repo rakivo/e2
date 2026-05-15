@@ -1,7 +1,9 @@
 use crate::BufferId;
 use crate::atum::{Atom, AtomTable};
 
+use std::cell::UnsafeCell;
 use std::num::NonZeroU32;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::thread;
 
@@ -82,11 +84,13 @@ pub enum ParserMessage {
     Initialize {
         buffer_id: BufferId,
         rope: Rope,
+        buffer_last_edit_generation: u64,
     },
 
     Reparse {
         buffer_id: BufferId,
         rope: Rope,
+        buffer_last_edit_generation: u64,
     },
 }
 
@@ -140,6 +144,21 @@ pub struct Overlay {
     pub closing_paren_byte: Option<NonZeroU32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VersionedTree {
+    pub tree: Tree,
+    pub buffer_last_edit_generation: u64
+}
+
+impl Deref for VersionedTree {
+    type Target = Tree;
+    fn deref(&self) -> &Self::Target { &self.tree }
+}
+
+impl DerefMut for VersionedTree {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.tree }
+}
+
 pub struct TreeSitter {
     pub message_tx: Sender<ParserMessage>,
     pub query_tx:   Sender<ParserQuery>,
@@ -148,7 +167,7 @@ pub struct TreeSitter {
 
     // Shared tables for main-thread lookups
     pub atom_table: Arc<AtomTable>,
-    pub trees:      Arc<DashMap<BufferId, Tree>>,
+    pub trees:      Arc<DashMap<BufferId, VersionedTree>>,
 
     pub func_table: FunctionTable,
 }
@@ -173,13 +192,13 @@ impl TreeSitter {
     }
 
     #[inline]
-    pub fn send_reparse(&self, buffer_id: BufferId, rope: Rope) {
-        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, rope });
+    pub fn send_reparse(&self, buffer_id: BufferId, rope: Rope, buffer_last_edit_generation: u64) {
+        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, rope, buffer_last_edit_generation });
     }
 
     #[inline]
-    pub fn send_init(&self, buffer_id: BufferId, rope: Rope) {
-        _ = self.message_tx.send(ParserMessage::Initialize { buffer_id, rope });
+    pub fn send_init(&self, buffer_id: BufferId, rope: Rope, buffer_last_edit_generation: u64) {
+        _ = self.message_tx.send(ParserMessage::Initialize { buffer_id, rope, buffer_last_edit_generation });
     }
 
     #[inline]
@@ -204,7 +223,7 @@ pub fn spawn() -> TreeSitter {
     TreeSitter { message_tx, result, query_tx, atom_table: table, trees, func_table: Default::default() }
 }
 
-fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, result_tx: Sender<ParseResult>, table: Arc<AtomTable>, trees: Arc<DashMap<BufferId, Tree>>) {
+fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, result_tx: Sender<ParseResult>, table: Arc<AtomTable>, trees: Arc<DashMap<BufferId, VersionedTree>>) {
     let mut parser  = Parser::new();
 
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -235,32 +254,69 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
             },
 
             recv(edit_rx) -> msg => match msg {
-                Ok(ParserMessage::Reparse { buffer_id, rope }) => {
+                Ok(ParserMessage::Reparse { buffer_id, rope, buffer_last_edit_generation }) => {
                     //
-                    // Grab the already-edited tree as hint, main thread already called tree.edit() on it
+                    // Snapshot the old tree for the incremental parse hint,
+                    // clone it immediately so we hold the lock for the minimum time.
                     //
-                    let old_tree = trees.get(&buffer_id).as_deref().cloned();
+                    let old_tree = trees.get(&buffer_id).map(|e| e.tree.clone());
 
+                    //
+                    // Parse entirely outside any lock.
+                    //
                     let mut callback = |byte: usize, _point: Point| rope_chunk_callback(&rope, byte);
-
                     let Some(new_tree) = parser.parse_with_options(
                         &mut callback,
                         old_tree.as_ref(),
-                        None
+                        None,
                     ) else {
                         continue
                     };
 
+                    //
+                    // Collect functions from the new tree before acquiring any lock
+                    //
                     let functions = collect_functions(new_tree.root_node(), &rope, buffer_id, &table);
-                    trees.insert(buffer_id, new_tree);
 
+                    //
+                    // Atomically decide whether to commit,
+                    // only commit if our parse is at least as fresh as whatever is in the map.
+                    //
+                    let committed = match trees.get_mut(&buffer_id) {
+                        Some(mut shared) => {
+                            if buffer_last_edit_generation >= shared.buffer_last_edit_generation {
+                                shared.tree = new_tree;
+                                shared.buffer_last_edit_generation = buffer_last_edit_generation;
+                                true
+                            } else {
+                                //
+                                // Stale: main thread has already applied newer edits on top of
+                                // a newer parse. Discarding this result preserves the main
+                                // thread's tree.edit() shifts which are more up-to-date.
+                                //
+                                false
+                            }
+                        }
+                        None => {
+                            //
+                            // Buffer was closed between when we started parsing and now.
+                            //
+                            false
+                        }
+                    };
+
+                    if !committed { continue; }
+
+                    //
+                    // Only send results if we actually committed
+                    //
                     _ = result_tx.send(ParseResult {
                         buffer_id,
-                        kind: ParseResultKind::FunctionsUpdate { functions }
+                        kind: ParseResultKind::FunctionsUpdate { functions },
                     });
                 }
 
-                Ok(ParserMessage::Initialize { buffer_id, rope }) => {
+                Ok(ParserMessage::Initialize { buffer_id, rope, buffer_last_edit_generation }) => {
                     if trees.contains_key(&buffer_id) { continue; }
 
                     let mut callback = |byte: usize, _point: Point| rope_chunk_callback(&rope, byte);
@@ -268,7 +324,7 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     let Some(tree) = parser.parse_with_options(&mut callback, None, None) else { continue };
 
                     let functions = collect_functions(tree.root_node(), &rope, buffer_id, &table);
-                    trees.insert(buffer_id, tree);
+                    trees.insert(buffer_id, VersionedTree { tree, buffer_last_edit_generation });
 
                     _ = result_tx.send(ParseResult {
                         buffer_id,
@@ -338,7 +394,7 @@ impl FunctionTable {
     }
 
     pub fn insert_batch(&mut self, infos: Vec<FunctionInfo>, buffer_stem: Atom) {
-        // pre-reserve capacity in all maps
+        // Pre-reserve capacity in all maps
         let n = infos.len();
         self.by_name.reserve(n);
         self.by_impl.reserve(n);
@@ -769,8 +825,6 @@ pub fn overlay_needs_reset_cursor_byte(o: &Overlay, cursor_byte: u32) -> bool {
 //
 //
 
-const LOOKBACK_BYTES: usize = 1024;
-
 fn find_incomplete_call_overlay(
     cursor_byte: usize,
     source: &Rope,
@@ -778,8 +832,8 @@ fn find_incomplete_call_overlay(
 ) -> Option<Overlay> {
     let cursor_byte = cursor_byte.min(source.len_bytes());
 
-    let open_paren_byte = find_opening_paren_before_cursor(source, cursor_byte, LOOKBACK_BYTES)?;
-    let callee = extract_callee_before_paren(source, open_paren_byte, LOOKBACK_BYTES)?;
+    let open_paren_byte = find_opening_paren_before_cursor(source, cursor_byte)?;
+    let callee = extract_callee_before_paren(source, open_paren_byte)?;
 
     if is_definition_context(source, callee.start_byte) {
         return None;
@@ -802,8 +856,10 @@ fn is_definition_context(source: &Rope, callee_start_byte: usize) -> bool {
 
     let trimmed = window.trim_end();
 
+    //
     // Check if it ends with a definition keyword
-    for keyword in &["fn", "struct", "enum", "trait", "impl", "macro_rules!", "type", "mod"] {
+    //
+    for keyword in &["fn", "struct", "enum", "trait", "impl", "macro_rules!", "type", "mod"] { // @Speed
         if trimmed == *keyword || trimmed.ends_with(&format!(" {}", keyword))
             || trimmed.ends_with(&format!("\t{}", keyword))
             || trimmed.ends_with(&format!("\n{}", keyword))
@@ -820,24 +876,61 @@ struct CalleeSpan {
     start_byte: usize,
 }
 
+const LOOKBACK_CHARS: usize = 1024;
+
+thread_local! {
+    static SCRATCH_CHARS: UnsafeCell<SmallVec<[char; LOOKBACK_CHARS]>> = Default::default();
+    static SCRATCH_BYTES: UnsafeCell<SmallVec<[u8;   LOOKBACK_CHARS]>> = Default::default();
+}
+macro_rules! with_scratch_chars {
+    (let $chars:ident; $($tt:tt)*) => {
+        SCRATCH_CHARS.with(|$chars| {
+            let $chars: &mut SmallVec<[char; LOOKBACK_CHARS]> = unsafe { &mut *($chars.get() as *mut _) };
+            $($tt)*
+        })
+    };
+}
+macro_rules! with_scratch_bytes {
+    (let $chars:ident; $($tt:tt)*) => {
+        SCRATCH_BYTES.with(|$chars| {
+            let $chars: &mut SmallVec<[u8; LOOKBACK_CHARS]> = unsafe { &mut *($chars.get() as *mut _) };
+            $($tt)*
+        })
+    };
+}
+
 fn find_opening_paren_before_cursor( // @Memory
     source: &Rope,
     cursor_byte: usize,
-    lookback_bytes: usize,
 ) -> Option<usize> {
-    let start = cursor_byte.saturating_sub(lookback_bytes);
-    let window = source.byte_slice(start..cursor_byte).to_string();
+    with_scratch_bytes! {
+        let scratch_bytes;
+        find_opening_paren_before_cursor_impl(source, cursor_byte, scratch_bytes)
+    }
+}
 
-    let mut depth = 0i32;
-    for (rel_byte, ch) in window.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => {
+fn find_opening_paren_before_cursor_impl(
+    source: &Rope,
+    cursor_byte: usize,
+    scratch_bytes: &mut SmallVec<[u8; LOOKBACK_CHARS]>,
+) -> Option<usize> {
+    let start = cursor_byte.saturating_sub(LOOKBACK_CHARS);
+
+    scratch_bytes.clear();
+    scratch_bytes.extend(source.byte_slice(start..cursor_byte).bytes());
+
+    let mut depth = 0isize;
+
+    for i in (0..scratch_bytes.len()).rev() {
+        match scratch_bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
                 if depth == 0 {
-                    return Some(start + rel_byte);
+                    return Some(start + i);
                 }
                 depth -= 1;
             }
+
             _ => {}
         }
     }
@@ -849,11 +942,11 @@ fn top_level_top_boundary(a: i32, b: i32, c: i32) -> bool {
     a == 0 && b == 0 && c == 0
 }
 
-fn is_escaped(chars: &[(usize, char)], idx: usize) -> bool {
+fn is_escaped(chars: &[char], idx: usize) -> bool {
     let mut backslashes = 0usize;
     let mut i = idx;
     while i > 0 {
-        if chars[i - 1].1 == '\\' {
+        if chars[i - 1] == '\\' {
             backslashes += 1;
             i -= 1;
         } else {
@@ -863,13 +956,13 @@ fn is_escaped(chars: &[(usize, char)], idx: usize) -> bool {
     backslashes % 2 == 1
 }
 
-fn looks_like_char_literal_start(chars: &[(usize, char)], idx: usize) -> bool {
+fn looks_like_char_literal_start(chars: &[char], idx: usize) -> bool {
     // Very small heuristic: `'x'`, `'\n'`, etc.
     if idx + 1 >= chars.len() {
         return false;
     }
 
-    let next = chars[idx + 1].1;
+    let next = chars[idx + 1];
     next != '\'' && next != '\n'
 }
 
@@ -880,7 +973,11 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
     }
 
     if expr.contains("::") {
-        let parts: Vec<&str> = expr.split("::").map(str::trim).filter(|s| !s.is_empty()).collect();
+        let parts: SmallVec<[&str; 4]> = expr.split("::")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+
         if parts.is_empty() {
             return None;
         }
@@ -931,6 +1028,7 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
         if name.is_empty() {
             return None;
         }
+
         let name_start = expr.rfind(name)?;
         let atom = rope_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
         Some(CallKind::Method(atom))
@@ -940,6 +1038,7 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
         if name.is_empty() {
             return None;
         }
+
         let name_start = expr.rfind(name)?;
         let atom = rope_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
         Some(CallKind::Bare(atom))
@@ -957,21 +1056,33 @@ fn rope_slice_to_atom_from_str(
     table.intern(s)
 }
 
-fn extract_callee_before_paren( // @Memory @Refactor
+fn extract_callee_before_paren(
     source: &Rope,
     open_paren_byte: usize,
-    lookback_bytes: usize,
 ) -> Option<CalleeSpan> {
-    let start = open_paren_byte.saturating_sub(lookback_bytes);
-    let window = source.byte_slice(start..open_paren_byte).to_string();
+    with_scratch_chars! {
+        let scratch_chars;
+        extract_callee_before_paren_impl(source, open_paren_byte, scratch_chars)
+    }
+}
 
-    let chars: Vec<(usize, char)> = window.char_indices().collect();
+fn extract_callee_before_paren_impl(
+    source: &Rope,
+    open_paren_byte: usize,
+    scratch_chars: &mut SmallVec<[char; LOOKBACK_CHARS]>
+) -> Option<CalleeSpan> {
+    let start = open_paren_byte.saturating_sub(LOOKBACK_CHARS);
+    let rope_slice = source.byte_slice(start..open_paren_byte);
+
+    let chars = scratch_chars;
+    chars.clear();
+    chars.extend(rope_slice.chars());
     if chars.is_empty() {
         return None;
     }
 
     let mut end = chars.len();
-    while end > 0 && chars[end - 1].1.is_whitespace() {
+    while end > 0 && chars[end - 1].is_whitespace() {
         end -= 1;
     }
     if end == 0 {
@@ -1005,7 +1116,7 @@ fn extract_callee_before_paren( // @Memory @Refactor
             continue;
         }
 
-        let (_, ch) = chars[i - 1];
+        let ch = chars[i - 1];
         match ch {
             ')' => paren_depth += 1,
             ']' => bracket_depth += 1,
@@ -1053,7 +1164,7 @@ fn extract_callee_before_paren( // @Memory @Refactor
             }
 
             ':' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 && angle_depth == 0 && !in_pipe_params => {
-                if i >= 2 && chars[i - 2].1 == ':' {
+                if i >= 2 && chars[i - 2] == ':' {
                     i -= 2;
                     continue;
                 }
@@ -1074,10 +1185,9 @@ fn extract_callee_before_paren( // @Memory @Refactor
         i -= 1;
     }
 
-    let start_char = i;
-    let start_byte_rel = chars.get(start_char).map(|(b, _)| *b).unwrap_or(window.len());
+    let start_byte_rel = i;
 
-    let text: Box<str> = window[start_byte_rel..end].trim().into();
+    let text: Box<str> = rope_slice.byte_slice(start_byte_rel..end).to_string().trim().into();
     if text.is_empty() {
         return None;
     }
@@ -1088,18 +1198,33 @@ fn extract_callee_before_paren( // @Memory @Refactor
     })
 }
 
-fn count_incomplete_arg_index(  // @Memory @Refactor
+fn count_incomplete_arg_index(
     source: &Rope,
     open_paren_byte: usize,
     cursor_byte: usize,
+) -> Option<usize> {
+    with_scratch_chars! {
+        let scratch_chars;
+        count_incomplete_arg_index_impl(source, open_paren_byte, cursor_byte, scratch_chars)
+    }
+}
+
+fn count_incomplete_arg_index_impl(
+    source: &Rope,
+    open_paren_byte: usize,
+    cursor_byte: usize,
+    scratch_chars: &mut SmallVec<[char; LOOKBACK_CHARS]>
 ) -> Option<usize> {
     let cursor_byte = cursor_byte.min(source.len_bytes());
     if cursor_byte <= open_paren_byte {
         return Some(0);
     }
 
-    let text = source.byte_slice(open_paren_byte + 1..cursor_byte).to_string();
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let rope_slice = source.byte_slice(open_paren_byte + 1..cursor_byte);
+    let chars = scratch_chars;
+
+    chars.clear();
+    chars.extend(rope_slice.chars());
 
     let mut paren_depth   = 0i32;
     let mut bracket_depth = 0i32;
@@ -1129,7 +1254,7 @@ fn count_incomplete_arg_index(  // @Memory @Refactor
             continue;
         }
 
-        let (_, ch) = chars[i];
+        let ch = chars[i];
         match ch {
             '(' => paren_depth += 1,
             ')' => {
@@ -1174,7 +1299,7 @@ fn count_incomplete_arg_index(  // @Memory @Refactor
 }
 
 fn consume_rust_syntax_backward(
-    chars: &[(usize, char)],
+    chars: &[char],
     i: &mut usize,
 
     in_line_comment: &mut bool,
@@ -1187,7 +1312,7 @@ fn consume_rust_syntax_backward(
         return false;
     }
 
-    let ch = chars[*i - 1].1;
+    let ch = chars[*i - 1];
 
     if *in_line_comment {
         if ch == '\n' {
@@ -1199,13 +1324,13 @@ fn consume_rust_syntax_backward(
     }
 
     if *block_comment_depth > 0 {
-        if ch == '/' && *i >= 2 && chars[*i - 2].1 == '*' {
+        if ch == '/' && *i >= 2 && chars[*i - 2] == '*' {
             *block_comment_depth -= 1;
             *i -= 2;
             return true;
         }
 
-        if ch == '*' && *i >= 2 && chars[*i - 2].1 == '/' {
+        if ch == '*' && *i >= 2 && chars[*i - 2] == '/' {
             *block_comment_depth += 1;
             *i -= 2;
             return true;
@@ -1220,7 +1345,7 @@ fn consume_rust_syntax_backward(
             let mut ok = true;
 
             for k in 0..hashes {
-                if *i + k >= chars.len() || chars[*i + k].1 != '#' {
+                if *i + k >= chars.len() || chars[*i + k] != '#' {
                     ok = false;
                     break;
                 }
@@ -1256,7 +1381,7 @@ fn consume_rust_syntax_backward(
     }
 
     if ch == '/' && *i >= 2 {
-        let prev = chars[*i - 2].1;
+        let prev = chars[*i - 2];
 
         if prev == '/' {
             *in_line_comment = true;
@@ -1275,12 +1400,12 @@ fn consume_rust_syntax_backward(
         let mut hashes = 0usize;
         let mut j = *i - 1;
 
-        while j > 0 && chars[j - 1].1 == '#' {
+        while j > 0 && chars[j - 1] == '#' {
             hashes += 1;
             j -= 1;
         }
 
-        if j > 0 && chars[j - 1].1 == 'r' {
+        if j > 0 && chars[j - 1] == 'r' {
             *raw_string_hashes = Some(hashes);
             *i -= 1;
             return true;
@@ -1301,7 +1426,7 @@ fn consume_rust_syntax_backward(
 }
 
 fn consume_rust_syntax_forward(
-    chars: &[(usize, char)],
+    chars: &[char],
     i: &mut usize,
 
     in_line_comment: &mut bool,
@@ -1314,7 +1439,7 @@ fn consume_rust_syntax_forward(
         return false;
     }
 
-    let ch = chars[*i].1;
+    let ch = chars[*i];
 
     if *in_line_comment {
         if ch == '\n' {
@@ -1325,13 +1450,13 @@ fn consume_rust_syntax_forward(
     }
 
     if *block_comment_depth > 0 {
-        if ch == '/' && *i + 1 < chars.len() && chars[*i + 1].1 == '*' {
+        if ch == '/' && *i + 1 < chars.len() && chars[*i + 1] == '*' {
             *block_comment_depth += 1;
             *i += 2;
             return true;
         }
 
-        if ch == '*' && *i + 1 < chars.len() && chars[*i + 1].1 == '/' {
+        if ch == '*' && *i + 1 < chars.len() && chars[*i + 1] == '/' {
             *block_comment_depth -= 1;
             *i += 2;
             return true;
@@ -1346,7 +1471,7 @@ fn consume_rust_syntax_forward(
             let mut ok = true;
 
             for k in 0..hashes {
-                if *i + 1 + k >= chars.len() || chars[*i + 1 + k].1 != '#' {
+                if *i + 1 + k >= chars.len() || chars[*i + 1 + k] != '#' {
                     ok = false;
                     break;
                 }
@@ -1382,7 +1507,7 @@ fn consume_rust_syntax_forward(
     }
 
     if ch == '/' && *i + 1 < chars.len() {
-        let next = chars[*i + 1].1;
+        let next = chars[*i + 1];
 
         if next == '/' {
             *in_line_comment = true;
@@ -1401,12 +1526,12 @@ fn consume_rust_syntax_forward(
         let mut hashes = 0usize;
         let mut j = *i;
 
-        while j > 0 && chars[j - 1].1 == '#' {
+        while j > 0 && chars[j - 1] == '#' {
             hashes += 1;
             j -= 1;
         }
 
-        if j > 0 && chars[j - 1].1 == 'r' {
+        if j > 0 && chars[j - 1] == 'r' {
             *raw_string_hashes = Some(hashes);
             *i += 1;
             return true;
