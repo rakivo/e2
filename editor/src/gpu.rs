@@ -2,7 +2,7 @@
 
 use crate::messager::MESSAGER_FONT_SIZE;
 use crate::util::format_bytes;
-use crate::{Editor, Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, scale_base_font_size};
+use crate::{Editor, Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, scale_base_font_size, tracy};
 use crate::color::{Color, GpuColor, lerp_color};
 
 use std::ffi::CStr;
@@ -181,6 +181,8 @@ impl Gpu {
 
     #[inline]
     pub fn submit_frame(&mut self) -> Result<(), vk::Result> {
+        let _tracy = tracy::span!("submit_frame");
+
         unsafe { self.submit_frame_impl() }
     }
 
@@ -659,8 +661,7 @@ impl Gpu {
         //
         let entry = ash::Entry::load().expect("failed to load Vulkan");
 
-        let app_info = vk::ApplicationInfo::default()
-            .api_version(vk::API_VERSION_1_2);
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
 
         //
         // Surface extensions required by winit

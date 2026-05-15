@@ -149,6 +149,8 @@ impl App {
 
         let (Some(gpu), Some(win)) = (&mut self.gpu, &self.window) else { return };
 
+        let _window_event_span = tracy_client::span!("window_event");
+
         let editor = &mut self.editor;
 
         let ctrl  = self.mods.state().control_key();
@@ -243,6 +245,8 @@ impl App {
                     {
                         // @Cutnpaste from above
 
+                        let _tracy = tracy_client::span!("pre_command_execution");
+
                         let pre_command_execution = editor.hooks.pre_command_execution;
                         let (
                             custom_window_redraw_requested,
@@ -262,11 +266,15 @@ impl App {
                     }
 
                     {
+                        let _tracy = tracy_client::span!("command_execution");
+
                         let mut cx = make_command_context!(reset &event);
                         (command.func)(&mut cx);
                     }
 
                     {
+                        let _tracy = tracy_client::span!("post_command_execution");
+
                         // @Cutnpaste from above
 
                         let post_command_execution = editor.hooks.post_command_execution;
@@ -440,6 +448,8 @@ impl App {
                 }
 
                 if editor.mouse_left_pressed {
+                    let _tracy = tracy_client::span!("editor_handle_left_mouse_click");
+
                     let mut cx = make_command_context!();
                     should_request_redraw |= editor_handle_left_mouse_click(&mut cx);
                 }
@@ -464,6 +474,8 @@ impl App {
 
             WindowEvent::RedrawRequested => {
                 tracy_client::frame_mark();
+
+                let _render_span = tracy_client::span!("Render Frame");
 
                 ShouldRequestFrameRedraw::begin_frame(&mut editor.redraw_reasons);
 
@@ -525,8 +537,9 @@ impl App {
                 collect_leaves(editor, editor.root_panel, &mut leaf_panels);
 
                 for (_panel_id, view_id, ..) in &leaf_panels {
-                    let char_index = editor.views[*view_id].cursor.char_index;
-                    editor.last_cursor_position.insert(*view_id, char_index as _);
+                    let view = &editor.views[*view_id];
+                    let char_index = view.cursor.char_index;
+                    editor.last_cursor_char_indexes.insert(*view_id, char_index as _);
                 }
 
                 if let Some(about_to_rebuild_dirty_layouts_hook) = editor.hooks.about_to_rebuild_dirty_layouts {
@@ -606,6 +619,8 @@ impl App {
                 }
 
                 if let Some(drew_all_leaf_panels_hook) = editor.hooks.drew_all_leaf_panels {
+                    let _tracy = tracy::span!("drew_all_leaf_panels_hook");
+
                     let mut cx = make_command_context!(defer);
                     redraw |= drew_all_leaf_panels_hook(&mut cx);
                 }
