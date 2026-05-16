@@ -490,7 +490,7 @@ pub fn lex_from(
                             Some(TokenKind::Note)
                         } else { None },
 
-                        6 => if matches!(word, "return" | "struct" | "extern" | "import" | "public" | "static" | "switch" | "typeof" | "delete") {
+                        6 => if matches!(word, "return" | "struct" | "extern" | "import" | "public" | "static" | "switch" | "typeof" | "delete" | "unsafe") {
                             Some(TokenKind::Keyword)
                         } else if matches!(word, "IMPORTANT") {
                             Some(TokenKind::Note)
