@@ -1466,96 +1466,95 @@ pub fn render_text_layout(
 
         let crect = context.cursor_rect(cursor_glyph_w);
 
-        let Some(info) = crate::ts::lookup_overlay(
+        if let Some(info) = crate::ts::lookup_overlay(
             overlay,
             &editor.tree_sitter.func_table,
             &editor.tree_sitter.atom_table
-        ) else {
-            return;
-        };
+        ) {
 
-        // :Configuration
-        let pad_x     = 6.0;
-        let pad_y_top = 4.0;
-        let pad_y_bot = 6.0;
-        let font_size = editor.font_size() * 0.85;
+            // :Configuration
+            let pad_x     = 6.0;
+            let pad_y_top = 4.0;
+            let pad_y_bot = 6.0;
+            let font_size = editor.font_size() * 0.85;
 
-        let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
+            let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
 
-        //
-        // Pre-measure total scratch size and record (start, end, is_active) per param
-        //
-        struct PieceRange { start: u32, end: u32, active: bool }
-        let mut param_ranges: SmallVec<[PieceRange; 8]> = Default::default();
+            //
+            // Pre-measure total scratch size and record (start, end, is_active) per param
+            //
+            struct PieceRange { start: u32, end: u32, active: bool }
+            let mut param_ranges: SmallVec<[PieceRange; 8]> = Default::default();
 
-        for (i, param) in info.params.iter().enumerate() {
-            let name     = editor.tree_sitter.atom_table.lookup_ref(param.name);
-            let type_str = editor.tree_sitter.atom_table.lookup_ref(param.type_str);
-            let start    = scratch.len() as _;
-            scratch.extend_from_slice(name.as_bytes());
-            scratch.extend_from_slice(b": ");
-            scratch.extend_from_slice(type_str.as_bytes());
-            let end      = scratch.len() as _;
-            param_ranges.push(PieceRange { start, end, active: i == overlay.arg_index as usize });
-        }
-
-        let func_name = editor.tree_sitter.atom_table.lookup_ref(overlay.call_kind.function_name());
-        let mut pieces: SmallVec<[(&str, bool); 16]> = SmallVec::new();
-        pieces.push((func_name.as_str(), false));
-        pieces.push(("(", false));
-        for (i, pr) in param_ranges.iter().enumerate() {
-            if i > 0 { pieces.push((", ", false)); }
-            let s = unsafe {
-                std::str::from_utf8_unchecked(&scratch[pr.start as usize..pr.end as usize])
-            };
-            pieces.push((s, pr.active));
-        }
-        pieces.push((")", false));
-
-        //
-        // Measure
-        //
-
-        let mut text_w: f32 = 0.0;
-        for (text, _) in &pieces {
-            text_w += gpu::measure_text(gpu, text, font_size);
-        }
-        let overlay_w = text_w + pad_x * 2.0;
-        let overlay_h = font_size + pad_y_top + pad_y_bot;
-
-        //
-        // Position
-        //
-
-        let margin = 8.0;
-        let mut ox = crect.x + 14.0;
-        let mut oy = crect.y - overlay_h - 6.0;
-        if ox + overlay_w > rect.x + rect.w - margin { ox = rect.x + rect.w - overlay_w - margin; }
-        if oy < rect.y + margin { oy = crect.y + crect.h + 6.0; }
-
-        //
-        // Draw
-        //
-
-        let   bg_opacity = 0.62;
-        let text_opacity = 0.80;
-
-        gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E).with_alpha(bg_opacity));
-        gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A).with_alpha(bg_opacity));
-
-        let mut tx = ox + pad_x;
-        let ty = oy + pad_y_top + font_size;
-        for (text, active) in &pieces {
-            let color =
-                if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) }.with_alpha(text_opacity);
-
-            gpu::draw_text(gpu, text, tx, ty, font_size, color);
-            if *active {
-                let w = gpu::measure_text(gpu, text, font_size);
-                gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D).with_alpha(text_opacity));
+            for (i, param) in info.params.iter().enumerate() {
+                let name     = editor.tree_sitter.atom_table.lookup_ref(param.name);
+                let type_str = editor.tree_sitter.atom_table.lookup_ref(param.type_str);
+                let start    = scratch.len() as _;
+                scratch.extend_from_slice(name.as_bytes());
+                scratch.extend_from_slice(b": ");
+                scratch.extend_from_slice(type_str.as_bytes());
+                let end      = scratch.len() as _;
+                param_ranges.push(PieceRange { start, end, active: i == overlay.arg_index as usize });
             }
 
-            tx += gpu::measure_text(gpu, text, font_size);
+            let func_name = editor.tree_sitter.atom_table.lookup_ref(overlay.call_kind.function_name());
+            let mut pieces: SmallVec<[(&str, bool); 16]> = SmallVec::new();
+            pieces.push((func_name.as_str(), false));
+            pieces.push(("(", false));
+            for (i, pr) in param_ranges.iter().enumerate() {
+                if i > 0 { pieces.push((", ", false)); }
+                let s = unsafe {
+                    std::str::from_utf8_unchecked(&scratch[pr.start as usize..pr.end as usize])
+                };
+                pieces.push((s, pr.active));
+            }
+            pieces.push((")", false));
+
+            //
+            // Measure
+            //
+
+            let mut text_w: f32 = 0.0;
+            for (text, _) in &pieces {
+                text_w += gpu::measure_text(gpu, text, font_size);
+            }
+            let overlay_w = text_w + pad_x * 2.0;
+            let overlay_h = font_size + pad_y_top + pad_y_bot;
+
+            //
+            // Position
+            //
+
+            let margin = 8.0;
+            let mut ox = crect.x + 14.0;
+            let mut oy = crect.y - overlay_h - 6.0;
+            if ox + overlay_w > rect.x + rect.w - margin { ox = rect.x + rect.w - overlay_w - margin; }
+            if oy < rect.y + margin { oy = crect.y + crect.h + 6.0; }
+
+            //
+            // Draw
+            //
+
+            let   bg_opacity = 0.62;
+            let text_opacity = 0.80;
+
+            gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E).with_alpha(bg_opacity));
+            gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A).with_alpha(bg_opacity));
+
+            let mut tx = ox + pad_x;
+            let ty = oy + pad_y_top + font_size;
+            for (text, active) in &pieces {
+                let color =
+                    if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) }.with_alpha(text_opacity);
+
+                gpu::draw_text(gpu, text, tx, ty, font_size, color);
+                if *active {
+                    let w = gpu::measure_text(gpu, text, font_size);
+                    gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D).with_alpha(text_opacity));
+                }
+
+                tx += gpu::measure_text(gpu, text, font_size);
+            }
         }
     }
 
@@ -2441,11 +2440,15 @@ impl Editor {
     #[inline]
     pub fn max_scroll_of(&self, view_id: ViewId) -> f32 {
         let (view, buf) = self.view_and_buffer(view_id);
-        let panel_id = view.panel_id().unwrap();
+        let rect = if let Some(layout) = &view.layout {
+            layout.rect
+        } else if let Some(panel_id) = view.panel_id() {
+            self.panel(panel_id).rect
+        } else {
+            unreachable!()
+        };
 
         let line_count = buf.text.len_lines();
-        let rect = self.panel(panel_id).rect;
-
         self.max_scroll_of_impl(line_count as _, rect)
     }
 
@@ -3970,6 +3973,11 @@ pub fn open_initial_buffer(editor: &mut Editor) {
     editor.mru_register_new_buffer(buffer_id); // @Refactor
 
     editor.views[VIEW_MAIN].switch_buffer(buffer_id);
+
+    {
+        let buffer = &editor.buffers[buffer_id];
+        editor.tree_sitter.send_init(buffer_id, buffer.text.clone(), buffer.last_edit_generation);
+    }
 
     if let Some(p) = canon {
         editor.canonicalized_path_to_buffer_id.insert(p.into(), buffer_id);
