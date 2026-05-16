@@ -2914,26 +2914,33 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.format_panel_bar = Some(|editor, view_id| {
         let view = &editor.views[view_id];
-        let buffer_id = view.buffer_id;
-        let buffer = &editor.buffers[buffer_id];
+        let buffer = &editor.buffers[view.buffer_id];
         let (line, col) = buffer.cursor_line_col(&view.cursor);
+        let dirty = if buffer.has_unsaved_changes() { " + " } else { " - " };
+
+        // Left: path + dirty marker
         _ = write!(
             &mut editor.scratch_panel_bar,
+            "{}{}",
+            buffer.pretty_path, dirty
+        );
 
-            "{}  {}:{}  {}  {}",
-            buffer.pretty_path, line+1, col+1,
-            if buffer.has_unsaved_changes() { '*' } else { '-' },
-            (editor.scale / 0.25).ceil() * 0.25
+        // Right: position + zoom
+        let zoom_pct = ((editor.scale / 0.25).ceil() * 0.25 * 100.0) as u32;
+        _ = write!(
+            &mut editor.scratch_panel_bar_dim,
+            "{}:{}   {}%",
+            line + 1, col + 1, zoom_pct
         );
     });
 
     cx.editor.hooks.panel_bar_color = Some(|editor, view_id| {
         let view = &editor.views[view_id];
-        let panel_color = Color::hex(0x1a1a2e);
-        if Some(editor.active_panel) == view.panel_id() { // @PaletteRefactor
-            (panel_color, Some(Color::hex(0x312815)))  // active: gold border
+        let p = palette();
+        if Some(editor.active_panel) == view.panel_id() {
+            (p.panel_bar_bg, Some(p.panel_bar_border))
         } else {
-            (panel_color.darken(0.5), None)            // inactive: no border
+            (p.panel_bar_bg_inactive, None)
         }
     });
 
@@ -3247,7 +3254,7 @@ pub fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
     // Item count
     lister.scratch_str.clear();
     _ = write!(&mut lister.scratch_str, "{} results", lister.filtered.len());
-    let count_w = gpu::measure_str(gpu, &lister.scratch_str, smaller_font_size);
+    let count_w = gpu::measure_text(gpu, &lister.scratch_str, smaller_font_size);
     gpu::draw_text(gpu, &lister.scratch_str,
                    px + pw - pad - count_w,
                    py + input_h * 0.44 + line_h * 0.35,
@@ -3298,7 +3305,7 @@ pub fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
         );
 
         if !item.sublabel.is_empty() {
-            let sub_w = gpu::measure_str(gpu, &item.sublabel, smaller_font_size);
+            let sub_w = gpu::measure_text(gpu, &item.sublabel, smaller_font_size);
 
             gpu::draw_text(
                 gpu, &item.sublabel,

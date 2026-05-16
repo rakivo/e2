@@ -168,7 +168,7 @@ impl Gpu {
 
     #[inline]
     pub fn measure_message(&mut self, s: &str) -> f32 {
-        measure_str(self, s, MESSAGER_FONT_SIZE)
+        measure_text(self, s, MESSAGER_FONT_SIZE)
     }
 
     #[inline]
@@ -465,7 +465,7 @@ pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
 }
 
 #[inline(always)]
-pub fn measure_str(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
+pub fn measure_text(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
     s.chars().map(|c| {
         get_glyph(gpu, c, font_size).map(|g| g.advance).unwrap_or(8.0)
     }).sum()
@@ -1079,7 +1079,7 @@ impl Gpu {
         self.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
         let clear = vk::ClearValue {
-            color: vk::ClearColorValue { float32: palette().bg.into_gpu().0 },
+            color: vk::ClearColorValue { float32: palette().background.into_gpu().0 },
         };
         let rp_begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)

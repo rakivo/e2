@@ -406,30 +406,44 @@ pub fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32
 }
 
 pub struct Palette {
-    pub bg:               Color,
+    pub background:       Color,
     pub selection:        Color,
     pub current_line:     Color,
+
     pub cursor:           Color,
-    pub cursor_text:      Color,
+    pub text_under_cursor: Color,
+
     pub paren_match:      Color,
+
     pub paste_highlight:  Color,
     pub copy_highlight:   Color,
     pub delete_highlight: Color,
+
+    pub panel_bar_bg:          Color,
+    pub panel_bar_bg_inactive: Color,
+    pub panel_bar_text:        Color,
+    pub panel_bar_text_dim:    Color,  // for secondary fields (line:col, zoom)
+    pub panel_bar_border:      Color,
 }
 
 #[inline]
 pub const fn palette() -> Palette {
     Palette {
-        bg:               Color::hex(0x0f0b05),
+        background:       Color::hex(0x0f0b05),
         selection:        Color::hex(0x112c4f),
-        // cursor:           Color::hex(0xc3a983),
         cursor:           Color::hex(0xff0014),
         current_line:     Color::hex(0x231b0e),
-        cursor_text:      Color::rgba(13, 13, 13, 255),
+        text_under_cursor: Color::rgba(13, 13, 13, 255),
         paren_match:      Color::rgba(190, 128, 133, 200),
         paste_highlight:  Color::hex(0xe6c86a),
         delete_highlight: Color::hex(0x8b3a1e),
         copy_highlight:   Color::hex(0x3a8fb5),
+
+        panel_bar_bg:          Color::hex(0x1c1408),  // warm near-black
+        panel_bar_bg_inactive: Color::hex(0x110d05),  // darker, clearly subordinate
+        panel_bar_text:        Color::rgba(210, 165, 80, 255),   // warm gold, active
+        panel_bar_text_dim:    Color::rgba(120, 95,  50, 255),   // muted gold, secondary info
+        panel_bar_border: Color::hex(0x2a2110),  // almost invisible, just a seam
     }
 }
 
@@ -1392,7 +1406,7 @@ pub fn render_text_layout(
 
         let verts = gpu.verts_mut();
 
-        let cursor_color    = palette().cursor_text.into();
+        let cursor_color    = palette().text_under_cursor.into();
         let paste_highlight = palette().paste_highlight.into();
         let copy_highlight  = palette().copy_highlight.into();
 
@@ -1504,7 +1518,7 @@ pub fn render_text_layout(
 
         let mut text_w: f32 = 0.0;
         for (text, _) in &pieces {
-            text_w += gpu::measure_str(gpu, text, font_size);
+            text_w += gpu::measure_text(gpu, text, font_size);
         }
         let overlay_w = text_w + pad_x * 2.0;
         let overlay_h = font_size + pad_y_top + pad_y_bot;
@@ -1537,11 +1551,11 @@ pub fn render_text_layout(
 
             gpu::draw_text(gpu, text, tx, ty, font_size, color);
             if *active {
-                let w = gpu::measure_str(gpu, text, font_size);
+                let w = gpu::measure_text(gpu, text, font_size);
                 gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D).with_alpha(text_opacity));
             }
 
-            tx += gpu::measure_str(gpu, text, font_size);
+            tx += gpu::measure_text(gpu, text, font_size);
         }
     }
 
@@ -1647,10 +1661,16 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     let bar_h = editor.panel_bar_h();
     let bar_y = rect.y - bar_h;
 
+    let p = palette();
+
     let (panel_bar_color, border_color) = if let Some(hook) = editor.hooks.panel_bar_color {
         hook(editor, view_id)
     } else {
-        (Color::hex(0x3d2a0f), None)  // @PaletteRefactor
+        if Some(editor.active_panel) == view.panel_id() {
+            (p.panel_bar_bg, Some(p.panel_bar_border))
+        } else {
+            (p.panel_bar_bg_inactive, None)
+        }
     };
 
     gpu::draw_rect(gpu, rect.x, bar_y, rect.w, bar_h, panel_bar_color);
@@ -1706,22 +1726,42 @@ pub fn render_panel_bar(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
     }
 
     editor.scratch_panel_bar.clear();
+    editor.scratch_panel_bar_dim.clear();
     if let Some(format_panel_bar) = editor.hooks.format_panel_bar {
         format_panel_bar(editor, view_id);
     }
 
-    let pad = (bar_h-editor.font_size())/2.0;
+    let is_active  = Some(editor.active_panel) == editor.views[view_id].panel_id();
+    let text_color = if is_active { p.panel_bar_text } else { p.panel_bar_text_dim };
+    let dim_color  = p.panel_bar_text_dim;
 
-    let center_y = bar_y + bar_h * 0.5;
-    let y = center_y + editor.font_size() * 0.34; // nocheckin
+    let pad        = bar_h - editor.font_size();
+    let center_y   = bar_y + bar_h * 0.5;
+    let y          = center_y + editor.font_size() * 0.34;
 
+    //
+    // Left aligned segment
+    //
     gpu::draw_text(
         gpu,
         &editor.scratch_panel_bar,
-        rect.x+pad, y,
+        rect.x + pad, y,
         editor.font_size(),
-        Color::rgba(174, 131, 60, 255)
+        text_color,
     );
+
+    // Right aligned segment
+    if !editor.scratch_panel_bar_dim.is_empty() {
+        let dim_text_w = gpu::measure_text(gpu, &editor.scratch_panel_bar_dim, editor.font_size());
+        let right_pad = pad * 2.0;
+        gpu::draw_text(
+            gpu,
+            &editor.scratch_panel_bar_dim,
+            rect.x + rect.w - right_pad - dim_text_w, y,
+            editor.font_size(),
+            dim_color,
+        );
+    }
 }
 
 pub fn render_split_seams(gpu: &mut Gpu, editor: &Editor, panel_id: PanelId, color: Color) {
@@ -2202,6 +2242,7 @@ pub struct Editor {
 
     pub scratch_paren:     Vec<char>,
     pub scratch_panel_bar: String,
+    pub scratch_panel_bar_dim: String,
 
     pub most_recently_used_buffers:  VecDeque<BufferId>,
     pub buffer_cycle_index:          Option<usize>,
@@ -2309,7 +2350,8 @@ impl Editor {
             views,
             panels,
             canonicalized_path_to_buffer_id,
-            scratch_panel_bar: String::with_capacity(256),
+            scratch_panel_bar: String::with_capacity(128),
+            scratch_panel_bar_dim: String::with_capacity(128),
             logger_config,
             hooks: Default::default(),
             last_input_time: Instant::now(),
