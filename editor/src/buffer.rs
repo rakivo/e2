@@ -333,7 +333,7 @@ impl Buffer {
         );
     }
 
-    fn invalidate_cache_from_char(&mut self, char_index: usize) {
+    pub fn invalidate_cache_from_char(&mut self, char_index: usize) {
         let byte = self.text.char_to_byte(char_index);
         let keep = self.comment_cache.partition_point(|(b, _)| *b < byte as u32);
         // Currently correct, keeps entries strictly before the edit byte.
@@ -749,6 +749,121 @@ impl Buffer {
 
         cursor.char_index    = i;
         cursor.preferred_col = None;
+    }
+
+    pub fn move_lines(&mut self, cursor: &mut Cursor, first_line: usize, last_line: usize, up: bool) {
+        let total_lines = self.text.len_lines();
+
+        if up  && first_line == 0                  { return }
+        if !up && last_line + 1 >= total_lines     { return }
+
+        //
+        // Save columns before any mutation
+        //
+        let cursor_line = self.text.char_to_line(cursor.char_index);
+        let cursor_col  = cursor.char_index - self.text.line_to_char(cursor_line);
+
+        let (anchor_line, anchor_col) = match cursor.anchor_char_index {
+            Some(anchor) => {
+                let al = self.text.char_to_line(anchor);
+                let ac = anchor - self.text.line_to_char(al);
+                (Some(al), Some(ac))
+            }
+            None => (None, None),
+        };
+
+        if up {
+            //
+            // Extract the line above the block
+            //
+            let above_start = self.text.line_to_char(first_line - 1);
+            let above_end   = self.text.line_to_char(first_line);
+            let above_text: String = self.text.slice(above_start..above_end).to_string();
+
+            //
+            // Remove it
+            //
+            self.text.remove(above_start..above_end);
+
+            //
+            // insertion point is now after the block (which shifted up by one line)
+            // last_line - 1 because everything shifted up
+            //
+            let insert_after_line = last_line - 1;
+            let insert_char = if insert_after_line + 1 < self.text.len_lines() {
+                self.text.line_to_char(insert_after_line + 1)
+            } else {
+                //
+                // Block is at end of file, need to append with a leading newline
+                //
+                let end = self.text.len_chars();
+                self.text.insert_char(end, '\n');
+                self.text.len_chars()
+            };
+
+            self.text.insert(insert_char, &above_text);
+
+            //
+            // Cursor moved up one line, same column
+            //
+            let new_cursor_line = cursor_line.saturating_sub(1);
+            let new_line_len    = self.text.line(new_cursor_line).len_chars().saturating_sub(1);
+            cursor.char_index   = self.text.line_to_char(new_cursor_line) + cursor_col.min(new_line_len);
+
+            if let (Some(al), Some(ac)) = (anchor_line, anchor_col) {
+                let nal          = al.saturating_sub(1);
+                let nal_len      = self.text.line(nal).len_chars().saturating_sub(1);
+                cursor.anchor_char_index = Some(self.text.line_to_char(nal) + ac.min(nal_len));
+            }
+        } else {
+            //
+            // Extract the line below the block
+            //
+            let below_start = self.text.line_to_char(last_line + 1);
+            let below_end   = if last_line + 2 < self.text.len_lines() {
+                self.text.line_to_char(last_line + 2)
+            } else {
+                self.text.len_chars()
+            };
+            let below_text: String = self.text.slice(below_start..below_end).to_string();
+
+            //
+            // Ensure it ends with newline
+            //
+            let below_text = if below_text.ends_with('\n') {
+                below_text
+            } else {
+                format!("{}\n", below_text)
+            };
+
+            //
+            // Remove the line below
+            //
+            self.text.remove(below_start..below_end);
+
+            //
+            // Insert above first_line
+            //
+            let insert_char = self.text.line_to_char(first_line);
+            self.text.insert(insert_char, &below_text);
+
+            //
+            // Cursor moved down one line, same column
+            //
+            let new_cursor_line = (cursor_line + 1).min(self.text.len_lines().saturating_sub(1));
+            let new_line_len    = self.text.line(new_cursor_line).len_chars().saturating_sub(1);
+            cursor.char_index   = self.text.line_to_char(new_cursor_line) + cursor_col.min(new_line_len);
+
+            if let (Some(anchor_line), Some(anchor_col)) = (anchor_line, anchor_col) {
+                let new_al     = (anchor_line + 1).min(self.text.len_lines().saturating_sub(1));
+                let new_al_len = self.text.line(new_al).len_chars().saturating_sub(1);
+                cursor.anchor_char_index = Some(self.text.line_to_char(new_al) + anchor_col.min(new_al_len));
+            }
+        }
+
+        self.last_edit_generation += 1;
+        self.is_dirty = true;
+        self.invalidate_cache_from_char(0);
     }
 }
 

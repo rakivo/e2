@@ -1620,7 +1620,7 @@ pub fn scope_end_byte(node: Node) -> usize {
 
 // Walk forward in document order from `node`, skipping `node` itself.
 // Visits children before siblings (pre-order).
-fn next_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
+pub fn next_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     // descend into first child if any
     if node.child_count() > 0 {
         return node.child(0);
@@ -1629,7 +1629,7 @@ fn next_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     ascend_to_next_sibling(node)
 }
 
-fn ascend_to_next_sibling(mut node: Node) -> Option<Node> {
+pub fn ascend_to_next_sibling(mut node: Node) -> Option<Node> {
     loop {
         if let Some(sib) = node.next_sibling() {
             return Some(sib);
@@ -1640,7 +1640,7 @@ fn ascend_to_next_sibling(mut node: Node) -> Option<Node> {
 
 // Walk backward in document order from `node`, skipping `node` itself.
 // This is the reverse pre-order: prev sibling's rightmost leaf, then parent.
-fn prev_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
+pub fn prev_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     if let Some(sib) = node.prev_sibling() {
         // rightmost leaf of the previous sibling
         return Some(rightmost_leaf(sib));
@@ -1648,7 +1648,7 @@ fn prev_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     node.parent()
 }
 
-fn rightmost_leaf(mut node: Node) -> Node {
+pub fn rightmost_leaf(mut node: Node) -> Node {
     loop {
         let c = node.child_count();
         if c == 0 { return node; }
@@ -1656,7 +1656,7 @@ fn rightmost_leaf(mut node: Node) -> Node {
     }
 }
 
-fn next_named_matching<'a, F>(start: Node<'a>, pred: F) -> Option<Node<'a>>
+pub fn next_named_matching<'a, F>(start: Node<'a>, pred: F) -> Option<Node<'a>>
 where F: Fn(Node<'a>) -> bool {
     let mut cur = next_node(start);
     while let Some(n) = cur {
@@ -1666,7 +1666,7 @@ where F: Fn(Node<'a>) -> bool {
     None
 }
 
-fn prev_named_matching<'a, F>(start: Node<'a>, pred: F) -> Option<Node<'a>>
+pub fn prev_named_matching<'a, F>(start: Node<'a>, pred: F) -> Option<Node<'a>>
 where F: Fn(Node<'a>) -> bool {
     let mut cur = prev_node(start);
     while let Some(n) = cur {
@@ -1676,7 +1676,7 @@ where F: Fn(Node<'a>) -> bool {
     None
 }
 
-fn find_enclosing<'a, F>(mut node: Node<'a>, pred: F) -> Option<Node<'a>>
+pub fn find_enclosing<'a, F>(mut node: Node<'a>, pred: F) -> Option<Node<'a>>
 where F: Fn(Node<'a>) -> bool {
     loop {
         node = node.parent()?;

@@ -328,6 +328,132 @@ pub fn kill_paragraph_forward(cx: &mut CommandContext) {
 }
 
 #[command]
+pub fn mark_sexp(cx: &mut CommandContext) {  // @Refactor
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    //
+    // Search forward from anchor if already selecting, else from cursor
+    //
+    let search_from = view.cursor.anchor_char_index.unwrap_or(view.cursor.char_index);
+
+    let text    = &buf.text;
+    let len     = text.len_chars();
+    let mut i   = search_from;
+
+    //
+    // Skip whitespace and comments
+    //
+    loop {
+        while i < len && text.char(i).is_whitespace() { i += 1 }
+        if i >= len { return }
+
+        if i + 1 < len && text.char(i) == '/' && text.char(i + 1) == '/' {
+            while i < len && text.char(i) != '\n' { i += 1 }
+            continue;
+        }
+
+        if i + 1 < len && text.char(i) == '/' && text.char(i + 1) == '*' {
+            i += 2;
+            while i + 1 < len {
+                if text.char(i) == '*' && text.char(i + 1) == '/' { i += 2; break; }
+                i += 1;
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    let ch = text.char(i);
+
+    let new_anchor = if matches!(ch, '(' | '[' | '{') {
+        //
+        // Find matching close by counting depth
+        //
+        let open  = ch;
+        let close = match open { '(' => ')', '[' => ']', '{' => '}', _ => unreachable!() };
+        let mut depth = 0usize;
+        let mut j = i;
+        while j < len {
+            let c = text.char(j);
+            if c == open  { depth += 1; }
+            if c == close {
+                depth -= 1;
+                if depth == 0 { j += 1; break; }
+            }
+            j += 1;
+        }
+        j
+    } else {
+        //
+        // Bare token: everything that isn't whitespace or a delimiter
+        // semicolon is its own single-char token
+        //
+        let mut j = i;
+        if ch == ';' {
+            j + 1  // Step over it as one unit
+        } else {
+            while j < len {
+                let c = text.char(j);
+                if c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';') {
+                    break;
+                }
+                if c == '/' && j + 1 < len && matches!(text.char(j + 1), '/' | '*') {
+                    break;
+                }
+                j += 1;
+            }
+            j
+        }
+    };
+
+    if new_anchor == search_from { return }
+
+    view.cursor.anchor_char_index = Some(new_anchor);
+    view.cursor.preferred_col     = None;
+}
+
+fn selected_line_range(view: &View, buf: &Buffer) -> (usize, usize) {
+    let cursor_line = buf.text.char_to_line(view.cursor.char_index);
+    let Some(anchor) = view.cursor.anchor_char_index else {
+        return (cursor_line, cursor_line);
+    };
+
+    let anchor_line = buf.text.char_to_line(anchor);
+    let first = cursor_line.min(anchor_line);
+    let mut last  = cursor_line.max(anchor_line);
+
+    //
+    // If the later of cursor/anchor is at column 0, it's not really selected
+    //
+    let last_char = if cursor_line > anchor_line {
+        view.cursor.char_index
+    } else {
+        anchor
+    };
+    let last_line_start = buf.text.line_to_char(last);
+    if last_char == last_line_start && last > first {
+        last -= 1;
+    }
+
+    (first, last)
+}
+
+#[command]
+pub fn move_line_up(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let (first, last) = selected_line_range(view, buf);
+    buf.move_lines(&mut view.cursor, first, last, true);
+}
+
+#[command]
+pub fn move_line_down(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let (first, last) = selected_line_range(view, buf);
+    buf.move_lines(&mut view.cursor, first, last, false);
+}
+
+#[command]
 pub fn delete_word_forward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
@@ -2070,6 +2196,9 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     *cx.command_table = CommandTable::from_commands(loaded.commands);
     *cx.keymap = Keymap::default_keymap(&mut cx.command_table);
 
+    cx.keymap.bind(KeyCombo::alt('i'), cx.command_table.intern("mark_sexp"));              // nocheckin
+    cx.keymap.bind(KeyCombo::alt('p'), cx.command_table.intern("move_line_up"));              // nocheckin
+    cx.keymap.bind(KeyCombo::alt('n'), cx.command_table.intern("move_line_down"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));          // nocheckin
     cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));     // nocheckin
