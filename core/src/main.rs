@@ -364,7 +364,7 @@ impl App {
                 let line_h  = editor.line_h();
 
                 let old_scroll = editor.views[view_id].scroll;
-                let new_scroll = (old_scroll - dy * 4.55).max(0.0);
+                let new_scroll = (old_scroll - dy * 3.0).max(0.0); // @Tune
                 let max_scroll = editor.max_scroll_of(view_id);
                 editor.views[view_id].scroll = new_scroll.min(max_scroll);
 
