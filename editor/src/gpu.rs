@@ -594,6 +594,33 @@ pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
     draw_rect_impl(gpu.verts_mut(), inv_sw, inv_sh, x, y, w, h, color);
 }
 
+#[inline]
+pub fn draw_rect_gradient_h(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color_left: Color, color_right: Color) {
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let cl: GpuColor = color_left.into();
+    let cr: GpuColor = color_right.into();
+
+    let x0 = x * inv_sw * 2.0 - 1.0;
+    let y0 = 1.0 - y * inv_sh * 2.0;
+    let x1 = (x + w) * inv_sw * 2.0 - 1.0;
+    let y1 = 1.0 - (y + h) * inv_sh * 2.0;
+
+    let verts = gpu.verts_mut();
+    verts.reserve(6);
+    let base = verts.len();
+    unsafe {
+        let p = verts.as_mut_ptr().add(base);
+        p.add(0).write(Vert { pos: [x0, y0], uv: [0.0, 0.0], color: cl }); // top-left
+        p.add(1).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color: cr }); // top-right
+        p.add(2).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color: cl }); // bottom-left
+        p.add(3).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color: cr }); // top-right
+        p.add(4).write(Vert { pos: [x1, y1], uv: [0.0, 0.0], color: cr }); // bottom-right
+        p.add(5).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color: cl }); // bottom-left
+        verts.set_len(base + 6);
+    }
+}
+
 #[inline(always)]
 pub fn measure_text(gpu: &mut Gpu, s: &str, font_size: f32) -> f32 {
     s.chars().map(|c| {

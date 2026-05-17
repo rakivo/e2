@@ -10,6 +10,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod lsp;
 
+use editor::ui::{Axis, BoxCustom, BoxRef, ListerItemInfo, Size};
 use lsp::*;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -26,13 +27,14 @@ use memmap2::MmapOptions;
 
 use std::borrow::Cow;
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::fmt::Write;
 
-use smallvec::smallvec;
+use smallvec::{SmallVec, smallvec};
 use smallstr::SmallString;
 use winit::event::KeyEvent;
 use cranelift_entity::EntityRef;
@@ -811,44 +813,16 @@ pub fn write_buffer_onto_disk(cx: &mut CommandContext) {
     _ = editor_write_buffer_onto_disk(cx.editor, buffer_id);
 }
 
-pub fn lister_item_list_from_command_table(cx: &CommandContext) -> Vec<ListerItem> {
-    cx.command_table.iter().enumerate().map(|(index, (atom, _cmd))| {
-        ListerItem {
-            data: index as u64,
-            label: cx.command_table.resolve(*atom).into(),
-            sublabel: "".into(),
-        }
-    }).collect()
-}
-
-pub fn lister_item_list_from_buffer_list(cx: &CommandContext) -> Vec<ListerItem> {
-    cx.editor.most_recently_used_buffers.iter().filter_map(|&buffer_id| {
-        // Skip internal buffers
-        if buffer_id == cx.editor.lister().query_buffer { return None; }
-
-        let buffer = &cx.editor.buffers[buffer_id];
-        let label: SmallString<_> = buffer.path.as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("[scratch]")
-            .into();
-
-        let sublabel: SmallString<_> = buffer.path.as_ref()
-            .and_then(|p| p.to_str())
-            .unwrap_or("")
-            .into();
-
-        Some(ListerItem {
-            data: buffer_id.index() as u64,
-            label,
-            sublabel,
-        })
-    }).collect()
-}
-
 #[command]
 pub fn open_command_lister(cx: &mut CommandContext) {
-    let items = lister_item_list_from_command_table(cx);
+    let items = cx.command_table.iter().enumerate().map(|(index, (atom, _cmd))| {
+        ListerItemRef {
+            data: index as u64,
+            label: cx.command_table.resolve(*atom),
+            sublabel: "",
+            match_positions: Default::default()
+        }
+    });
     let lister = cx.editor.lister_mut();
     lister.is_query_dirty = true;
     lister.rebuild_filtered();
@@ -926,7 +900,29 @@ pub fn delete_selection_and_copy(cx: &mut CommandContext) {
 pub fn switch_buffer(cx: &mut CommandContext) { // @Refactor: Rename switch_buffer -> open_buffer_lister
     cx.editor.lister_mut().set_selected_index_to_1_instead_of_0 = true;
 
-    let items = lister_item_list_from_buffer_list(cx);
+    let items = cx.editor.most_recently_used_buffers.iter().filter_map(|&buffer_id| {
+        // Skip internal buffers
+        if buffer_id == cx.editor.lister().query_buffer { return None; }
+
+        let buffer = &cx.editor.buffers[buffer_id];
+        let label: SmallString<_> = buffer.path.as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("[scratch]")
+            .into();
+
+        let sublabel: SmallString<_> = buffer.path.as_ref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .into();
+
+        Some(ListerItem {
+            data: buffer_id.index() as u64,
+            label,
+            sublabel,
+            match_positions: Default::default()
+        })
+    }).collect::<Vec<_>>(); // @Memory
 
     editor_open_lister(cx.editor, items, |cx, item_data| {
         let buffer_id = BufferId::new(item_data as usize);
@@ -972,21 +968,22 @@ pub fn open_file(cx: &mut CommandContext) {
 }
 
 pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
-    let items = Vec::new();
+    let empty: [ListerItem; 0] = [];
     editor_open_lister_with_frame_callback(
         cx.editor,
 
-        items,
+        empty,
 
         // Called on select
         |cx, item_data| {
             let entry_kind: EntryKind = unsafe { core::mem::transmute(item_data as u8) };
 
-            let selected_item = &cx.editor.lister().items[cx.editor.lister().filtered[cx.editor.lister().selected_index as usize] as usize];
+            let index = cx.editor.lister().filtered[cx.editor.lister().selected_index as usize] as usize;
+            let selected_item = cx.editor.lister().items.get(index);
             let path = &selected_item.sublabel;
 
             if entry_kind == EntryKind::Dir {
-                let path: &Path = path.as_str().as_ref();
+                let path: &Path = path.as_ref();
                 if let Ok(canon) = path.canonicalize() {
                     cx.editor.canonicalized_current_working_directory = canon.into_os_string().into_string().unwrap().into();
                     open_file_impl(cx, cx.editor.canonicalized_current_working_directory.to_string()); // @Clone
@@ -995,7 +992,7 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
             }
 
             let view = cx.editor.active_view_id();
-            let path: &Path = path.as_str().as_ref();
+            let path: &Path = path.as_ref();
             let path = Box::from(path);
             open_buffer_from_path_in(cx.editor, view, path);
         },
@@ -1017,11 +1014,11 @@ pub fn open_file_impl(cx: &mut CommandContext, start_dir: String) {
                     lister.last_seen_cached_dir_generation = cached.entries.generation;
                     lister.items.clear();
                     for entry in cached.entries.iter() {
-                        lister.items.push(ListerItem {
-                            data:     entry.kind as u64,
-                            label:    entry.name.into(),
-                            sublabel: entry.path.into(),
-                        });
+                        lister.items.push(
+                            entry.name.into(),
+                            entry.path.into(),
+                            entry.kind as u64,
+                        );
                     }
                     lister.is_query_dirty = true;
                     lister.rebuild_filtered();
@@ -2156,11 +2153,12 @@ pub fn goto_definition(cx: &mut CommandContext) {
 
 #[command]
 pub fn cargo_build(cx: &mut CommandContext) { // nocheckin
-    let buffer = cx.editor.commander().command_buffer;
-    clear_buffer(cx.editor, buffer);
-
+    let commander = cx.editor.commander();
+    let commander_buffer = commander.command_buffer;
     let view_id = cx.editor.views.next_key();
-    cx.editor.views.push(View::new(view_id, buffer));
+    cx.editor.views.push(View::new(view_id, commander_buffer));
+
+    clear_buffer(cx.editor, commander_buffer);
 
     let root_id  = cx.editor.root_panel;
 
@@ -2174,14 +2172,15 @@ pub fn cargo_build(cx: &mut CommandContext) { // nocheckin
     }
 
     if let PanelKind::Split(split) = cx.editor.panel(root_id).kind {
-        let unfocused_id = if cx.editor.active_panel == split.left_id {
-            split.right_id
-        } else {
-            split.left_id
-        };
-
-        cx.editor.panel_mut(unfocused_id).kind = PanelKind::Leaf { view_id };
+        if cx.editor.active_view().buffer_id != commander_buffer {
+            cx.editor.panel_mut(split.right_id).kind = PanelKind::Leaf { view_id };
+        }
     }
+
+    let buf = &mut cx.editor.buffers[commander_buffer];
+    let end = buf.text.len_chars();
+    buf.text.insert(end, "[Running cargo build]\n\n");
+    buf.is_dirty = true;
 
     _ = cx.editor.commander().command_tx.send("cargo build".into());
 }
@@ -2300,34 +2299,10 @@ fn lister_create_fresh_buffers_views_panels(editor: &mut Editor) {
 }
 
 fn commander_create_fresh_buffers_views_panels(editor: &mut Editor) { // nocheckin
-    let commander_command_buffer = editor.buffers.push(Buffer::new());
-
-    let commander_command_view = editor.views.next_key();
-    editor.views.push(View::new(commander_command_view, commander_command_buffer));
-
-    let commander_command_panel = editor.panels.next_key();
-    editor.panels.push(Panel {
-        id:   commander_command_panel,
-        rect: Rect::default(),
-        rect_including_panel_bar: Rect::default(),
-        kind: PanelKind::Leaf { view_id: commander_command_view },
-    });
-    editor.views[commander_command_view].panel_id = commander_command_panel;
-
-    let commander_split_panel = editor.panels.next_key();
-    editor.panels.push(Panel {
-        id:   commander_split_panel,
-        rect: Rect::default(),
-        rect_including_panel_bar: Rect::default(),
-        kind: PanelKind::Leaf { view_id: commander_command_view },
-    });
+    let commander_command_buffer = editor.push_buffer(Buffer::new());
 
     let commander = editor.commander_mut();
     commander.command_buffer = commander_command_buffer;
-    commander.command_view   = commander_command_view;
-    commander.command_panel  = commander_command_panel;
-
-    editor.mru_register_new_buffer(commander_command_buffer);
 }
 
 fn find_panel_by_kind(editor: &Editor, root: PanelId, kind: &PanelKind) -> Option<PanelId> {
@@ -2417,11 +2392,11 @@ pub fn find_matching_paren(
 fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.layout_panels = Some(|editor, win_rect| {
         {
-            editor.layout_panel(editor.lister().query_panel, lister_rect(win_rect.w, win_rect.h, 1.0, editor.scale));
-            editor.layout_panel(editor.lister().query_split, lister_rect(win_rect.w, win_rect.h, 1.0, editor.scale));
+            let qp = editor.lister().query_panel;
+            let qs = editor.lister().query_split;
+            editor.layout_panel(qs, lister_rect(win_rect.w, win_rect.h, 1.0, 1.0, editor.scale));
+            editor.layout_panel(qp, lister_rect(win_rect.w, win_rect.h, 1.0, 1.0, editor.scale));
         }
-
-        editor.layout_panel(editor.commander().command_panel, win_rect);
     });
 
     cx.editor.hooks.layout_panel = Some(|editor, id, _rect| {
@@ -2454,54 +2429,44 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.animate = Some(|editor, dt, should_redraw| {
-        let epsilon = 0.5f32;  // Stop animating when close enough
-
         let lister = editor.custom_data.lister_mut();
 
         //
         // Lister smooth scrolling
         //
-        let ds = lister.scroll - lister.scroll_anim;
-        if ds.abs() > epsilon {
-            lister.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
+        if lister.tick(dt) {
             *should_redraw = should_redraw.or_msg("Lister scrolling animation", &mut editor.redraw_reasons);
-        } else {
-            lister.scroll_anim = lister.scroll;
         }
 
         //
         // Lister opening animation
         //
-        let target = if lister.is_open { 1.0_f32 } else { 0.0 };
-        let speed = if lister.open_anim > target { 55.0 } else { 25.0 }; // @Tune
-        let remaining = target - lister.open_anim;
-        if remaining.abs() < 0.08 {
-            lister.open_anim = target;
-        } else {
-            let step = (remaining * speed * dt).clamp(-0.15, 0.15);
-            lister.open_anim += step;
-            lister.open_anim = lister.open_anim.clamp(0.0, 1.0);
-        }
+        let target = if lister.is_open() { 1.0_f32 } else { 0.0 };
 
-        *should_redraw = should_redraw.or_if(lister.open_anim != target, "Lister opening animation", &mut editor.redraw_reasons);
+        _ = lister.panel.tick(dt);
+
+        *should_redraw = should_redraw.or_if(
+            lister.panel.anim != target,
+            "Lister opening animation",
+            &mut editor.redraw_reasons
+        );
+
+        *should_redraw = should_redraw.or_if(lister.panel.anim != target, "Lister opening animation", &mut editor.redraw_reasons);
     });
-
 
     cx.editor.hooks.left_mouse_clicked = Some(|cx| {
         if cx.editor.lister().is_open() {
             let (mx, my) = cx.editor.mouse_pos;
 
-            let lister_rect = lister_rect(cx.gpu.win_w, cx.gpu.win_h, cx.editor.lister().open_anim, cx.editor.scale);
+            let lister_rect = cx.editor.lister().lister_rect(cx.gpu.win_w, cx.gpu.win_h, cx.editor.scale);
             if !lister_rect.contains(mx, my) {
                 let lister = cx.editor.custom_data.lister_mut();
 
                 //
                 // Click outside lister closes it
                 //
-                lister.is_open = false;
-                lister.is_listing_file_entries = true;
 
-                let panel = lister.panel_before_opening_lister.pop().unwrap();
+                let panel = lister.close().unwrap();
                 cx.editor.set_active_panel(panel);
 
                 return (true, true);
@@ -2510,7 +2475,6 @@ fn setup_hooks(cx: &mut CommandContext) {
             let line_h   = cx.editor.line_h();
             let scale    = cx.editor.scale;
             let pad      = (8.0 * scale).round();
-            let item_h   = cx.editor.lister().item_h;
             let input_h  = (line_h + pad).round();
             let sep      = scale.max(1.0);
             let list_y   = lister_rect.y + input_h + sep;
@@ -2518,18 +2482,12 @@ fn setup_hooks(cx: &mut CommandContext) {
             let lister = cx.editor.custom_data.lister_mut();
 
             if my >= list_y {
-                let local_y = my - list_y + lister.scroll_anim;
-                let clicked = (local_y / item_h) as u32;
-                if clicked < lister.filtered.len() as u32 {
-                    //
-                    // Click outside lister closes it
-                    //
+                if let Some(index) = lister.frame_item_refs.iter().position(|&r| cx.editor.ui.was_clicked(r)) {
+                    let actual_index = lister.frame_item_refs_first + index as u32;
 
-                    lister.selected_index = clicked;
-                    lister.is_open = false;
-                    lister.is_listing_file_entries = true;
+                    lister.selected_index = actual_index as u32;
 
-                    let panel = cx.editor.lister_mut().panel_before_opening_lister.pop().unwrap();
+                    let panel = cx.editor.lister_mut().close().unwrap();
                     cx.editor.set_active_panel(panel);
                     cx.editor.reset_blink();
 
@@ -2568,10 +2526,8 @@ fn setup_hooks(cx: &mut CommandContext) {
         let is_selected = matches!(result, ListerKeyDispatch::Selected);
         match result {
             ListerKeyDispatch::Selected | ListerKeyDispatch::Close => {
-                lister.is_open = false;
-                lister.is_listing_file_entries = true;
+                let panel_before_opening_lister = lister.close().unwrap();
 
-                let panel_before_opening_lister = cx.editor.lister_mut().panel_before_opening_lister.pop().unwrap();
                 cx.editor.set_active_panel(panel_before_opening_lister);
 
                 if is_selected {
@@ -2627,7 +2583,7 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.collect_leaf_panels_init_stack = Some(|editor, _id, stack| {
-        if editor.lister().is_open {
+        if editor.lister().is_open() {
             stack.push(editor.lister().query_split);
         }
     });
@@ -2670,7 +2626,7 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.inside_about_to_wait_should_request_redraw = Some(|editor| {
         let mut redraw = ShouldRequestFrameRedraw::No;
 
-        if editor.lister().open_anim > 0.0 && !editor.lister().is_open {
+        if editor.lister().panel.is_visible() && !editor.lister().is_open() {
             redraw = redraw.or_msg("Lister opening animation", &mut editor.redraw_reasons);
         }
 
@@ -2696,7 +2652,8 @@ fn setup_hooks(cx: &mut CommandContext) {
             // Lister scroll takes priority if open and mouse is over it
             //
 
-            let lister_rect = lister_rect(editor.win_w, editor.win_h, editor.lister().open_anim, editor.scale);
+            let lister_rect = editor.lister().lister_rect(editor.win_w, editor.win_h, editor.scale);
+
             let (mx, my) = editor.mouse_pos;
             if lister_rect.contains(mx, my) {
                 let line_h  = editor.line_h();
@@ -2708,29 +2665,18 @@ fn setup_hooks(cx: &mut CommandContext) {
 
                 let lister = editor.custom_data.lister_mut();
 
-                let max_scroll = (
-                    lister.filtered.len() as f32 * lister.item_h
-                        + lister.item_h * 2.0 - lister.list_h
-                ).max(0.0);
-
-                lister.scroll = (lister.scroll - dy * 2.0).clamp(0.0, max_scroll);
+                lister.scroll_by(dy * 2.0);
 
                 //
                 // Update hovered index for new scroll position
                 //
                 if my >= list_y {
                     let local_y = my - list_y + lister.scroll_anim;
-                    let hovered = (local_y / lister.item_h) as usize;
                     let hovered_index_before = lister.hovered_index;
-                    lister.hovered_index = if hovered < lister.filtered.len() {
-                        if hovered_index_before != Some(hovered as u32) {
-                            editor.audioer.play_lister_item_hover_sound();
-                        }
-
-                        Some(hovered as u32)
-                    } else {
-                        None
-                    };
+                    lister.hovered_index = lister.hovered_index(local_y);
+                    if lister.hovered_index.map_or(false, |after| Some(after) != hovered_index_before) {
+                        editor.audioer.play_lister_item_hover_sound();
+                    }
                 }
 
                 return (true, true);
@@ -2746,12 +2692,11 @@ fn setup_hooks(cx: &mut CommandContext) {
         if editor.lister().is_open() {
             // @Cutnpaste from above
 
-            let lister_rect = lister_rect(editor.win_w, editor.win_h, editor.lister().open_anim, editor.scale);
+            let lister_rect = editor.lister().lister_rect(editor.win_w, editor.win_h, editor.scale);
             let (mx, my) = editor.mouse_pos;
             let line_h  = editor.line_h();
             let scale   = editor.scale;
             let pad     = (8.0 * scale).round();
-            let item_h  = editor.lister().item_h;
             let input_h = (line_h + pad).round();
             let sep     = scale.max(1.0);
             let list_y  = lister_rect.y + input_h + sep;
@@ -2760,17 +2705,11 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             if lister_rect.contains(mx, my) && my >= list_y {
                 let local_y = my - list_y + lister.scroll_anim;
-                let hovered = (local_y / item_h) as usize;
                 let hovered_index_before = lister.hovered_index;
-                lister.hovered_index = if hovered < lister.filtered.len() {
-                    if hovered_index_before != Some(hovered as u32) {
-                        editor.audioer.play_lister_item_hover_sound();
-                    }
-
-                    Some(hovered as u32)
-                } else {
-                    None
-                };
+                lister.hovered_index = lister.hovered_index(local_y);
+                if lister.hovered_index.map_or(false, |after| Some(after) != hovered_index_before) {
+                    editor.audioer.play_lister_item_hover_sound();
+                }
             } else {
                 lister.hovered_index = None;
             }
@@ -2787,7 +2726,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         let lister = editor.custom_data.lister();
 
         redraw = redraw.or_if(lister.is_open() != lister.last_is_lister_open, "Lister opening animation", &mut editor.redraw_reasons);
-        redraw = redraw.or_if(lister.open_anim > 0.0 && !lister.is_open, "Lister opening animation", &mut editor.redraw_reasons);
+        redraw = redraw.or_if(lister.panel.is_visible() && !lister.is_open(), "Lister opening animation", &mut editor.redraw_reasons);
 
         {
             redraw |= peek_pending_lsp_goto(editor);
@@ -2868,9 +2807,9 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             let t1 = Instant::now();
             {
-                let lister = lister_rect(gpu.win_w, gpu.win_h, editor.lister().open_anim, editor.scale);
-                let t = 1.0 - (1.0 - editor.lister().open_anim).powi(4);  // Same easing as lister_rect
-                render_lister_background_frosted(gpu, lister, editor.scale, t);
+                let lister_rect = editor.lister().lister_rect(editor.win_w, editor.win_h, editor.scale);
+                let t = 1.0 - (1.0 - editor.lister().panel.anim).powi(3);  // Same easing as lister_rect
+                render_lister_background_frosted(gpu, lister_rect, editor.scale, t);
                 render_lister_background(gpu, editor);
             }
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
@@ -2892,7 +2831,21 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             let t1 = Instant::now();
             {
-                render_lister_foreground(gpu, editor);
+                build_lister_ui(gpu, editor);
+                let ui = &mut editor.ui;
+                ui.layout(|text, font_size| {
+                    let w = text.chars()
+                        .filter_map(|c| gpu::get_glyph(gpu, c, font_size))
+                        .map(|g| g.advance)
+                        .sum();
+                    [w, font_size]
+                });
+                ui.update_interaction(
+                    [editor.mouse_pos.0, editor.mouse_pos.1],
+                    editor.mouse_left_pressed,
+                );
+                ui.tick();
+                ui::render(ui, gpu);
             }
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
         }
@@ -3088,39 +3041,25 @@ fn setup_hooks(cx: &mut CommandContext) {
         }
     });
 
-    cx.editor.hooks.session_save_chunks.get_or_insert_default().push(|editor, view_index, _| {
+    cx.editor.hooks.session_save_chunks.get_or_insert_default().push(|editor, _view_index, buffer_index| {
         let commander = editor.commander();
         let mut data = Vec::with_capacity(8);
-        if let Some(&vi) = view_index.get(&commander.command_view) {
-            write_u32(&mut data, vi);
+        if let Some(&bi) = buffer_index.get(&commander.command_buffer) {
+            write_u32(&mut data, bi);
             Some((COMMANDER_CUSTOM_CHUNK_ID, data))
         } else {
             None
         }
     });
 
-    cx.editor.hooks.session_restore_chunks.get_or_insert_default().push(|editor, chunk_id, data, view_ids, _| {
+    cx.editor.hooks.session_restore_chunks.get_or_insert_default().push(|editor, chunk_id, data, _view_ids, buf_ids| {
         if chunk_id != COMMANDER_CUSTOM_CHUNK_ID { return; }
 
         let mut r = Reader::new(data);
-        if let Some(vi) = r.u32() {
-            if let Some(&real_view_id) = view_ids.get(vi as usize) {
+        if let Some(bi) = r.u32() {
+            if let Some(&real_buffer_id) = buf_ids.get(bi as usize) {
                 let commander = editor.custom_data.commander_mut();
-                commander.command_view   = real_view_id;
-                commander.command_buffer = editor.views[real_view_id].buffer_id;
-                commander.command_panel = if let Some(existing) = editor.views[commander.command_view].panel_id() {
-                    existing
-                } else {
-                    let panel_id = editor.panels.next_key();
-                    editor.panels.push(Panel {
-                        id:   panel_id,
-                        rect: Rect::default(),
-                        rect_including_panel_bar: Rect::default(),
-                        kind: PanelKind::Leaf { view_id: commander.command_view },
-                    });
-                    editor.views[commander.command_view].panel_id = panel_id;
-                    panel_id
-                };
+                commander.command_buffer = real_buffer_id;
             }
         }
     });
@@ -3149,13 +3088,12 @@ pub fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
 
     let index = lister.selected_index;
     let Some(index) = lister.filtered.get(index as usize) else { return };
-    let item_data = lister.items[*index as usize].data;
+    let item_data = lister.items.get(*index as usize).data;
 
     let Some(on_confirm) = lister.on_confirm.pop()        else { return };
 
     lister.pending_datas.push(item_data);
     _ = lister.items_update_frame_update_callback.pop();
-    lister.set_selected_index_to_1_instead_of_0 = false;
 
     on_confirm(cx, item_data);
 }
@@ -3166,8 +3104,7 @@ pub fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32,
     let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
 
     // Base dark fill
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
-        Color::rgba(12, 9, 4, a(200)));
+    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h, palette().lister_bg);
 
     // Warm tint layer
     gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
@@ -3194,7 +3131,7 @@ pub fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32,
 pub fn render_lister_background(gpu: &mut Gpu, editor: &Editor) {
     if editor.active_panel != editor.lister().query_split { return; }
 
-    if !editor.lister().renderer_is_open() { return; }
+    if !editor.lister().is_visible() { return; }
 
     // Dim the whole screen
     gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
@@ -3204,161 +3141,164 @@ const fn lister_smaller_font_size(scaled_font_size: f32) -> f32 {
     scaled_font_size * 0.80
 }
 
-pub fn render_lister_foreground(gpu: &mut Gpu, editor: &mut Editor) {
-    debug_assert_eq!(
-        gpu.clip_depth, 0,
-        "render_lister_foreground entered with unbalanced clip depth {}, expected 0",
-        gpu.clip_depth
-    );
-
+pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
     let scale     = editor.scale;
     let font_size = editor.font_size();
     let line_h    = editor.line_h();
-
-    let smaller_font_size = lister_smaller_font_size(font_size);
+    let is_mouse_cursor_hidden = editor.is_cursor_visible;
 
     let lister = editor.custom_data.lister_mut();
+    if !lister.is_visible() { return; }
 
-    if !lister.renderer_is_open() { return; }
+    let open_anim = lister.panel.anim;
+    let a = |c: Color| -> Color {
+        Color::rgba(c.r, c.g, c.b, ((c.a as f32) * open_anim) as u8)
+    };
+    let smaller_font_size = lister_smaller_font_size(font_size);
 
-    let open_anim = lister.open_anim;
-    let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
-
-    let lister_rect = lister_rect(gpu.win_w, gpu.win_h, lister.open_anim, editor.scale);
-    let Rect { x: px, y: py, w: pw, h: ph } = lister_rect;
+    let Rect { x: px, y: py, w: pw, h: ph } = lister.lister_rect(gpu.win_w, gpu.win_h, editor.scale);
 
     let pad     = (8.0 * scale).round();
     let item_h  = (line_h + pad).round();
-    let input_h = (line_h + pad).round();
     let sep     = scale.max(1.0);
-    let list_y  = py + input_h + sep;
+    let input_h = (line_h + pad).round();
     let list_h  = ph - input_h - sep;
 
-    let is_mouse_cursor_hidden = editor.is_cursor_visible;
+    let total_items = lister.filtered.len();
+    let first       = lister.first();
+    let visible     = lister.visible();
+
+    lister.frame_item_refs.clear();
+    lister.frame_item_refs_first = first as u32;
 
     lister.item_h = item_h;
     lister.list_h = list_h;
 
-    // Outer border
-    gpu::draw_rect_outline(gpu, px, py, pw, ph, sep,
-                           Color::rgba(180, 140, 80, a(200)));
+    let ui = &mut editor.ui;
 
-    // Inner border
-    gpu::draw_rect_outline(gpu, px + sep, py + sep, pw - sep*2.0, ph - sep*2.0, sep,
-                           Color::rgba(80, 60, 30, a(80)));
-
-    // Separator
-    gpu::draw_rect(gpu, px, py + input_h, pw, sep,
-                   Color::rgba(180, 140, 80, a(160)));
-
-    // Item count
-    lister.scratch_str.clear();
-    _ = write!(&mut lister.scratch_str, "{} results", lister.filtered.len());
-    let count_w = gpu::measure_text(gpu, &lister.scratch_str, smaller_font_size);
-    gpu::draw_text(gpu, &lister.scratch_str,
-                   px + pw - pad - count_w,
-                   py + input_h * 0.44 + line_h * 0.35,
-                   smaller_font_size,
-                   Color::rgba(160, 120, 60, a(150)));
-
-    // Items
-    let first   = (lister.scroll_anim / item_h) as usize;
-    let visible = (list_h / item_h) as usize + 2;
-    let frac    = lister.scroll_anim % item_h;
-
-    gpu::push_clip(gpu, px, list_y, pw, list_h);
-
-    for slot in 0..visible {
-        let index      = first + slot;
-        let Some(&item_index) = lister.filtered.get(index)            else { break };
-        let Some(item)        = lister.items.get(item_index as usize) else { break };
-
-        let iy       = list_y + slot as f32 * item_h - frac;
-
-        let is_selected = index == lister.selected_index as usize;
-        let is_hovered  = lister.hovered_index == Some(index as u32);
-
-        if iy > list_y + list_h { break; }
-
-        // Alternating row tint  very subtle, just enough to separate rows
-        if index % 2 == 0 {
-            gpu::draw_rect(gpu, px, iy, pw, item_h, Color::rgba(255, 200, 100, a(8)));
-        }
-
-        if is_mouse_cursor_hidden && is_hovered && !is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(60, 45, 15, a(120)));
-        }
-
-        if is_selected {
-            gpu::draw_rect(gpu, px + sep*2.0, iy, pw - sep*4.0, item_h, Color::rgba(80, 55, 20, a(180)));
-            gpu::draw_rect(gpu, px + sep, iy, sep * 3.0, item_h, Color::rgba(195, 169, 131, a(255)));
-            gpu::draw_rect(gpu, px, iy, pw, sep, Color::rgba(180, 140, 80, a(60)));
-            gpu::draw_rect(gpu, px, iy + item_h - sep, pw, sep, Color::rgba(180, 140, 80, a(60)));
-        }
-
-        let label_x = px + pad + sep * 5.0;
-        let label_y = iy + item_h * 0.5 + line_h * 0.35;
-
-        gpu::draw_text(
-            gpu, &item.label, label_x, label_y, font_size,
-            if is_selected { Color::rgba(240, 208, 144, a(255)) } else { Color::rgba(200, 190, 165, a(220)) }
-        );
-
-        if !item.sublabel.is_empty() {
-            let sub_w = gpu::measure_text(gpu, &item.sublabel, smaller_font_size);
-
-            gpu::draw_text(
-                gpu, &item.sublabel,
-                px + pw - pad - sub_w,
-                label_y,
-                smaller_font_size,
-                if is_selected { Color::rgba(180, 140, 80, a(200)) }
-                else           { Color::rgba(120, 100, 60, a(120)) }
-            );
-        }
-    }
-
-    gpu::pop_clip(gpu);
+    let p = palette();
 
     //
-    // Scrollbar
+    // Full-window root, column layout
+    // Push a floating container sized and positioned to the lister rect
     //
-    let total_items = lister.filtered.len();
-    if total_items > 0 {
-        let total_h = total_items as f32 * item_h + item_h;
-        let bar_h    = (list_h * (list_h / total_h).min(1.0)).max(sep * 4.0);
-        let bar_frac = (lister.scroll_anim / (total_h - list_h).max(1.0)).clamp(0.0, 1.0);
-        let bar_y    = list_y + bar_frac * (list_h - bar_h);
+    ui.col("lister##root")
+        .size(Size::px(pw), Size::px(ph))
+        .floating(px, py)
+        .build_children(|ui| {
+            // ---- Header row: item count ----
+            ui.row("lister##header")
+                .size(Size::fill(), Size::px(input_h))
+                .build_children(|ui| {
+                    // spacer pushes count to the right
+                    ui.spacer_fill("lister##header_gap", Axis::X);
 
-        // Scrollbar track - very faint
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, Color::rgba(255, 200, 100, a(15)));
+                    let mut scratch = SmallString::<[u8; 64]>::new();
+                    _ = write!(&mut scratch, "{} results", total_items);
+                    ui.label("lister##count")
+                        .size(Size::text(), Size::fill())
+                        .padding(pad)
+                        .text(&*scratch)
+                        .font_size(smaller_font_size)
+                        .color(a(p.lister_item_text_dim))
+                        .build();
+                });
 
-        // Scrollbar thumb
-        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, bar_y, sep*3.0, bar_h, Color::rgba(180, 140, 80, a(140)));
-    }
+            // ---- Separator ----
+            ui.spacer("lister##sep", Axis::Y, sep);
+
+            // ---- Scrollable list ----
+            ui.col("lister##list")
+                .size(Size::fill(), Size::fill())
+                .clip()
+                .build_children(|ui| {
+                    for slot in 0..visible {
+                        let index = first + slot;
+                        let Some(&item_index) = lister.filtered.get(index) else { break };
+                        let Some(item)        = lister.items.try_get(item_index as usize) else { break };
+
+                        let iy = lister.item_y(slot);
+
+                        let is_selected = index == lister.selected_index as usize;
+                        let is_hovered  = is_mouse_cursor_hidden && lister.hovered_index == Some(index as u32);
+
+                        let row = ui.label(&format!("lister##item_{index}"))
+                            .size(Size::fill(), Size::px(item_h))
+                            .floating(0.0, iy)
+                            .padding_left(pad + sep * 5.0)
+                            .text(&*item.label)
+                            .font_size(font_size)
+                            .color(if is_selected {
+                                a(Color::rgba(240, 208, 144, 255))
+                            } else {
+                                a(Color::rgba(200, 190, 165, 220))
+                            }).build();
+
+                        let label_x = pad + sep * 5.0;
+                        let mut highlight_rects: Vec<(f32, f32)> = Default::default();  // @Memory @Speed
+                        if !item.match_positions.is_empty() {
+                            let mut x_cursor = 0.0f32;
+                            for (byte_pos, ch) in item.label.char_indices() {
+                                let char_w = gpu::get_glyph_no_upload(gpu, ch, font_size)
+                                    .map(|g| g.advance)
+                                    .unwrap_or(font_size * 0.6);
+
+                                if item.match_positions.contains(&(byte_pos as u32)) {
+                                    //
+                                    // Merge with previous rect if adjacent
+                                    //
+                                    if let Some(last) = highlight_rects.last_mut() {
+                                        if (last.0 + last.1 - x_cursor).abs() < 1.0 {
+                                            last.1 += char_w;
+                                        } else {
+                                            highlight_rects.push((x_cursor, char_w));
+                                        }
+                                    } else {
+                                        highlight_rects.push((x_cursor, char_w));
+                                    }
+                                }
+
+                                x_cursor += char_w;
+                            }
+                        }
+
+                        lister.frame_item_refs.push(row);
+
+                        ui.boxes[row].custom = BoxCustom::ListerItem(ListerItemInfo {
+                            is_selected,
+                            is_hovered,
+                            index,
+                            sublabel:           item.sublabel.into(),
+                            sublabel_font_size: smaller_font_size,
+                            open_anim,
+                            highlight_rects: highlight_rects.into_boxed_slice(),
+                            label_x,
+                            font_size,
+                        });
+                    }
+
+                    let below = total_items.saturating_sub(first + visible);
+                    if below > 0 {
+                        ui.spacer("lister##bottom", Axis::Y, below as f32 * item_h);
+                    }
+                });
+        });
 }
 
-pub fn lister_rect(win_w: f32, win_h: f32, open_anim: f32, scale: f32) -> Rect {
-    let t = 1.0 - (1.0 - open_anim).powi(4);
+pub fn lister_rect(win_w: f32, win_h: f32, anim_w: f32, anim_h: f32, scale: f32) -> Rect {
+    let tw = 1.0 - (1.0 - anim_w).powi(3);
+    let th = 1.0 - (1.0 - anim_h).powi(3);
 
-    let panel_w = (win_w * 0.45).clamp(320.0, 720.0);
-    let panel_h = (win_h * 0.65).clamp(200.0, 600.0);
+    let panel_w = (win_w * 0.60 * scale).clamp(400.0 * scale, win_w * 0.85);
+    let panel_h = (win_h * 0.60).clamp(240.0 * scale, win_h * 0.80);
 
     let cx = win_w * 0.50;
-    let cy = (win_h - panel_h) * 0.40 + panel_h * 0.50;
+    let cy = win_h * 0.48;
 
-    let min_w = 60.0 * scale;
-    let min_h = 40.0 * scale;
+    let w = (panel_w * tw).max(40.0 * scale);
+    let h = (panel_h * th).max(20.0 * scale);
 
-    let w = (panel_w * t).max(min_w);
-    let h = (panel_h * t).max(min_h);
-
-    Rect {
-        x: cx - w * 0.5,
-        y: cy - h * 0.5,
-        w,
-        h,
-    }
+    Rect { x: cx - w * 0.5, y: cy - h * 0.5, w, h }
 }
 
 #[inline]
@@ -3367,24 +3307,36 @@ pub fn editor_is_lister_buffer_dirty(editor: &Editor) -> bool {
 }
 
 #[inline]
-pub fn editor_open_lister(editor: &mut Editor, items: Vec<ListerItem>, on_confirm: ListerSelectFn) {
+pub fn editor_open_lister<I>(editor: &mut Editor, items: I, on_confirm: ListerSelectFn)
+where
+    I: IntoIterator,
+    ListerItems: Extend<I::Item>,
+{
     editor_open_lister_impl(editor, items, on_confirm, None)
 }
 
 #[inline]
-pub fn editor_open_lister_with_frame_callback(editor: &mut Editor, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: ListerFrameUpdateCallback) {
+pub fn editor_open_lister_with_frame_callback<I>(editor: &mut Editor, items: I, on_confirm: ListerSelectFn, frame_callback: ListerFrameUpdateCallback)
+where
+    I: IntoIterator,
+    ListerItems: Extend<I::Item>,
+{
     editor_open_lister_impl(editor, items, on_confirm, Some(frame_callback))
 }
 
 #[inline]
-pub fn editor_open_lister_impl(editor: &mut Editor, items: Vec<ListerItem>, on_confirm: ListerSelectFn, frame_callback: Option<ListerFrameUpdateCallback>) {
+pub fn editor_open_lister_impl<I>(editor: &mut Editor, items: I, on_confirm: ListerSelectFn, frame_callback: Option<ListerFrameUpdateCallback>)
+where
+    I: IntoIterator,
+    ListerItems: Extend<I::Item>,
+{
     clear_buffer(editor, editor.lister().query_buffer);
 
     editor.set_active_panel(editor.lister().query_split);
 
     let lister = editor.custom_data.lister_mut();
 
-    if lister.is_open {
+    if lister.is_open() {
         _ = lister.panel_before_opening_lister.pop();
     }
 
@@ -3397,14 +3349,133 @@ pub fn editor_open_lister_impl(editor: &mut Editor, items: Vec<ListerItem>, on_c
     editor.canonicalized_last_scanned_directory = SmallString::new();
     lister.scroll          = 0.0;
     lister.scroll_anim     = 0.0;
-    lister.is_open         = true;
-    lister.items           = items;
+    lister.panel.is_open   = true;
+    lister.items.clear();
+    lister.items.extend(items);
     lister.rebuild_filtered();
     lister.selected_index  = if lister.set_selected_index_to_1_instead_of_0 {
         (lister.filtered.len() > 1) as u32
     } else {
         0
     };
+}
+
+#[derive(Default)]
+pub struct PanelAnim {
+    pub is_open:   bool,
+    pub anim:      f32,
+    pub anim_w:    f32,
+    pub anim_h:    f32,
+    pub open_speed:  f32,
+    pub close_speed: f32,
+}
+
+impl PanelAnim {
+    pub fn tick(&mut self, dt: f32) -> bool {
+        let target = if self.is_open { 1.0 } else { 0.0 };
+        let speed  = if self.anim > target { self.close_speed } else { self.open_speed };
+        let remaining = target - self.anim;
+
+        if remaining.abs() < 0.005 {
+            self.anim   = target;
+            self.anim_w = target;
+            self.anim_h = target;
+            return false;
+        }
+
+        self.anim   += remaining * speed * dt;
+        self.anim_w += (self.anim   - self.anim_w) * (speed * 1.4 * dt).min(1.0);
+        self.anim_h += (self.anim   - self.anim_h) * (speed * 0.7 * dt).min(1.0);
+
+        for v in [&mut self.anim, &mut self.anim_w, &mut self.anim_h] {
+            *v = v.clamp(0.0, 1.0);
+        }
+        true
+    }
+
+    pub fn is_visible(&self) -> bool { self.anim > 0.0 }
+    pub fn alpha(&self, base: u8) -> u8 { ((base as f32) * self.anim) as u8 }
+    pub fn t_w(&self) -> f32 { 1.0 - (1.0 - self.anim_w).powi(3) }
+    pub fn t_h(&self) -> f32 { 1.0 - (1.0 - self.anim_h).powi(3) }
+}
+
+#[derive(Default)]
+pub struct VirtualList {
+    pub scroll:      f32,  // target
+    pub scroll_anim: f32,  // visual
+    pub item_h:      f32,
+    pub list_h:      f32,
+}
+
+impl VirtualList {
+    pub fn first(&self)   -> usize { (self.scroll_anim / self.item_h) as usize }
+    pub fn frac(&self)    -> f32   { self.scroll_anim % self.item_h }
+    pub fn visible(&self) -> usize { (self.list_h / self.item_h) as usize + 2 }
+
+    pub fn max_scroll(&self, item_count: u32) -> f32 {
+        (item_count as f32 * self.item_h + self.item_h * 2.0 - self.list_h).max(0.0)
+    }
+
+    pub fn scroll_by(&mut self, dy: f32, item_count: u32) {
+        self.scroll = (self.scroll - dy).clamp(0.0, self.max_scroll(item_count));
+    }
+
+    pub fn scroll_to_index(&mut self, index: u32, item_count: u32) {
+        let item_top = index as f32 * self.item_h;
+        let item_bot = item_top + self.item_h;
+        if item_top < self.scroll {
+            self.scroll = item_top;
+        } else if item_bot > self.scroll + self.list_h {
+            self.scroll = item_bot - self.list_h;
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll(item_count));
+    }
+
+    pub fn hovered_index(&self, local_y: f32, item_count: u32) -> Option<u32> {
+        let idx = ((local_y + self.scroll_anim) / self.item_h) as u32;
+        if idx < item_count { Some(idx) } else { None }
+    }
+
+    pub fn tick(&mut self, dt: f32) -> bool {
+        let ds = self.scroll - self.scroll_anim;
+        if ds.abs() > 0.5 {
+            self.scroll_anim += ds * (1.0 - (-SCROLL_ANIM_RATE * dt).exp());
+            true
+        } else {
+            self.scroll_anim = self.scroll;
+            false
+        }
+    }
+
+    pub fn item_y(&self, slot: usize) -> f32 {
+        slot as f32 * self.item_h - self.frac()
+    }
+}
+
+impl Lister {
+    pub fn item_count(&self) -> u32 {
+        self.filtered.len() as u32
+    }
+
+    pub fn max_scroll(&self) -> f32 {
+        self.vlist.max_scroll(self.item_count())
+    }
+
+    pub fn scroll_by(&mut self, dy: f32) {
+        self.vlist.scroll_by(dy, self.item_count());
+    }
+
+    pub fn scroll_to_index(&mut self, index: u32) {
+        self.vlist.scroll_to_index(index, self.item_count());
+    }
+
+    pub fn hovered_index(&self, local_y: f32) -> Option<u32> {
+        self.vlist.hovered_index(local_y, self.item_count())
+    }
+
+    pub fn scroll_to_selected(&mut self) {
+        self.scroll_to_index(self.selected_index);
+    }
 }
 
 pub enum ListerKeyDispatch {
@@ -3419,16 +3490,318 @@ pub struct ListerItem {
     pub label:    SmallString<[u8; 32]>,
     pub sublabel: SmallString<[u8; 64]>,
     pub data:     u64,
+    pub match_positions: SmallVec<[u32; 16]>,
 }
 
 pub type ListerFrameUpdateCallback = fn(&mut CommandContext) -> ShouldRequestFrameRedraw;
 pub type ListerSelectFn = fn(&mut CommandContext, u64);
 
-#[derive(Clone)]
+#[derive(Default)]
+pub struct ListerItems {
+    pub blob: String,
+
+    pub label_start:     Vec<u32>,
+    pub label_len:       Vec<u16>,
+    pub sublabel_start:  Vec<u32>,
+    pub sublabel_len:    Vec<u16>,
+    pub data:            Vec<u64>,
+
+    pub match_pos_data:  Vec<u32>,
+    pub match_pos_start: Vec<u32>,
+    pub match_pos_len:   Vec<u16>,
+}
+
+pub struct ListerItemRef<'a> {
+    pub label: &'a str,
+    pub sublabel: &'a str,
+    pub data: u64,
+    pub match_positions: &'a [u32],
+}
+
+pub struct ListerItemMut<'a> {
+    pub label: &'a str,
+    pub sublabel: &'a str,
+    pub data: &'a mut u64,
+    pub match_positions: &'a mut [u32],
+}
+
+pub struct ListerItemsIter<'a> {
+    items: &'a ListerItems,
+    index: usize,
+}
+
+impl<'a> Iterator for ListerItemsIter<'a> {
+    type Item = ListerItemRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.items.try_get(self.index)?;
+        self.index += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.items.len() - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ListerItemsIter<'_> {}
+
+impl<'a> IntoIterator for &'a ListerItems {
+    type Item = ListerItemRef<'a>;
+    type IntoIter = ListerItemsIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct ListerItemsIterMut<'a> {
+    strings: &'a str,
+
+    label_start: &'a [u32],
+    label_len: &'a [u16],
+
+    sublabel_start: &'a [u32],
+    sublabel_len: &'a [u16],
+
+    data: std::slice::IterMut<'a, u64>,
+
+    match_pos_data: *mut u32,
+    match_pos_start: &'a [u32],
+    match_pos_len: &'a [u16],
+
+    index: usize,
+}
+
+impl<'a> Iterator for ListerItemsIterMut<'a> {
+    type Item = ListerItemMut<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.index;
+
+        let data = self.data.next()?;
+
+        let label_start = self.label_start[i] as usize;
+        let label_len   = self.label_len[i] as usize;
+
+        let sub_start = self.sublabel_start[i] as usize;
+        let sub_len   = self.sublabel_len[i] as usize;
+
+        let match_start = self.match_pos_start[i] as usize;
+        let match_len   = self.match_pos_len[i] as usize;
+
+        self.index += 1;
+
+        let match_positions = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.match_pos_data.add(match_start),
+                match_len,
+            )
+        };
+
+        Some(ListerItemMut {
+            label: &self.strings[label_start..label_start + label_len],
+            sublabel: &self.strings[sub_start..sub_start + sub_len],
+            data,
+            match_positions,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.label_start.len() - self.index;
+        (rem, Some(rem))
+    }
+}
+
+impl ExactSizeIterator for ListerItemsIterMut<'_> {}
+
+impl<'a> IntoIterator for &'a mut ListerItems {
+    type Item = ListerItemMut<'a>;
+    type IntoIter = ListerItemsIterMut<'a>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<'a> Extend<ListerItemRef<'a>> for ListerItems {
+    fn extend<T: IntoIterator<Item = ListerItemRef<'a>>>(&mut self, iter: T) {
+        for item in iter {
+            let i = self.push(item.label, item.sublabel, item.data);
+            self.set_match_positions(i, item.match_positions);
+        }
+    }
+}
+
+impl<'a> Extend<ListerItem> for ListerItems {
+    fn extend<T: IntoIterator<Item = ListerItem>>(&mut self, iter: T) {
+        for item in iter {
+            let i = self.push(&item.label, &item.sublabel, item.data);
+            self.set_match_positions(i, &item.match_positions);
+        }
+    }
+}
+
+impl Extend<(String, String, u64, Vec<u32>)> for ListerItems {
+    fn extend<T: IntoIterator<Item = (String, String, u64, Vec<u32>)>>(
+        &mut self,
+        iter: T,
+    ) {
+        for (label, sublabel, data, matches) in iter {
+            let i = self.push(&label, &sublabel, data);
+            self.set_match_positions(i, &matches);
+        }
+    }
+}
+
+impl<'a> Extend<(&'a str, &'a str, u64, &'a [u32])> for ListerItems {
+    fn extend<T: IntoIterator<Item = (&'a str, &'a str, u64, &'a [u32])>>(
+        &mut self,
+        iter: T,
+    ) {
+        for (label, sublabel, data, matches) in iter {
+            let i = self.push(label, sublabel, data);
+            self.set_match_positions(i, matches);
+        }
+    }
+}
+
+impl ListerItems {
+    #[inline]
+    pub fn iter(&self) -> ListerItemsIter<'_> {
+        ListerItemsIter {
+            items: self,
+            index: 0,
+        }
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> ListerItemsIterMut<'_> {
+        ListerItemsIterMut {
+            strings: &self.blob,
+
+            label_start: &self.label_start,
+            label_len: &self.label_len,
+
+            sublabel_start: &self.sublabel_start,
+            sublabel_len: &self.sublabel_len,
+
+            data: self.data.iter_mut(),
+
+            match_pos_data: self.match_pos_data.as_mut_ptr(),
+            match_pos_start: &self.match_pos_start,
+            match_pos_len: &self.match_pos_len,
+
+            index: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize { self.data.len() }
+
+    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.blob.clear();
+        self.label_start.clear();
+        self.label_len.clear();
+        self.sublabel_start.clear();
+        self.sublabel_len.clear();
+        self.data.clear();
+        self.match_pos_data.clear();
+        self.match_pos_start.clear();
+        self.match_pos_len.clear();
+    }
+
+    #[inline]
+    pub fn push(&mut self, label: &str, sublabel: &str, data: u64) -> usize {
+        let index = self.label_len.len();
+
+        let ls = self.blob.len() as u32;
+        self.blob.push_str(label);
+        self.label_start.push(ls);
+        self.label_len.push(label.len() as u16);
+
+        let ss = self.blob.len() as u32;
+        self.blob.push_str(sublabel);
+        self.sublabel_start.push(ss);
+        self.sublabel_len.push(sublabel.len() as u16);
+
+        self.data.push(data);
+
+        // no match positions yet
+        self.match_pos_start.push(self.match_pos_data.len() as u32);
+        self.match_pos_len.push(0);
+
+        index
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> ListerItemRef<'_> {
+        ListerItemRef {
+            label: self.label(index),
+            sublabel: self.sublabel(index),
+            data: self.data[index],
+            match_positions: self.match_positions(index)
+        }
+    }
+
+    #[inline]
+    pub fn try_get(&self, index: usize) -> Option<ListerItemRef<'_>> {
+        _ = self.data.get(index)?;
+        Some(self.get(index))
+    }
+
+    #[inline]
+    pub fn label(&self, i: usize) -> &str {
+        let s = self.label_start[i] as usize;
+        let e = s + self.label_len[i] as usize;
+        &self.blob[s..e]
+    }
+
+    #[inline]
+    pub fn sublabel(&self, i: usize) -> &str {
+        let s = self.sublabel_start[i] as usize;
+        let e = s + self.sublabel_len[i] as usize;
+        &self.blob[s..e]
+    }
+
+    #[inline]
+    pub fn match_positions(&self, i: usize) -> &[u32] {
+        let s = self.match_pos_start[i] as usize;
+        let e = s + self.match_pos_len[i] as usize;
+        &self.match_pos_data[s..e]
+    }
+
+    pub fn set_match_positions(&mut self, i: usize, positions: &[u32]) {
+        // match positions are rebuilt each filter pass so just append
+        // caller is responsible for calling this in index order during rebuild
+        let start = self.match_pos_data.len() as u32;
+        self.match_pos_data.extend_from_slice(positions);
+        self.match_pos_start[i] = start;
+        self.match_pos_len[i]   = positions.len() as u16;
+    }
+
+    pub fn clear_match_positions(&mut self) {
+        self.match_pos_data.clear();
+        for i in 0..self.len() {
+            self.match_pos_start[i] = 0;
+            self.match_pos_len[i]   = 0;
+        }
+    }
+}
+
 pub struct Lister {
-    pub is_open:        bool,
-    pub is_listing_file_entries: bool,
+    pub is_listing_file_entries: bool,              // For EMACS-like find-file behavior
+
     pub is_query_dirty: bool,
+
+    pub last_is_lister_open: bool,                  // For redraw flagging
+
+    pub set_selected_index_to_1_instead_of_0: bool, // For EMACS-like switch-buffer behavior
 
     pub last_seen_cached_dir_generation: u64, // u64::MAX if we didnt see any generations
 
@@ -3442,37 +3815,47 @@ pub struct Lister {
     pub selected_index: u32,
     pub  hovered_index: Option<u32>,
 
-    pub last_is_lister_open: bool,
-
-    pub set_selected_index_to_1_instead_of_0: bool,
+    pub panel: PanelAnim,
+    pub vlist: VirtualList,
 
     pub on_confirm:    Vec<ListerSelectFn>,
     pub pending_datas: Vec<u64>,
     pub panel_before_opening_lister: Vec<PanelId>,
     pub items_update_frame_update_callback: Vec<Option<ListerFrameUpdateCallback>>,
 
-    pub scroll:        f32,
-    pub scroll_anim:   f32,
-    pub open_anim:     f32,  // 0.0 = closed, 1.0 = fully open
-
-    pub item_h:        f32,
-    pub list_h:        f32,
-
     // Storage - cleared and refilled when lister opens
-    pub items:           Vec<ListerItem>,
+    pub items:           ListerItems,
 
-    // Scratch - rebuilt only when query changes (dirty flag)
-    pub filtered:        Vec<u32>,        // Indices into items
+    // Rebuilt when search
+    pub filtered:        Vec<u32>,        // Indexes into items
+
+    pub frame_item_refs: Vec<BoxRef>,
+    pub frame_item_refs_first: u32,
 
     pub scratch_str:     String,          // Reused for formatting
     pub scoring_scratch: Vec<(u32, u32)>, // Reused rebuild_filtered
 }
 
+impl Deref for Lister {
+    type Target = VirtualList;
+    fn deref(&self) -> &Self::Target { &self.vlist }
+}
+
+impl DerefMut for Lister {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.vlist }
+}
+
 impl Lister {
     pub fn new() -> Self {
         Self {
-            is_open: false,
-            open_anim: 0.0,
+            panel: PanelAnim {
+                open_speed: 18.0,
+                close_speed: 40.0,
+                ..Default::default()
+            },
+            items: Default::default(),
+            frame_item_refs_first: 0,
+            frame_item_refs: Vec::with_capacity(32),
             query_panel: PanelId::reserved_value(),
             query_buffer: BufferId::reserved_value(),
             query_view: ViewId::reserved_value(),
@@ -3485,27 +3868,33 @@ impl Lister {
             items_update_frame_update_callback: Default::default(),
             hovered_index: None,
             is_listing_file_entries: false,
-            items: Default::default(),
             on_confirm: Default::default(),
             pending_datas: Default::default(),
             is_query_dirty: false,
             scratch_str: String::with_capacity(512),
-            scroll: 0.0,
             set_selected_index_to_1_instead_of_0: false,
-            scroll_anim: 0.0,
+            vlist: Default::default(),
             selected_index: 0,
             scoring_scratch: Vec::with_capacity(256),
-            list_h: 0.0,
-            item_h: 0.0
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        self.is_open
+    pub fn lister_rect(&self, win_w: f32, win_h: f32, scale: f32) -> Rect {
+        lister_rect(win_w, win_h, self.panel.anim_w, self.panel.anim_h, scale)
     }
 
-    pub fn renderer_is_open(&self) -> bool {
-        self.open_anim > 0.10
+    pub fn is_open(&self) -> bool {
+        self.panel.is_open
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.panel.is_visible()
+    }
+
+    pub fn close(&mut self) -> Option<PanelId> {
+        self.panel.is_open = false;
+        self.set_selected_index_to_1_instead_of_0 = false;
+        self.panel_before_opening_lister.pop()
     }
 
     pub fn rebuild_filtered(&mut self) {
@@ -3534,6 +3923,7 @@ impl Lister {
         };
 
         if filter_str.is_empty() {
+            self.items.clear_match_positions();
             self.filtered.extend(0..self.items.len() as u32);
             self.is_query_dirty = false;
             return;
@@ -3544,18 +3934,24 @@ impl Lister {
         // then score by edit distance on matched items only for sorting
         //
         self.scoring_scratch.clear();
+
+        for index in 0..self.items.len() {
+            if let Some(positions) = Self::fuzzy_match_positions(self.items.label(index), filter_str) {
+                self.items.set_match_positions(index, &positions);
+            }
+        }
+
         self.scoring_scratch.extend(self.items.iter()
             .enumerate()
-            .filter(|(_, item)| Self::fuzzy_match(&item.label, filter_str))
-            .map(|(i, item)| {
+            .filter_map(|(i, item)| {
+                if item.match_positions.is_empty() { return None }
+
                 let score = rustc_edit_distance::edit_distance_with_substrings(
                     filter_str,
                     &item.label,
-                    // Use a large limit since we already know it's a subsequence match
                     filter_str.len() * 3,
                 ).unwrap_or(usize::MAX);
-
-                (i as u32, score as u32)
+                Some((i as u32, score as u32))
             }));
 
         self.scoring_scratch.sort_unstable_by_key(|&(_, score)| score);
@@ -3563,20 +3959,22 @@ impl Lister {
         self.is_query_dirty = false;
     }
 
-    fn fuzzy_match(text: &str, query: &str) -> bool {
-        let mut qchars = query.chars();
-        let mut qc = match qchars.next() { Some(c) => c, None => return true };
-        for tc in text.chars() {
+    fn fuzzy_match_positions(text: &str, query: &str) -> Option<SmallVec<[u32; 16]>> {
+        let mut positions = SmallVec::new();
+        let mut qchars = query.chars().peekable();
+        let mut qc = match qchars.next() { Some(c) => c, None => return Some(positions) };
+        for (byte_pos, tc) in text.char_indices() {
             if tc.to_ascii_lowercase() == qc.to_ascii_lowercase() {
-                qc = match qchars.next() { Some(c) => c, None => return true };
+                positions.push(byte_pos as u32);
+                qc = match qchars.next() { Some(c) => c, None => return Some(positions) };
             }
         }
 
-        false
+        None // didn't consume all query chars  no match
     }
 
     pub fn lister_key(&mut self, event: &KeyEvent, mods: Mods) -> ListerKeyDispatch {
-        if !self.is_open { return ListerKeyDispatch::None; }
+        if !self.is_open() { return ListerKeyDispatch::None; }
 
         let Mods { ctrl, alt, shift: _ } = mods;
 
@@ -3649,26 +4047,11 @@ impl Lister {
             _ => ListerKeyDispatch::None
         }
     }
-
-    fn scroll_to_selected(&mut self) {
-        let top    = self.selected_index as f32 * self.item_h;
-        let bottom = top + self.item_h;
-
-        // Only scroll when item is fully outside the visible area
-        if top < self.scroll {
-            self.scroll = top;
-        }
-        if bottom > self.scroll + self.list_h {
-            self.scroll = bottom - self.list_h;
-        }
-    }
 }
 
 #[derive(Clone)]
 pub struct Commander {
-    pub command_view: ViewId,
     pub command_buffer: BufferId,
-    pub command_panel: PanelId,
 
     pub command_tx: Sender<Box<str>>,
     pub output_rx: Receiver<Box<str>>,
@@ -3755,8 +4138,6 @@ impl Commander {
 
         Self {
             command_buffer: BufferId::reserved_value(),
-            command_view: ViewId::reserved_value(),
-            command_panel: PanelId::reserved_value(),
             command_tx,
             last_command_buffer_character_count: 0,
             output_rx,

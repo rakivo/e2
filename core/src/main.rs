@@ -466,6 +466,9 @@ impl App {
                     editor.win_w = gpu.win_w;
                     editor.win_h = gpu.win_h;
 
+                    editor.ui.win_w = editor.win_w;
+                    editor.ui.win_h = editor.win_h;
+
                     editor.layout_panels();
 
                     win.request_redraw();
@@ -491,6 +494,8 @@ impl App {
 
                 editor.messager.tick(dt);
                 editor.messager.evict_expired(MESSAGE_DURATION_IN_MILLISECONDS);
+
+                editor.ui.begin_frame(gpu.win_w, gpu.win_h);
 
                 redraw |= editor.always_on_update();
 
@@ -647,6 +652,20 @@ impl App {
                 render_messager(gpu, editor);
                 editor.render_us_acc += t1.elapsed().as_micros() as f32;
 
+                {
+                    editor.ui.end_frame();
+                    editor.ui.layout(|text, font_size| {
+                        let w = text.chars()
+                            .filter_map(|c| gpu::get_glyph_no_upload(gpu, c, font_size))
+                            .map(|g| g.advance)
+                            .sum();
+
+                        [w, font_size]
+                    });
+
+                    ui::render(&editor.ui, gpu);
+                }
+
                 for buffer in editor.buffers.values_mut() {
                     //
                     // No buffer can be dirty now!
@@ -697,6 +716,8 @@ impl ApplicationHandler<UserEvent> for App {
         let editor = &mut self.editor;
         editor.win_w = gpu.win_w;
         editor.win_h = gpu.win_h;
+        editor.ui.win_w = gpu.win_w;
+        editor.ui.win_h = gpu.win_h;
 
         editor.refresh_rate_millihertz = win.current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())

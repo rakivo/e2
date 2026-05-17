@@ -307,6 +307,8 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
 
                     if !committed { continue; }
 
+                    if functions.is_empty() { continue; }
+
                     //
                     // Only send results if we actually committed
                     //
@@ -323,8 +325,12 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
 
                     let Some(tree) = parser.parse_with_options(&mut callback, None, None) else { continue };
 
-                    let functions = collect_functions(tree.root_node(), &rope, buffer_id, &table);
+                    let tree_copy = tree.clone();
+                    let root_node = tree_copy.root_node();
                     trees.insert(buffer_id, VersionedTree { tree, buffer_last_edit_generation });
+
+                    let functions = collect_functions(root_node, &rope, buffer_id, &table);
+                    if functions.is_empty() { continue; }
 
                     _ = result_tx.send(ParseResult {
                         buffer_id,

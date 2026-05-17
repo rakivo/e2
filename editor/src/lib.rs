@@ -34,6 +34,7 @@ pub mod audioer;
 pub mod messager;
 pub mod ts;
 pub mod atum;
+pub mod ui;
 
 use audioer::Audioer;
 use lexer::token_color;
@@ -45,6 +46,7 @@ use command::{CommandContext, CommandAtom};
 use director::Director;
 use ts::{ParseResultKind, TreeSitter};
 use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
+use ui::UiState;
 
 use std::any::Any;
 use std::num::NonZero;
@@ -424,6 +426,25 @@ pub struct Palette {
     pub panel_bar_text:        Color,
     pub panel_bar_text_dim:    Color,  // for secondary fields (line:col, zoom)
     pub panel_bar_border:      Color,
+
+    pub lister_bg:              Color,
+    pub lister_border:          Color,
+    pub lister_border_inner:    Color,
+    pub lister_separator:       Color,
+    pub lister_item_text:       Color,
+    pub lister_item_text_dim:   Color,
+    pub lister_item_selected_bg: Color,
+    pub lister_item_selected_text: Color,
+    pub lister_item_hovered_bg: Color,
+    pub lister_item_alt_tint:   Color,
+    pub lister_accent:          Color, // left bar, hairlines
+    pub lister_match_highlight: Color,
+    pub lister_sublabel:        Color,
+    pub lister_sublabel_selected: Color,
+    pub lister_count:           Color,
+    pub lister_glow:            Color,
+    pub lister_scrollbar:       Color,
+    pub lister_scrollbar_track: Color,
 }
 
 #[inline]
@@ -444,6 +465,25 @@ pub const fn palette() -> Palette {
         panel_bar_text:        Color::rgba(210, 165, 80, 255),   // warm gold, active
         panel_bar_text_dim:    Color::rgba(120, 95,  50, 255),   // muted gold, secondary info
         panel_bar_border: Color::hex(0x2a2110),  // almost invisible, just a seam
+
+        lister_bg:               Color::hex(0x0d0a06),
+        lister_border:           Color::rgba(180, 20, 30, 180),   // red accent border
+        lister_border_inner:     Color::rgba(60,  10, 12, 80),
+        lister_separator:        Color::rgba(180, 20, 30, 140),
+        lister_item_text:        Color::rgba(200, 190, 165, 220),
+        lister_item_text_dim:    Color::rgba(130, 120, 100, 160),
+        lister_item_selected_bg: Color::rgba(60,  12, 14, 220),   // dark red tint
+        lister_item_selected_text: Color::rgba(255, 200, 200, 255),
+        lister_item_hovered_bg:  Color::rgba(35,  10, 10, 140),
+        lister_item_alt_tint:    Color::rgba(255, 255, 255, 5),
+        lister_accent:           Color::rgba(220, 20, 35, 255),   // cursor red
+        lister_match_highlight:  Color::rgba(220, 20, 35, 45),    // red match highlight
+        lister_sublabel:         Color::rgba(110, 90, 50, 120),
+        lister_sublabel_selected: Color::rgba(200, 80, 85, 200),  // red-tinted sublabel
+        lister_count:            Color::rgba(150, 30, 35, 150),
+        lister_glow:             Color::rgba(200, 15, 25, 25),    // full-width glow
+        lister_scrollbar:        Color::rgba(180, 20, 30, 130),
+        lister_scrollbar_track:  Color::rgba(200, 20, 30, 12),
     }
 }
 
@@ -2270,6 +2310,8 @@ pub struct Editor {
 
     pub clipboard:       Option<arboard::Clipboard>,
 
+    pub ui:              UiState,
+
     pub last_cursor_char_indexes: SecondaryMap<ViewId, u32>,
 
     pub frame_count:     u32,
@@ -2351,6 +2393,7 @@ impl Editor {
             canonicalized_path_to_buffer_id,
             scratch_panel_bar: String::with_capacity(128),
             scratch_panel_bar_dim: String::with_capacity(128),
+            ui: UiState::new(0.0, 0.0),
             logger_config,
             hooks: Default::default(),
             last_input_time: Instant::now(),

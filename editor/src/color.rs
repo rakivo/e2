@@ -42,6 +42,11 @@ impl From<[f32; 4]> for Color {
 
 impl Color {
     #[inline(always)]
+    pub const fn with_alpha_scaled(self, t: f32) -> Self {
+        Color::rgba(self.r, self.g, self.b, ((self.a as f32) * t) as u8)
+    }
+
+    #[inline(always)]
     pub const fn into_gpu(self) -> GpuColor {
         GpuColor::rgba(self.r, self.g, self.b, self.a)
     }
