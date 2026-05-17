@@ -3834,6 +3834,7 @@ pub struct Lister {
 
     pub scratch_str:     String,          // Reused for formatting
     pub scoring_scratch: Vec<(u32, u32)>, // Reused rebuild_filtered
+    pub matched_scratch: Vec<bool>, // @Memory // Reused rebuild_filtered
 }
 
 impl Deref for Lister {
@@ -3855,6 +3856,7 @@ impl Lister {
             },
             items: Default::default(),
             frame_item_refs_first: 0,
+            matched_scratch: Vec::with_capacity(32),
             frame_item_refs: Vec::with_capacity(32),
             query_panel: PanelId::reserved_value(),
             query_buffer: BufferId::reserved_value(),
@@ -3933,44 +3935,34 @@ impl Lister {
         // Filter by subsequence,
         // then score by edit distance on matched items only for sorting
         //
-        self.scoring_scratch.clear();
+
+        self.matched_scratch.clear();
+        self.matched_scratch.resize(self.items.len(), false);
 
         for index in 0..self.items.len() {
-            if let Some(positions) = Self::fuzzy_match_positions(self.items.label(index), filter_str) {
+            if let Some(positions) = lister::completion_match_positions(
+                self.items.label(index),
+                filter_str,
+            ) {
                 self.items.set_match_positions(index, &positions);
+                self.matched_scratch[index] = true;
             }
         }
 
-        self.scoring_scratch.extend(self.items.iter()
-            .enumerate()
-            .filter_map(|(i, item)| {
-                if item.match_positions.is_empty() { return None }
-
-                let score = rustc_edit_distance::edit_distance_with_substrings(
-                    filter_str,
-                    &item.label,
-                    filter_str.len() * 3,
-                ).unwrap_or(usize::MAX);
-                Some((i as u32, score as u32))
-            }));
+        self.scoring_scratch.clear();
+        self.scoring_scratch.extend(
+            (0..self.items.len())
+                .filter(|i| self.matched_scratch[*i])
+                .map(|i| {
+                    let score = lister::score_item(self.items.label(i), filter_str);
+                    (i as u32, score)
+                })
+        );
 
         self.scoring_scratch.sort_unstable_by_key(|&(_, score)| score);
         self.filtered.extend(self.scoring_scratch.iter().map(|&(i, _)| i));
+
         self.is_query_dirty = false;
-    }
-
-    fn fuzzy_match_positions(text: &str, query: &str) -> Option<SmallVec<[u32; 16]>> {
-        let mut positions = SmallVec::new();
-        let mut qchars = query.chars().peekable();
-        let mut qc = match qchars.next() { Some(c) => c, None => return Some(positions) };
-        for (byte_pos, tc) in text.char_indices() {
-            if tc.to_ascii_lowercase() == qc.to_ascii_lowercase() {
-                positions.push(byte_pos as u32);
-                qc = match qchars.next() { Some(c) => c, None => return Some(positions) };
-            }
-        }
-
-        None // didn't consume all query chars  no match
     }
 
     pub fn lister_key(&mut self, event: &KeyEvent, mods: Mods) -> ListerKeyDispatch {
@@ -4204,4 +4196,83 @@ pub fn peek_pending_lsp_goto(editor: &mut Editor) -> ShouldRequestFrameRedraw {
     }
 
     redraw
+}
+
+mod lister {
+    use super::*;
+
+    pub fn completion_match_positions(label: &str, filter: &str) -> Option<SmallVec<[u32; 16]>> {
+        if filter.is_empty() { return Some(SmallVec::new()); }
+
+        let label_lower  = label.to_ascii_lowercase();
+        let filter_lower = filter.to_ascii_lowercase();
+
+        // Exact prefix match
+        if label_lower.starts_with(&filter_lower) {
+            let positions = (0..filter.len() as u32).collect();
+            return Some(positions);
+        }
+
+        // Contiguous substring match
+        if let Some(pos) = label_lower.find(&filter_lower) {
+            let positions = (pos as u32..(pos + filter.len()) as u32).collect();
+            return Some(positions);
+        }
+
+        // Word boundary acronym match, only for short filters
+        if filter.len() <= 6 {
+            return fuzzy_match_word_boundaries(label, filter);
+        }
+
+        None
+    }
+
+    pub fn fuzzy_match_word_boundaries(label: &str, filter: &str) -> Option<SmallVec<[u32; 16]>> {
+        let mut positions: SmallVec<[u32; 16]> = SmallVec::new(); // @Memory :MakeScratch
+
+        let label_bytes = label.as_bytes();
+        let mut fchars  = filter.chars().peekable();
+        let mut fc      = fchars.next()?.to_ascii_lowercase();
+
+        let mut i = 0usize;
+        while i < label_bytes.len() {
+            let is_boundary = i == 0
+                || label_bytes[i - 1] == b'_'
+                || (label_bytes[i].is_ascii_uppercase()
+                    && i > 0
+                    && label_bytes[i - 1].is_ascii_lowercase());
+
+            if is_boundary && (label_bytes[i] as char).to_ascii_lowercase() == fc {
+                positions.push(i as u32);
+                match fchars.next() {
+                    Some(c) => fc = c.to_ascii_lowercase(),
+                    None    => return Some(positions),
+                }
+            }
+
+            i += 1;
+        }
+
+        None
+    }
+
+    pub fn score_item(label: &str, filter: &str) -> u32 {
+        let label_lower  = label.to_ascii_lowercase();
+        let filter_lower = filter.to_ascii_lowercase();
+
+        // Prefix match is best
+        if label_lower.starts_with(&filter_lower) {
+            // Shorter = better within prefix matches
+            return label.len() as u32;
+        }
+
+        // Substring match
+        if let Some(pos) = label_lower.find(&filter_lower) {
+            // Earlier in the string = better, shorter = better
+            return 1000 + pos as u32 * 10 + label.len() as u32;
+        }
+
+        // Word boundary match
+        2000 + label.len() as u32
+    }
 }
