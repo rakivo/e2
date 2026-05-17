@@ -6,7 +6,7 @@ layout(location=0) out vec4 out_color;
 layout(set=0, binding=0) uniform texture2D tex;
 layout(set=0, binding=1) uniform sampler   smp;
 
-const float ATLAS_SIZE = 2048.0;
+const float ATLAS_SIZE = 4096.0;
 
 void main() {
     if (f_uv.x == 0.0 && f_uv.y == 0.0) {

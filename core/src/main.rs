@@ -14,7 +14,7 @@ use editor::audioer::Audioer;
 use editor::messager::{MESSAGE_DURATION_IN_MILLISECONDS};
 use editor::session::{default_session_path, pretty_path, save_session};
 use editor::command::{CommandContext, CommandTable, Keymap, LoadedLib, Mods};
-use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY, prewarm_glyphs_and_print_preallocation_memory_usage};
+use editor::gpu::{Gpu, INITIAL_VERTEX_BUFFER_CAPACITY, prewarm_glyphs_and_print_preallocation_memory_usage, wait_for_atlas_upload};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -654,6 +654,7 @@ impl App {
                     buffer.is_dirty = false;
                 }
 
+                wait_for_atlas_upload(gpu);
                 _ = gpu.submit_frame();
 
                 redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation", &mut editor.redraw_reasons);
@@ -715,7 +716,11 @@ impl ApplicationHandler<UserEvent> for App {
 
         post_custom_layer_initialization(editor);
 
-        prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
+        {
+            let t0 = Instant::now();
+            prewarm_glyphs_and_print_preallocation_memory_usage(&editor, &mut gpu);
+            println!("[Prewarmed glyphs in {}ms]", t0.elapsed().as_millis() as f32);
+        }
 
         self.gpu    = Some(gpu);
         self.window = Some(win);

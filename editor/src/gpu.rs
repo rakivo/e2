@@ -10,13 +10,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
-use gpu_allocator::MemoryLocation;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use smallvec::SmallVec;
 use winit::window::Window;
+use gpu_allocator::MemoryLocation;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
 
-pub const ATLAS_SIZE: u32          = 2048;
+pub const ATLAS_SIZE: u32          = 4096;
 pub const ATLAS_RESET_RATIO: f32   = 0.8;
 pub const INITIAL_VERTEX_BUFFER_CAPACITY: u64 = 8 * 1024 * 1024;
 pub const FRAMES_IN_FLIGHT: usize      = 2;
@@ -78,6 +78,12 @@ struct DrawCmd {
     clip:  [f32; 4],
 }
 
+pub struct PendingAtlasUpload {
+    x: u32, y: u32, w: u32, h: u32,
+    data: *const u8,  // Points into glyph_pixels value, valid until glyph_pixels is mutated (which it never is)
+    data_len: usize,
+}
+
 const VERT_SPV: &[u8] = include_bytes!("../assets/vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../assets/frag.spv");
 
@@ -98,13 +104,18 @@ pub struct Gpu {
     pub atlas_row_h: u16,
     pub glyphs: rustc_hash::FxHashMap<(char, u32), GpuGlyph>,
 
+    pub glyph_pixels: rustc_hash::FxHashMap<(char, u32), Box<[u8]>>,
+    pub pending_atlas_uploads: Vec<PendingAtlasUpload>,
+
     //
     // Batch vertex state
     //
     pub batch_pool:  Vec<Batch>,
     pub batch_count: usize,
     pub clip_depth:  i32,
+
     pub glyph_scratch: Vec<(GpuGlyph, f32)>,
+    pub regions_scratch: Vec<vk::BufferImageCopy>,
 
     //
     // Window size
@@ -135,6 +146,10 @@ pub struct Gpu {
     pipeline_layout: vk::PipelineLayout,
     pipeline:        vk::Pipeline,
     render_pass:     vk::RenderPass,
+    pub one_shot_cmd_pool:  vk::CommandPool,
+    pub one_shot_cmd_buf:   vk::CommandBuffer,
+    pub upload_fence:       vk::Fence,
+    pub upload_in_flight:   bool,
 
     framebuffers:    Vec<vk::Framebuffer>,
     swapchain_views: Vec<vk::ImageView>,
@@ -147,7 +162,6 @@ pub struct Gpu {
     draw_scratch: Vec<DrawCmd>,
 
     queue:          vk::Queue,
-    queue_family:   u32,
     device:         ash::Device,
     surface:        vk::SurfaceKHR,
     surface_ext:    ash::khr::surface::Instance,
@@ -185,23 +199,20 @@ impl Gpu {
 
         unsafe { self.submit_frame_impl() }
     }
-
-    #[inline]
-    pub fn upload_to_atlas(&mut self, x: u32, y: u32, w: u32, h: u32, data: &[u8]) {
-        unsafe { self.upload_to_atlas_impl(x, y, w, h, data) }
-    }
 }
 
 pub fn prewarm_glyphs(gpu: &mut Gpu, font_size: f32) {
     // ASCII printable
     for c in ' '..='~' {
-        get_glyph(gpu, c, font_size);
+        get_glyph_no_upload(gpu, c, font_size);
     }
 
     // Box drawing
     for c in '\u{2500}'..='\u{257F}' {
-        get_glyph(gpu, c, font_size);
+        get_glyph_no_upload(gpu, c, font_size);
     }
+
+    flush_atlas_uploads(gpu);
 }
 
 pub fn prewarm_glyphs_and_print_preallocation_memory_usage(editor: &Editor, gpu: &mut Gpu) {
@@ -270,7 +281,124 @@ pub fn print_atlas_usage(gpu: &Gpu) {
     );
 }
 
+pub fn flush_atlas_uploads(gpu: &mut Gpu) {
+    unsafe { flush_atlas_uploads_impl(gpu) }
+}
+
+pub fn wait_for_atlas_upload(gpu: &mut Gpu) {
+    unsafe {
+        if gpu.upload_in_flight {
+            gpu.device.wait_for_fences(&[gpu.upload_fence], true, u64::MAX).unwrap();
+            gpu.device.reset_fences(&[gpu.upload_fence]).unwrap();
+            gpu.upload_in_flight = false;
+        }
+    }
+}
+
+pub unsafe fn flush_atlas_uploads_impl(gpu: &mut Gpu) {
+    if gpu.pending_atlas_uploads.is_empty() { return; }
+
+    if gpu.upload_in_flight {
+        gpu.device.wait_for_fences(&[gpu.upload_fence], true, u64::MAX).unwrap();
+        gpu.device.reset_fences(&[gpu.upload_fence]).unwrap();
+        gpu.upload_in_flight = false;
+    }
+
+    //
+    // Size staging buf to fit all pending data at once
+    //
+    let total: u64 = gpu.pending_atlas_uploads.iter()
+        .map(|u| u.data_len as u64)
+        .sum();
+
+    if total > gpu.staging_capacity {
+        let new_cap = total * 2;
+        let alloc   = gpu.allocator.as_mut().unwrap();
+        let old     = gpu.staging_buffer.take().unwrap();
+        alloc.free(old.allocation).unwrap();
+        gpu.device.destroy_buffer(old.buffer, None);
+        let (buf, allocation) = create_buffer(
+            &gpu.device, alloc, new_cap,
+            vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu,
+        );
+        gpu.staging_buffer   = Some(AllocBuffer { buffer: buf, allocation });
+        gpu.staging_capacity = new_cap;
+    }
+
+    //
+    // Pack all pixel data into staging
+    //
+    let staging_ptr = gpu.staging_buffer.as_mut().unwrap()
+        .allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+
+    let mut buffer_offset = 0u64;
+
+    gpu.regions_scratch.clear();
+    gpu.regions_scratch.extend(gpu.pending_atlas_uploads.iter()
+        .map(|u| {
+            std::ptr::copy_nonoverlapping(u.data, staging_ptr.add(buffer_offset as usize), u.data_len);
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(buffer_offset)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0, base_array_layer: 0, layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: u.x as i32, y: u.y as i32, z: 0 })
+                .image_extent(vk::Extent3D { width: u.w, height: u.h, depth: 1 });
+            buffer_offset += u.data_len as u64;
+            region
+        }));
+
+    _ = gpu.device.reset_command_pool(gpu.one_shot_cmd_pool, vk::CommandPoolResetFlags::empty());
+    begin_one_shot(&gpu.device, gpu.one_shot_cmd_buf);
+
+    transition_image_layout(
+        &gpu.device, gpu.one_shot_cmd_buf,
+        gpu.atlas_image.as_ref().unwrap().img,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
+
+    gpu.device.cmd_copy_buffer_to_image(
+        gpu.one_shot_cmd_buf,
+        gpu.staging_buffer.as_ref().unwrap().buffer,
+        gpu.atlas_image.as_ref().unwrap().img,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &gpu.regions_scratch,
+    );
+
+    transition_image_layout(
+        &gpu.device, gpu.one_shot_cmd_buf,
+        gpu.atlas_image.as_ref().unwrap().img,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    );
+
+    gpu.device.end_command_buffer(gpu.one_shot_cmd_buf).unwrap();
+
+    //
+    // Submit with fence
+    //
+
+    let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&gpu.one_shot_cmd_buf));
+
+    gpu.device.queue_submit(gpu.queue, &[submit_info], gpu.upload_fence).unwrap();
+    gpu.upload_in_flight = true;
+
+    gpu.pending_atlas_uploads.clear();
+}
+
 pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
+    let g = get_glyph_no_upload(gpu, c, size);
+    flush_atlas_uploads(gpu);
+    wait_for_atlas_upload(gpu);
+    g
+}
+
+pub fn get_glyph_no_upload(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
     use swash::FontRef;
     use swash::zeno::Format;
     use swash::scale::{Render, Source};
@@ -332,11 +460,17 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph> {
         return None;
     }
 
-    gpu.upload_to_atlas(
-        gpu.atlas_cur_x as u32, gpu.atlas_cur_y as u32,
-        w as u32, h as u32,
-        &image.data,
-    );
+    let atlas_x = gpu.atlas_cur_x;
+    let atlas_y = gpu.atlas_cur_y;
+
+    let image_data: Box<[u8]> = image.data.into();
+    let (data, data_len) = (image_data.as_ptr(), image_data.len());
+    gpu.glyph_pixels.insert(key, image_data);
+    gpu.pending_atlas_uploads.push(PendingAtlasUpload {
+        x: atlas_x as u32, y: atlas_y as u32,
+        w: w as u32,        h: h as u32,
+        data, data_len
+    });
 
     let bearing_x = image.placement.left as i16;
     let bearing_y = image.placement.top as i16;
@@ -368,10 +502,6 @@ pub fn reset_atlas(gpu: &mut Gpu) {
     gpu.atlas_cur_x = 1;
     gpu.atlas_cur_y = 1;
     gpu.atlas_row_h = 0;
-
-    // @Redundant?
-    static ZEROS: [u8; ATLAS_SIZE as usize * ATLAS_SIZE as usize] = [08; _];
-    gpu.upload_to_atlas(0, 0, ATLAS_SIZE, ATLAS_SIZE, &ZEROS);
 }
 
 #[inline]
@@ -871,12 +1001,27 @@ impl Gpu {
         let font_offset = font_ref.offset;
         let font_key    = font_ref.key;
 
+        let one_shot_cmd_pool = create_cmd_pool(&device, queue_family);
+        let one_shot_cmd_buf  = alloc_cmd_buf(&device, one_shot_cmd_pool);
+
         Gpu {
+            one_shot_cmd_pool,
+            one_shot_cmd_buf,
+            upload_fence:       device.create_fence(
+                &vk::FenceCreateInfo::default(),
+                None,
+            ).unwrap(),
+            upload_in_flight:   false,
+
             font_key, font_offset, font_data,
             scale_context: swash::scale::ScaleContext::new(),
 
             atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
-            glyphs: rustc_hash::FxHashMap::default(),
+
+            glyphs: rustc_hash::FxHashMap::with_capacity_and_hasher(1024, Default::default()),
+            regions_scratch: Vec::with_capacity(1024),
+            pending_atlas_uploads: Vec::with_capacity(1024),
+            glyph_pixels: rustc_hash::FxHashMap::with_capacity_and_hasher(1024, Default::default()),
 
             batch_pool:  vec![Batch::full_window(win_w as _, win_h as _)],
             batch_count: 1,
@@ -910,84 +1055,12 @@ impl Gpu {
             frame_index: 0,
             draw_scratch: Vec::new(),
             queue,
-            queue_family,
             device,
             surface,
             surface_ext,
             _instance: instance,
             _entry: entry,
         }
-    }
-
-    unsafe fn upload_to_atlas_impl(&mut self, x: u32, y: u32, w: u32, h: u32, data: &[u8]) {
-        let byte_size = data.len() as u64;
-
-        //
-        // Grow staging buffer if needed
-        //
-        if byte_size > self.staging_capacity {
-            let new_cap = byte_size * 2;
-
-            let alloc   = self.allocator.as_mut().unwrap();
-            let old     = self.staging_buffer.take().unwrap();
-            alloc.free(old.allocation).unwrap();
-            self.device.destroy_buffer(old.buffer, None);
-
-            let (buf, allocation) = create_buffer(
-                &self.device, alloc, new_cap,
-                vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu,
-            );
-            self.staging_buffer     = Some(AllocBuffer { buffer: buf, allocation });
-            self.staging_capacity = new_cap;
-        }
-
-        // Write into staging
-        {
-            let sb = self.staging_buffer.as_mut().unwrap();
-            let ptr = sb.allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-
-        // One-shot copy staging -> atlas image
-        let pool = create_cmd_pool(&self.device, self.queue_family);
-        let cmd  = alloc_cmd_buf(&self.device, pool);
-        begin_one_shot(&self.device, cmd);
-
-        // Atlas: SHADER_READ_ONLY -> TRANSFER_DST
-        transition_image_layout(
-            &self.device, cmd, self.atlas_image.as_ref().unwrap().img,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
-
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)    // Tightly packed
-            .buffer_image_height(0)  // Tightly packed
-            .image_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0, base_array_layer: 0, layer_count: 1,
-            })
-            .image_offset(vk::Offset3D { x: x as i32, y: y as i32, z: 0 })
-            .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
-
-        self.device.cmd_copy_buffer_to_image(
-            cmd,
-            self.staging_buffer.as_ref().unwrap().buffer,
-            self.atlas_image.as_ref().unwrap().img,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            std::slice::from_ref(&region),
-        );
-
-        // Atlas: TRANSFER_DST -> SHADER_READ_ONLY
-        transition_image_layout(
-            &self.device, cmd, self.atlas_image.as_ref().unwrap().img,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        );
-
-        submit_one_shot(&self.device, cmd, self.queue);
-        self.device.destroy_command_pool(pool, None);
     }
 
     unsafe fn submit_frame_impl(&mut self) -> Result<(), vk::Result> {
