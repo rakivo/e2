@@ -2501,7 +2501,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                 lister.is_open = false;
                 lister.is_listing_file_entries = true;
 
-                let panel = lister.panel_before_opening_lister.take().unwrap();
+                let panel = lister.panel_before_opening_lister.pop().unwrap();
                 cx.editor.set_active_panel(panel);
 
                 return (true, true);
@@ -2529,7 +2529,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                     lister.is_open = false;
                     lister.is_listing_file_entries = true;
 
-                    let panel = cx.editor.lister_mut().panel_before_opening_lister.take().unwrap();
+                    let panel = cx.editor.lister_mut().panel_before_opening_lister.pop().unwrap();
                     cx.editor.set_active_panel(panel);
                     cx.editor.reset_blink();
 
@@ -2571,7 +2571,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                 lister.is_open = false;
                 lister.is_listing_file_entries = true;
 
-                let panel_before_opening_lister = cx.editor.lister_mut().panel_before_opening_lister.take().unwrap();
+                let panel_before_opening_lister = cx.editor.lister_mut().panel_before_opening_lister.pop().unwrap();
                 cx.editor.set_active_panel(panel_before_opening_lister);
 
                 if is_selected {
@@ -2634,7 +2634,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.set_active_panel = Some(|editor, panel_id| {
         if panel_id == editor.lister().query_split {
-            editor.lister_mut().panel_before_opening_lister = Some(editor.active_panel);
+            editor.custom_data.lister_mut().panel_before_opening_lister.push(editor.active_panel);
         }
 
         false
@@ -3384,6 +3384,10 @@ pub fn editor_open_lister_impl(editor: &mut Editor, items: Vec<ListerItem>, on_c
 
     let lister = editor.custom_data.lister_mut();
 
+    if lister.is_open {
+        _ = lister.panel_before_opening_lister.pop();
+    }
+
     lister.items_update_frame_update_callback.push(frame_callback);
     lister.on_confirm.push(on_confirm);
 
@@ -3430,21 +3434,21 @@ pub struct Lister {
 
     pub query:         SmallString<[u8; 128]>,
 
-    pub query_buffer: BufferId, // :CustomData
-    pub query_view:   ViewId,   // :CustomData
-    pub query_panel:  PanelId,  // :CustomData @Redundant?
-    pub query_split:  PanelId,  // :CustomData
+    pub query_buffer: BufferId,
+    pub query_view:   ViewId,
+    pub query_panel:  PanelId,
+    pub query_split:  PanelId,
 
     pub selected_index: u32,
     pub  hovered_index: Option<u32>,
 
-    pub panel_before_opening_lister: Option<PanelId>, // :CustomData
-    pub last_is_lister_open: bool, // :CustomData
+    pub last_is_lister_open: bool,
 
     pub set_selected_index_to_1_instead_of_0: bool,
 
     pub on_confirm:    Vec<ListerSelectFn>,
     pub pending_datas: Vec<u64>,
+    pub panel_before_opening_lister: Vec<PanelId>,
     pub items_update_frame_update_callback: Vec<Option<ListerFrameUpdateCallback>>,
 
     pub scroll:        f32,
@@ -3475,7 +3479,7 @@ impl Lister {
             query_split: PanelId::reserved_value(),
             query: SmallString::new(),
             filtered: Default::default(),
-            panel_before_opening_lister: None,
+            panel_before_opening_lister: Vec::new(),
             last_is_lister_open: false,
             last_seen_cached_dir_generation: u64::MAX,
             items_update_frame_update_callback: Default::default(),
