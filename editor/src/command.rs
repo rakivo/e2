@@ -299,6 +299,40 @@ impl Keymap {
     }
 }
 
+#[inline]
+const fn osx_normalize_alt_char(c: char, shift: bool) -> char {
+    match c {
+        'å' => if shift { 'A' } else { 'a' },
+        '∫' => if shift { 'B' } else { 'b' },
+        'ç' => if shift { 'C' } else { 'c' },
+        '∂' => if shift { 'D' } else { 'd' },
+        '´' => if shift { 'E' } else { 'e' },
+        'ƒ' => if shift { 'F' } else { 'f' },
+        '©' => if shift { 'G' } else { 'g' },
+        '˙' => if shift { 'H' } else { 'h' },
+        'ˆ' => if shift { 'I' } else { 'i' },
+        '∆' => if shift { 'J' } else { 'j' },
+        '˚' => if shift { 'K' } else { 'k' },
+        '¬' => if shift { 'L' } else { 'l' },
+        'µ' => if shift { 'M' } else { 'm' },
+        '˜' => if shift { 'N' } else { 'n' },
+        'ø' => if shift { 'O' } else { 'o' },
+        'π' => if shift { 'P' } else { 'p' },
+        'œ' => if shift { 'Q' } else { 'q' },
+        '®' => if shift { 'R' } else { 'r' },
+        'ß' => if shift { 'S' } else { 's' },
+        '†' => if shift { 'T' } else { 't' },
+        '¨' => if shift { 'U' } else { 'u' },
+        '√' => if shift { 'V' } else { 'v' },
+        '∑' => if shift { 'W' } else { 'w' },
+        '≈' => if shift { 'X' } else { 'x' },
+        '¥' => if shift { 'Y' } else { 'y' },
+        'Ω' => if shift { 'Z' } else { 'z' },
+
+        _ => c,
+    }
+}
+
 impl Keymap {
     pub fn bind(&mut self, key: KeyCombo, cmd: CommandAtom) {
         self.bindings.insert(key, cmd.into());
@@ -308,7 +342,16 @@ impl Keymap {
         let (combo, mods) = match &event.logical_key {
             Key::Named(k) => (KeyCombo::Named(k.clone(), mods), mods),
             Key::Character(s) => {
-                let c = s.chars().next()?;
+                let mut c = s.chars().next()?;
+
+                //
+                // macOS Option/Alt produces special Unicode symbols
+                // like ∑ instead of "w". Normalize them back so
+                // bindings remain layout-independent enough.
+                //
+                if mods.alt {
+                    c = osx_normalize_alt_char(c, mods.shift);
+                }
 
                 //
                 // Shift is baked into the character already; strip it from mods

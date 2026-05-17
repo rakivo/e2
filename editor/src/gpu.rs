@@ -673,12 +673,23 @@ impl Gpu {
         //
         // No validation layers
         //
-        let instance = entry.create_instance(
-            &vk::InstanceCreateInfo::default()
-                .application_info(&app_info)
-                .enabled_extension_names(&surface_extensions),
-            None,
-        ).unwrap();
+	let app_info = vk::ApplicationInfo::default()
+	    .api_version(vk::make_api_version(0, 1, 1, 0));
+
+	let extensions = [
+	    ash::khr::surface::NAME.as_ptr(),
+	    ash::ext::metal_surface::NAME.as_ptr(),
+	    ash::khr::portability_enumeration::NAME.as_ptr(),
+	];
+
+	let create_info = vk::InstanceCreateInfo::default()
+	    .application_info(&app_info)
+	    .enabled_extension_names(&extensions)
+	    .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+
+	let instance = unsafe {
+	    entry.create_instance(&create_info, None)
+	}.unwrap();
 
         //
         // Surface
