@@ -619,6 +619,7 @@ impl App {
                     let t1 = Instant::now();
                     render_text_layout(editor, gpu, view_id, show_cursor);
                     render_panel_bar(gpu, editor, view_id);
+                    render_completion_dropdown(gpu, editor, view_id);
                     editor.render_us_acc += t1.elapsed().as_micros() as f32;
                     gpu::pop_clip(gpu);
                 }

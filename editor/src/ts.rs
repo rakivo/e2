@@ -1,6 +1,8 @@
-use crate::BufferId;
+use crate::buffer::Buffer;
+use crate::{BufferId, CompletionItem, CompletionItemKind};
 use crate::atum::{Atom, AtomTable};
 
+use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
@@ -103,8 +105,9 @@ pub enum ParserQuery {
 }
 
 pub enum ParseResultKind {
-    FunctionsUpdate {
-        functions: Vec<FunctionInfo>
+    SymbolsUpdate {
+        functions: Vec<FunctionInfo>,
+        symbols: Vec<RawSymbol>,
     },
 
     FuncCallOverlayUpdate {
@@ -170,6 +173,7 @@ pub struct TreeSitter {
     pub trees:      Arc<DashMap<BufferId, VersionedTree>>,
 
     pub func_table: FunctionTable,
+    pub symbol_table: SymbolTable
 }
 
 impl TreeSitter {
@@ -212,18 +216,21 @@ pub fn spawn() -> TreeSitter {
     let (query_tx, query_rx) = crossbeam_channel::unbounded();
     let (result_tx, result) = crossbeam_channel::unbounded();
 
-    let table = Arc::new(AtomTable::new());
+    let atom_table = Arc::new(AtomTable::new());
     let trees = Arc::default();
 
-    let table_clone = Arc::clone(&table);
+    let table_clone = Arc::clone(&atom_table);
     let trees_clone = Arc::clone(&trees);
 
     thread::spawn(move || bg_thread(query_rx, edit_rx, result_tx, table_clone, trees_clone));
 
-    TreeSitter { message_tx, result, query_tx, atom_table: table, trees, func_table: Default::default() }
+    TreeSitter {
+        message_tx, result, query_tx, atom_table, trees,
+        func_table: Default::default(), symbol_table: SymbolTable::new()
+    }
 }
 
-fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, result_tx: Sender<ParseResult>, table: Arc<AtomTable>, trees: Arc<DashMap<BufferId, VersionedTree>>) {
+fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, result_tx: Sender<ParseResult>, atom_table: Arc<AtomTable>, trees: Arc<DashMap<BufferId, VersionedTree>>) {
     let mut parser  = Parser::new();
 
     parser.set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -242,7 +249,7 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     let Some(tree) = trees.get(&buffer_id) else { continue };
 
                     let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte);
-                    let overlay = node.and_then(|n| find_call_overlay(n, cursor_byte, &rope, &table));
+                    let overlay = node.and_then(|n| find_call_overlay(n, cursor_byte, &rope, &atom_table));
 
                     _ = result_tx.send(ParseResult {
                         buffer_id,
@@ -276,7 +283,9 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     //
                     // Collect functions from the new tree before acquiring any lock
                     //
-                    let functions = collect_functions(new_tree.root_node(), &rope, buffer_id, &table);
+                    let root_node = new_tree.root_node();
+                    let functions = collect_functions(root_node, &rope, buffer_id, &atom_table);
+                    let symbols   = collect_symbols(root_node, &rope, buffer_id, &atom_table);
 
                     //
                     // Atomically decide whether to commit,
@@ -307,14 +316,14 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
 
                     if !committed { continue; }
 
-                    if functions.is_empty() { continue; }
+                    if functions.is_empty() && symbols.is_empty() { continue; }
 
                     //
                     // Only send results if we actually committed
                     //
                     _ = result_tx.send(ParseResult {
                         buffer_id,
-                        kind: ParseResultKind::FunctionsUpdate { functions },
+                        kind: ParseResultKind::SymbolsUpdate { functions, symbols },
                     });
                 }
 
@@ -329,12 +338,13 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     let root_node = tree_copy.root_node();
                     trees.insert(buffer_id, VersionedTree { tree, buffer_last_edit_generation });
 
-                    let functions = collect_functions(root_node, &rope, buffer_id, &table);
-                    if functions.is_empty() { continue; }
+                    let functions = collect_functions(root_node, &rope, buffer_id, &atom_table);
+                    let symbols   = collect_symbols(root_node, &rope, buffer_id, &atom_table);
+                    if functions.is_empty() && symbols.is_empty() { continue; }
 
                     _ = result_tx.send(ParseResult {
                         buffer_id,
-                        kind: ParseResultKind::FunctionsUpdate { functions }
+                        kind: ParseResultKind::SymbolsUpdate { functions, symbols }
                     });
                 }
 
@@ -632,6 +642,297 @@ fn rope_slice_to_atom(source: &Rope, start_byte: usize, end_byte: usize, table: 
             for c in s.chunks() { flat.push_str(c); }
             table.intern(&flat)
         }).unwrap_or_default()
+}
+
+/// Helper that slices the rope and interns the resulting string immediately.
+fn rope_slice_to_string<'a>(source: &'a Rope, start_byte: usize, end_byte: usize) -> Cow<'a, str> {
+    let start = source.byte_to_char(start_byte);
+    let end   = source.byte_to_char(end_byte);
+
+    source.get_slice(start..end)
+        .map(|s| if let Some(in_memory) = s.as_str() {
+            Cow::Borrowed(in_memory)
+        } else {
+            let mut flat = String::with_capacity(s.len_bytes());
+            for c in s.chunks() { flat.push_str(c); }
+            Cow::Owned(flat)
+        }).unwrap_or_default()
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Struct,
+    Enum,
+    EnumVariant,
+    Trait,
+    TypeAlias,
+    Const,
+    Static,
+    Mod,
+    Local
+}
+
+impl SymbolKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Struct      => "struct",
+            Self::Enum        => "enum",
+            Self::EnumVariant => "variant",
+            Self::Trait       => "trait",
+            Self::TypeAlias   => "type",
+            Self::Const       => "const",
+            Self::Static      => "static",
+            Self::Mod         => "mod",
+            Self::Local       => "local",
+        }
+    }
+}
+
+pub struct SymbolTable {
+    pub strings:      String,
+    pub names:        Vec<Atom>,
+    pub detail_start: Vec<u32>,
+    pub detail_len:   Vec<u16>,
+    pub kind:         Vec<SymbolKind>,
+    pub buffer_id:    Vec<BufferId>,
+    pub range_start:  Vec<u32>,
+    pub range_end:    Vec<u32>,
+    pub generation:   Vec<u32>,
+    pub global_gen:   u32,
+
+    pub by_name:   FxHashMap<Atom, SmallVec<[u32; 2]>>,
+    pub by_buffer: FxHashMap<BufferId, Vec<u32>>,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        Self {
+            strings:      String::new(),
+            detail_start: Vec::new(),
+            detail_len:   Vec::new(),
+            kind:         Vec::new(),
+            buffer_id:    Vec::new(),
+            range_start:  Vec::new(),
+            range_end:    Vec::new(),
+            generation:   Vec::new(),
+            global_gen:   1,
+            names:        Vec::new(),
+            by_name:      FxHashMap::default(),
+            by_buffer:    FxHashMap::default(),
+        }
+    }
+
+    pub fn len(&self) -> usize { self.kind.len() }
+
+    pub fn name(&self, i: usize) -> Atom {
+        self.names[i]
+    }
+
+    pub fn detail(&self, i: usize) -> &str {
+        let s = self.detail_start[i] as usize;
+        &self.strings[s..s + self.detail_len[i] as usize]
+    }
+
+    pub fn is_alive(&self, i: usize) -> bool {
+        self.generation[i] == self.global_gen
+    }
+
+    fn push_symbol(
+        &mut self,
+        name: Atom, detail: &str, kind: SymbolKind,
+        buffer_id: BufferId, start: u32, end: u32,
+    ) -> u32 {
+        let ds = self.strings.len() as u32;
+        self.strings.push_str(detail);
+
+        let idx = self.kind.len() as u32;
+        self.detail_start.push(ds);
+        self.detail_len.push(detail.len() as u16);
+        self.names.push(name);
+        self.kind.push(kind);
+        self.buffer_id.push(buffer_id);
+        self.range_start.push(start);
+        self.range_end.push(end);
+        self.generation.push(self.global_gen);
+
+        self.by_name.entry(name).or_default().push(idx);
+        self.by_buffer.entry(buffer_id).or_default().push(idx);
+
+        idx
+    }
+
+    pub fn remove_buffer(&mut self, buffer_id: BufferId) {
+        let Some(indices) = self.by_buffer.remove(&buffer_id) else { return };
+        for i in indices {
+            self.generation[i as usize] = 0; // mark dead
+            let name = self.name(i as usize);
+            if let Some(refs) = self.by_name.get_mut(&name) {
+                refs.retain(|r| *r != i);
+                if refs.is_empty() { self.by_name.remove(&name); }
+            }
+        }
+    }
+
+    pub fn replace_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        new_symbols: impl IntoIterator<Item = RawSymbol>,
+    ) {
+        self.remove_buffer(buffer_id);
+        for s in new_symbols {
+            self.push_symbol(s.name, &s.detail, s.kind, buffer_id, s.range_start, s.range_end);
+        }
+    }
+
+    // Prefix search - returns indices of matching live symbols
+    pub fn query_prefix<'a>(&'a self, prefix: &str, atom_table: &'a AtomTable) -> impl Iterator<Item = usize> + 'a {
+        let prefix_lower = prefix.to_ascii_lowercase();
+        (0..self.len()).filter(move |&i| {
+            self.is_alive(i) &&
+            atom_table.lookup_ref(self.name(i)).starts_with(&prefix_lower)
+        })
+    }
+}
+
+// Intermediate type used by bg thread before inserting into table
+pub struct RawSymbol {
+    pub name:        Atom,
+    pub detail:      String,
+    pub kind:        SymbolKind,
+    pub range_start: u32,
+    pub range_end:   u32,
+}
+
+pub fn collect_symbols(root: Node, source: &Rope, _buffer_id: BufferId, atom_table: &AtomTable) -> Vec<RawSymbol> {
+    let mut out = Vec::new();
+    collect_symbols_inner(root, source, &mut out, None, atom_table);
+    out
+}
+
+fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, parent_enum: Option<Atom>, atom_table: &AtomTable) {
+    match node.kind() {
+        "struct_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(RawSymbol {
+                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    detail:      "struct".into(),
+                    kind:        SymbolKind::Struct,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        "enum_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let enum_name = rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
+                out.push(RawSymbol {
+                    name:        enum_name,
+                    detail:      "enum".into(),
+                    kind:        SymbolKind::Enum,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+
+                // Recurse into variants with parent enum name
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    collect_symbols_inner(child, source, out, Some(enum_name), atom_table);
+                }
+
+                return;
+            }
+        }
+
+        "enum_variant" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let variant_name = rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
+                let detail = parent_enum.map_or("variant".into(), |e| format!("{}::", atom_table.lookup_ref(e).as_ref()));
+                out.push(RawSymbol {
+                    name:        variant_name,
+                    detail,
+                    kind:        SymbolKind::EnumVariant,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        "trait_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(RawSymbol {
+                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    detail:      "trait".into(),
+                    kind:        SymbolKind::Trait,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        "type_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(RawSymbol {
+                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    detail:      "type".into(),
+                    kind:        SymbolKind::TypeAlias,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        "const_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let detail = node.child_by_field_name("type")
+                    .map(|t| rope_slice_to_string(source, t.start_byte(), t.end_byte()))
+                    .unwrap_or_else(|| "const".into());
+                out.push(RawSymbol {
+                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    detail: detail.into(),
+                    kind:        SymbolKind::Const,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        "static_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let detail = node.child_by_field_name("type")
+                    .map(|t| rope_slice_to_string(source, t.start_byte(), t.end_byte()))
+                    .unwrap_or_else(|| "static".into());
+
+                out.push(RawSymbol {
+                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    detail: detail.into(),
+                    kind:        SymbolKind::Static,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        "mod_item" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(RawSymbol {
+                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    detail:      "mod".into(),
+                    kind:        SymbolKind::Mod,
+                    range_start: node.start_byte() as u32,
+                    range_end:   node.end_byte() as u32,
+                });
+            }
+        }
+
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_symbols_inner(child, source, out, None, atom_table);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1855,4 +2156,245 @@ fn last_close_child(node: Node) -> Option<usize> {
         if !cursor.goto_next_sibling() { break; }
     }
     found
+}
+
+// @Incomplete: Skip incomplete let's that the user might be typing right now.
+pub fn collect_locals_at_cursor(
+    root:        Node,
+    cursor_byte: usize,
+    source:      &Rope,
+    atom_table:  &AtomTable
+) -> Vec<CompletionItem> {
+    let mut out = Vec::new();
+
+    // Find the leaf at cursor then walk up collecting bindings
+    let Some(mut node) = root.descendant_for_byte_range(cursor_byte, cursor_byte) else {
+        return out;
+    };
+
+    loop {
+        match node.kind() {
+            "block" | "source_file" => {
+                //
+                // Scan named children of this block that come BEFORE cursor
+                //
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.start_byte() >= cursor_byte { break; }
+                    match child.kind() {
+                        "let_declaration" => {
+                            if let Some(pat) = child.child_by_field_name("pattern") {
+                                collect_pattern_bindings(pat, source, &mut out, atom_table);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "match_arm" => {
+                if let Some(pat) = node.child_by_field_name("pattern") {
+                    //
+                    // Only collect if cursor is inside this arm's body
+                    //
+                    if let Some(body) = node.child_by_field_name("value") {
+                        if cursor_byte >= body.start_byte() && cursor_byte <= body.end_byte() {
+                            collect_pattern_bindings(pat, source, &mut out, atom_table);
+                        }
+                    }
+                }
+            }
+            "function_item" => {
+                //
+                // Collect parameters
+                //
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    let mut cursor = params.walk();
+                    for param in params.named_children(&mut cursor) {
+                        if param.kind() != "parameter" { continue; }
+                        if let Some(pat) = param.child_by_field_name("pattern") {
+                            collect_pattern_bindings(pat, source, &mut out, atom_table);
+                        }
+                    }
+                }
+            }
+            "for_expression" => {
+                //
+                // For x in ... - collect the pattern
+                //
+                if let Some(pat) = node.child_by_field_name("pattern") {
+                    collect_pattern_bindings(pat, source, &mut out, atom_table);
+                }
+            }
+            "closure_expression" => {
+                if let Some(params) = node.child_by_field_name("parameters") {
+                    let mut cursor = params.walk();
+                    for param in params.named_children(&mut cursor) {
+                        collect_pattern_bindings(param, source, &mut out, atom_table);
+                    }
+                }
+            }
+            "if_expression" | "while_expression" => {
+                //
+                // if let Some(x) = ... / while let Some(x) = ...
+                //
+                if let Some(cond) = node.child_by_field_name("condition") {
+                    if cond.kind() == "let_condition" {
+                        if let Some(pat) = cond.child_by_field_name("pattern") {
+                            collect_pattern_bindings(pat, source, &mut out, atom_table);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        match node.parent() {
+            Some(p) => node = p,
+            None    => break,
+        }
+    }
+
+    out
+}
+
+fn collect_pattern_bindings(pat: Node, source: &Rope, out: &mut Vec<CompletionItem>, atom_table: &AtomTable) {
+    match pat.kind() {
+        "identifier" => {
+            let name = rope_slice_to_atom(source, pat.start_byte(), pat.end_byte(), atom_table);
+            if atom_table.lookup_ref(name).as_ref() == "_" { return; }
+            out.push(CompletionItem {
+                name: name,
+                detail: "let".into(),
+                kind:   CompletionItemKind::Local,
+                score:  0,
+            });
+        }
+
+        "tuple_pattern" | "struct_pattern" | "tuple_struct_pattern" => {
+            let mut cursor = pat.walk();
+            for child in pat.named_children(&mut cursor) {
+                collect_pattern_bindings(child, source, out, atom_table);
+            }
+        }
+
+        "ref_pattern" | "mut_pattern" => {
+            if let Some(inner) = pat.named_child(0) {
+                collect_pattern_bindings(inner, source, out, atom_table);
+            }
+        }
+
+        _ => {}
+    }
+}
+
+pub fn extract_prefix_at_cursor(buf: &Buffer, cursor_char: usize) -> (usize, String) {
+    let mut start = cursor_char;
+    while start > 0 {
+        let c = buf.text.char(start - 1);
+        if c.is_alphanumeric() || c == '_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let prefix: String = buf.text.slice(start..cursor_char).to_string();
+    (start, prefix)
+}
+
+pub fn query_completions(
+    prefix:       &str,
+    sym_table:    &SymbolTable,
+    func_table:   &FunctionTable,
+    atom_table:   &AtomTable,
+    _buffer_id:    BufferId,
+    cursor_byte: usize,
+    tree:        Option<&Tree>,
+    source:      &Rope,
+    limit:        usize,
+) -> Vec<CompletionItem> {
+    if prefix.is_empty() { return vec![]; }
+
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let mut items: Vec<CompletionItem> = Vec::new();
+
+    // symbols
+    for i in sym_table.query_prefix(prefix, atom_table) {
+        let name   = sym_table.name(i);
+        let detail: Box<str> = sym_table.detail(i).into(); // @Memory
+        let kind   = sym_table.kind[i];
+        let score  = score_completion(&atom_table.lookup_ref(name), prefix);
+        items.push(CompletionItem {
+            name,
+            detail,
+            kind: kind.into(),
+            score,
+        });
+        if items.len() >= limit * 2 { break; }
+    }
+
+    // functions from func_table
+    for (_, refs) in &func_table.by_name {
+        for &r in refs.as_slice() {
+            let Some(info) = func_table.get(r) else { continue };
+            let name = atom_table.lookup_ref(info.name);
+            if !name.to_ascii_lowercase().starts_with(&prefix_lower) { continue; }
+            let detail: Box<str> = format_fn_detail(info, atom_table).into();
+            let score  = score_completion(&name, prefix);
+            items.push(CompletionItem {
+                name: info.name,
+                detail,
+                kind: if info.impl_name.is_some() {
+                    CompletionItemKind::Function // method
+                } else {
+                    CompletionItemKind::Function
+                },
+                score,
+            });
+            if items.len() >= limit * 2 { break; }
+        }
+    }
+
+    // Locals from scope walk
+    if let Some(tree) = tree {
+        let locals = collect_locals_at_cursor(
+            tree.root_node(),
+            cursor_byte,
+            source,
+            atom_table
+        );
+        let prefix_lower = prefix.to_ascii_lowercase();
+        for mut item in locals {
+            let name = atom_table.lookup_ref(item.name);
+            if !name.to_ascii_lowercase().starts_with(&prefix_lower) { continue; }
+            item.score = score_completion(&name, prefix) + 5; // + 5 for locals
+            items.push(item);
+        }
+    }
+
+    // sort by score, deduplicate by name
+    items.sort_unstable_by_key(|i| i.score);
+    items.dedup_by(|a, b| a.name == b.name);
+    items.truncate(limit);
+    items
+}
+
+fn score_completion(name: &str, prefix: &str) -> u32 {
+    // exact prefix match scores 0 (best)
+    // then by length difference
+    // then alphabetical
+    if name == prefix { return 0; }
+    let len_diff = (name.len() as i32 - prefix.len() as i32).unsigned_abs();
+    len_diff + 1
+}
+
+fn format_fn_detail(info: &FunctionInfo, atom_table: &AtomTable) -> String {
+    let mut s = String::from("(");
+    for (i, param) in info.params.iter().enumerate() {
+        if i > 0 { s.push_str(", "); }
+        s.push_str(atom_table.lookup_ref(param.name).as_str());
+        s.push_str(": ");
+        s.push_str(atom_table.lookup_ref(param.type_str).as_str());
+    }
+    s.push(')');
+    s
 }

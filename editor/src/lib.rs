@@ -36,6 +36,7 @@ pub mod ts;
 pub mod atum;
 pub mod ui;
 
+use atum::{Atom, AtomTable};
 use audioer::Audioer;
 use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
@@ -44,11 +45,13 @@ use buffer::{AnimatedRegion, Buffer, Cursor};
 use color::{Color, GpuColor};
 use command::{CommandContext, CommandAtom};
 use director::Director;
-use ts::{ParseResultKind, TreeSitter};
+use tree_sitter::Tree;
+use ts::{FunctionTable, ParseResultKind, SymbolKind, SymbolTable, TreeSitter, extract_prefix_at_cursor, query_completions};
 use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
 use ui::UiState;
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::num::NonZero;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -686,7 +689,8 @@ pub struct TextLayout {
 
     pub line_h:            f32,
     pub font_size:         f32,
-    pub first_buffer_line: u32,
+
+    pub first_buffer_line_including_prelex: u32,
 
     pub rect: Rect,
 
@@ -716,13 +720,13 @@ impl DerefMut for TextLayout {
 impl TextLayout {
     #[inline]
     pub fn first_visible_buffer_line(&self) -> u32 {
-        self.first_buffer_line
+        self.first_buffer_line_including_prelex
     }
 
     /// Find the LineLayout for a buffer line if visible.
     #[inline]
     pub fn line_for_buffer_line(&self, buffer_line: u32) -> Option<&LineLayout> {
-        let offset = buffer_line.checked_sub(self.first_buffer_line)?;
+        let offset = buffer_line.checked_sub(self.first_buffer_line_including_prelex)?;
 
         let ll = self.lines.get(offset as usize)?;
         if ll.buffer_line == buffer_line && ll.wrap_index == 0 {
@@ -765,7 +769,7 @@ impl TextLayout {
     ) -> Option<[f32; 4]> {
         let ll = self.line_for_buffer_line(buffer_line)?;
         let y = self.rect.y
-            + (ll.buffer_line - self.first_buffer_line) as f32 * self.line_h
+            + (ll.buffer_line - self.first_buffer_line_including_prelex) as f32 * self.line_h
             - (scroll_anim % self.line_h);
 
         let x0 = ll.x_for_col(
@@ -781,15 +785,15 @@ impl TextLayout {
     #[inline]
     pub fn hit_test(&self, mx: f32, my: f32, scroll_anim: f32, scroll_anim_x: f32) -> (u32, u32) {
         if self.lines.is_empty() {
-            return (self.first_buffer_line, 0);
+            return (self.first_buffer_line_including_prelex, 0);
         }
 
         let line_f   = (my - self.rect.y + scroll_anim) / self.line_h;
         let line_index = (line_f as u32).clamp(
-            self.first_buffer_line,
-            self.first_buffer_line + self.lines.len() as u32 - 1,
+            self.first_buffer_line_including_prelex,
+            self.first_buffer_line_including_prelex + self.lines.len() as u32 - 1,
         );
-        let vis_index  = (line_index - self.first_buffer_line) as usize;
+        let vis_index  = (line_index - self.first_buffer_line_including_prelex) as usize;
         let ll       = &self.lines[vis_index];
         let col      = ll.col_for_screen_x(
             self.rect.x + padding_left(self.should_pad_left_when_rendering) - scroll_anim_x,
@@ -1128,7 +1132,7 @@ pub fn build_text_layout(
         line_offsets,
         render_settings,
         glyph_insertion_ids: Default::default(),
-        first_buffer_line: first_line,
+        first_buffer_line_including_prelex: first_line,
     }
 }
 
@@ -1214,7 +1218,7 @@ pub fn render_text_layout(
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
 
-    let vis_start = layout.first_buffer_line;
+    let vis_start = layout.first_buffer_line_including_prelex;
     let vis_end   = vis_start + layout.lines.len() as u32;
 
     let space_width = gpu::get_glyph(gpu, ' ', font_size)
@@ -1444,8 +1448,6 @@ pub fn render_text_layout(
         let inv_sw = 1.0 / gpu.win_w;
         let inv_sh = 1.0 / gpu.win_h;
 
-        let verts = gpu.verts_mut();
-
         let cursor_color    = palette().text_under_cursor.into();
         let paste_highlight = palette().paste_highlight.into();
         let copy_highlight  = palette().copy_highlight.into();
@@ -1474,6 +1476,7 @@ pub fn render_text_layout(
                 None
             };
 
+            let verts = gpu.verts_mut();
             draw_text_for_editor(
                 verts,
                 inv_sw,
@@ -1489,6 +1492,17 @@ pub fn render_text_layout(
                 ll.glyph_start as usize,
                 animated_regions_ts
             );
+
+            if ll.buffer_line == cursor_line {
+                if let Some(ref ghost) = view.completion.ghost_text {
+                    if !ghost.is_empty() {
+                        let ghost_x = ll.x_for_col(origin_x, cursor_col, &layout.glyphs);
+                        let ghost_y = context.line_y(ll.buffer_line) + line_h;
+                        gpu::draw_text(gpu, ghost, ghost_x, ghost_y, font_size,
+                                       Color::rgba(120, 110, 90, 120));
+                    }
+                }
+            }
         }
     }
 
@@ -1969,7 +1983,7 @@ pub struct ViewState {
     pub scroll_anim: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct View {
     pub        id: ViewId,
     pub buffer_id: BufferId,
@@ -1997,6 +2011,8 @@ pub struct View {
     pub cursor: Cursor,
     pub layout: Option<TextLayout>,
 
+    pub completion: CompletionState,
+
     pub overlay: crate::ts::OverlayState,
     pub persistent_state_per_buffer: FxHashMap<BufferId, ViewState>,
 }
@@ -2014,6 +2030,7 @@ impl View {
             cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: scroll,
             cursor_opacity: 1.0,
+            completion: Default::default(),
             persistent_state_per_buffer: Default::default(),
             overlay: Default::default(),
             panel_id: PanelId::reserved_value()  // Set on first layout
@@ -2152,6 +2169,54 @@ impl View {
     #[inline]
     pub fn line_to_screen_y(&self, line: u32, rect: Rect, line_h: f32) -> f32 {
         rect.y + line as f32 * line_h - self.scroll
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CompletionState {
+    pub active:          bool,
+    pub prefix:          Box<str>,
+    pub prefix_start:    usize,  // Char index where prefix starts
+    pub items:           Vec<CompletionItem>,
+    pub selected:        usize,
+    pub ghost_text:      Option<Box<str>>, // Suffix to display after cursor
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletionItem {
+    pub name:   Atom,
+    pub detail: Box<str>,
+    pub kind:   CompletionItemKind,
+    pub score:  u32,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum CompletionItemKind {
+    Function,
+    Struct,
+    Enum,
+    EnumVariant,
+    Trait,
+    TypeAlias,
+    Const,
+    Static,
+    Mod,
+    Local
+}
+
+impl From<SymbolKind> for CompletionItemKind {
+    fn from(k: SymbolKind) -> Self {
+        match k {
+            SymbolKind::Struct      => CompletionItemKind::Struct,
+            SymbolKind::Enum        => CompletionItemKind::Enum,
+            SymbolKind::EnumVariant => CompletionItemKind::EnumVariant,
+            SymbolKind::Trait       => CompletionItemKind::Trait,
+            SymbolKind::TypeAlias   => CompletionItemKind::TypeAlias,
+            SymbolKind::Const       => CompletionItemKind::Const,
+            SymbolKind::Static      => CompletionItemKind::Static,
+            SymbolKind::Mod         => CompletionItemKind::Mod,
+            SymbolKind::Local       => CompletionItemKind::Local,
+        }
     }
 }
 
@@ -2577,8 +2642,8 @@ impl Editor {
 
             let (view, buf) = self.active_view_and_buffer_mut();
 
-            let needs_cursor_query = !buf.ts_edits_in_this_frame.is_empty()
-                || char_index as u32 != last_pos;
+            let has_cursor_moved = char_index as u32 != last_pos;
+            let needs_cursor_query = !buf.ts_edits_in_this_frame.is_empty() || has_cursor_moved;
 
             for edit in &buf.ts_edits_in_this_frame {
                 view.overlay.on_edit(&edit);
@@ -2588,6 +2653,8 @@ impl Editor {
                 view.overlay.current = None;
             }
 
+            //
+            // Function overlay
             //
             // Query only after local invalidation
             //
@@ -2601,6 +2668,38 @@ impl Editor {
                     redraw |= true;
                 } else {
                     redraw |= true;
+                }
+            }
+
+            //
+            // Completions
+            //
+            {
+                let (view, buf) = self.active_view_and_buffer_mut();
+                if view.completion.active {
+                    let (start, current_prefix) = extract_prefix_at_cursor(buf, view.cursor.char_index);
+                    if start != view.completion.prefix_start
+                    || !current_prefix.starts_with(view.completion.prefix.as_ref())
+                    {
+                        view.completion = CompletionState::default();
+                        redraw |= true;
+                    }
+                }
+
+                if has_cursor_moved {
+                    let view_id = self.active_view_id();
+                    let view = &mut self.views[view_id];
+                    let buffer_id   = view.buffer_id;
+                    let buf = &self.buffers[buffer_id];
+                    let tree_ref = self.tree_sitter.trees.get(&buffer_id);
+                    update_ghost_text_from_keystroke(
+                        view,
+                        tree_ref.as_ref().map(|t| &t.tree),
+                        buf,
+                        &self.tree_sitter.symbol_table,
+                        &self.tree_sitter.func_table,
+                        &self.tree_sitter.atom_table,
+                    );
                 }
             }
         }
@@ -2623,9 +2722,11 @@ impl Editor {
 
         // @Cleanup :TreeSitter
         while let Ok(result) = self.tree_sitter.result.try_recv() {
-            let buffer_filename = self.buffers[result.buffer_id].filestem_atom;
-            if let ParseResultKind::FunctionsUpdate { functions } = result.kind {
-                self.tree_sitter.func_table.insert_batch(functions, buffer_filename);
+            let buffer_stem = self.buffers[result.buffer_id].filestem_atom;
+            if let ParseResultKind::SymbolsUpdate { functions, symbols } = result.kind {
+                self.tree_sitter.func_table.replace_buffer_batch(result.buffer_id, buffer_stem, functions);
+                self.tree_sitter.symbol_table.replace_buffer(result.buffer_id, symbols);
+
                 continue;
             }
 
@@ -3968,9 +4069,9 @@ pub fn does_view_need_layout_rebuild(
     let is_dirty = editor.buffers[buffer].is_dirty || editor.views[view].layout.as_ref().map(|l| {
         let layout_rect = l.rect;
 
-        anim_first < l.first_buffer_line
+        anim_first < l.first_buffer_line_including_prelex
             || (
-                anim_first + screen_lines > l.first_buffer_line + l.lines.len() as u32
+                anim_first + screen_lines > l.first_buffer_line_including_prelex + l.lines.len() as u32
                     && screen_lines < l.lines.len() as u32
             )
             || (layout_rect.w - rect.w).abs() > 0.5
@@ -4025,4 +4126,213 @@ pub fn open_initial_buffer(editor: &mut Editor) {
     if let Some(p) = canon {
         editor.canonicalized_path_to_buffer_id.insert(p.into(), buffer_id);
     }
+}
+
+pub fn update_ghost_text_from_keystroke(
+    view:       &mut View,
+    tree:       Option<&Tree>,
+    buf:        &Buffer,
+    symbol_table:  &SymbolTable,
+    func_table: &FunctionTable,
+    atom_table: &AtomTable,
+) {
+    if view.completion.active {
+        return;  // Dropdown takes priority
+    }
+
+    let (start, prefix) = extract_prefix_at_cursor(buf, view.cursor.char_index);
+    if prefix.len() < 2 { view.completion.ghost_text = None; return; }
+
+    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
+    let items = query_completions(
+        &prefix,
+        symbol_table,
+        func_table,
+        atom_table,
+        view.buffer_id,
+        cursor_byte,
+        tree,
+        &buf.text,
+        24,
+    );
+
+    if items.is_empty() { view.completion.ghost_text = None; return; }
+
+    let name_str = atom_table.lookup_ref(items[0].name);
+    view.completion.ghost_text = if items.len() == 1 && name_str.as_ref() != prefix {
+        Some(name_str.as_ref()[prefix.len()..].into())
+    } else {
+        None
+    };
+    view.completion.prefix_start = start;
+    view.completion.prefix = prefix.into();
+}
+
+pub fn render_completion_dropdown(gpu: &mut Gpu, editor: &Editor, view_id: ViewId) { // @PaletteRefactor @Cleanup
+    let view   = &editor.views[view_id];
+    let buf    = &editor.buffers[view.buffer_id];
+    let comp   = &view.completion;
+
+    if !comp.active || comp.items.is_empty() { return; }
+
+    let font_size    = editor.font_size();
+    let line_h       = editor.line_h();
+    let scale        = editor.scale;
+    let pad_x        = 8.0 * scale;
+    let pad_y        = 3.0 * scale;
+    let item_h       = (font_size + pad_y * 2.0).round();
+    let detail_font  = font_size * 0.80;
+    let max_items    = 8usize;
+    let visible      = comp.items.len().min(max_items);
+    let sep          = scale.max(1.0);
+    let p            = palette();
+
+    // Measure widest name + detail to size the panel
+    let mut max_name_w   = 0.0f32;
+    let mut max_detail_w = 0.0f32;
+    for item in comp.items.iter().take(visible) { // @Speed
+        max_name_w   = max_name_w.max(gpu::measure_text(gpu, &editor.tree_sitter.atom_table.lookup_ref(item.name),   font_size));
+        max_detail_w = max_detail_w.max(gpu::measure_text(gpu, &item.detail, detail_font));
+    }
+    let max_detail_col_w = 120.0 * scale;  // Fixed cap for detail column
+    let name_col_w       = (max_name_w + font_size * 0.7 + pad_x * 2.0).min(200.0 * scale);
+    let panel_w          = (name_col_w + max_detail_col_w + pad_x)
+        .ceil()
+        .min(gpu.win_w * 0.35);  // Never wider than 35% of screen @Tune
+    let panel_h = (item_h * visible as f32 + sep).ceil();
+
+    // Anchor to cursor position
+    let layout = match &editor.views[view_id].layout {
+        Some(l) => l,
+        None    => return,
+    };
+    let (cursor_line, cursor_col) = buf.cursor_line_col(&view.cursor);
+    let Some(ll) = layout.line_for_buffer_line(cursor_line) else { return };
+
+    let padding_left = padding_left(layout.should_pad_left_when_rendering);
+    let origin_x = layout.rect.x + padding_left - view.scroll_anim_x;
+
+    let first_buffer_line = (view.scroll_anim.round() / line_h).floor() as u32;
+    let cursor_x = ll.x_for_col(origin_x, cursor_col, &layout.glyphs);
+    let cursor_y = layout.rect.y
+        + (cursor_line as f32 - first_buffer_line as f32) * line_h;
+
+    // Position below cursor, flip up if too close to bottom
+    let mut px = cursor_x;
+    let mut py = cursor_y + line_h + 2.0 * scale;
+    if py + panel_h > gpu.win_h - 8.0 * scale {
+        py = cursor_y - panel_h - 2.0 * scale;
+    }
+    if px + panel_w > gpu.win_w - 8.0 * scale {
+        px = gpu.win_w - panel_w - 8.0 * scale;
+    }
+
+    //
+    // Background
+    //
+    gpu::draw_rect(gpu, px, py, panel_w, panel_h, Color::rgba(13, 10, 6, 245));
+    gpu::draw_rect_outline(gpu, px, py, panel_w, panel_h, sep, p.lister_border);
+
+    //
+    //
+    // Items
+    //
+    //
+
+    gpu::push_clip(gpu, px, py, panel_w, panel_h);
+    for (slot, item) in comp.items.iter().take(visible).enumerate() {
+        let iy          = py + slot as f32 * item_h;
+        let is_selected = slot == comp.selected;
+
+        if slot % 2 == 0 {
+            gpu::draw_rect(gpu, px, iy, panel_w, item_h, Color::rgba(255, 255, 255, 4));
+        }
+
+        if is_selected {
+            gpu::draw_rect(gpu, px, iy, panel_w, item_h,
+                Color::rgba(60, 12, 14, 220));
+            gpu::draw_rect_gradient_h(gpu, px, iy, panel_w, item_h,
+                Color::rgba(220, 15, 25, 40),
+                Color::rgba(220, 15, 25, 0));
+            gpu::draw_rect(gpu, px, iy, sep * 3.0, item_h, p.lister_accent);
+        }
+
+        let ty = iy + item_h * 0.5 + font_size * 0.35;
+
+        //
+        // Kind icon @Design?
+        //
+        let kind_color = kind_color(item.kind);
+        gpu::draw_rect(gpu, px + pad_x, iy + item_h * 0.5 - font_size * 0.35,
+            font_size * 0.55, font_size * 0.75, kind_color);
+
+        //
+        // Name
+        //
+        gpu::draw_text(
+            gpu, &editor.tree_sitter.atom_table.lookup_ref(item.name),
+            px + pad_x + font_size * 0.7,
+            ty, font_size,
+            if is_selected { Color::rgba(255, 200, 200, 255) }
+            else           { Color::rgba(200, 190, 165, 220) }
+        );
+
+        //
+        // Detail
+        //
+        let detail = trim_detail(&item.detail, max_detail_col_w - pad_x, detail_font, gpu);
+        let detail_w = gpu::measure_text(gpu, &detail, detail_font);
+        gpu::draw_text(
+            gpu, &item.detail,
+            px + panel_w - pad_x - detail_w,
+            ty, detail_font,
+            if is_selected { Color::rgba(180, 80, 85, 200) }
+            else           { Color::rgba(110, 95, 70, 150) }
+        );
+    }
+    gpu::pop_clip(gpu);
+
+    // Scrollbar if more items than visible
+    if comp.items.len() > max_items {
+        let total_h  = comp.items.len() as f32 * item_h;
+        let thumb_h  = (panel_h * (panel_h / total_h)).max(sep * 4.0);
+        let thumb_y  = py + (comp.selected as f32 / comp.items.len() as f32) * (panel_h - thumb_h);
+        gpu::draw_rect(gpu, px + panel_w - sep * 3.0, py, sep * 3.0, panel_h, Color::rgba(200, 20, 30, 12));
+        gpu::draw_rect(gpu, px + panel_w - sep * 3.0, thumb_y, sep * 3.0, thumb_h, Color::rgba(180, 20, 30, 130));
+    }
+}
+
+const fn kind_color(kind: CompletionItemKind) -> Color {
+    match kind {
+        CompletionItemKind::Function    => Color::rgba(86,  156, 214, 200), // blue
+        CompletionItemKind::Struct      => Color::rgba(78,  201, 176, 200), // teal
+        CompletionItemKind::Enum        => Color::rgba(184, 215, 163, 200), // green
+        CompletionItemKind::EnumVariant => Color::rgba(150, 200, 140, 200),
+        CompletionItemKind::Trait       => Color::rgba(184, 160, 220, 200), // purple
+        CompletionItemKind::TypeAlias   => Color::rgba(78,  201, 176, 180),
+        CompletionItemKind::Const       => Color::rgba(220, 220, 170, 200), // yellow
+        CompletionItemKind::Static      => Color::rgba(200, 200, 150, 180),
+        CompletionItemKind::Mod         => Color::rgba(200, 140, 80,  200), // orange
+        CompletionItemKind::Local => Color::rgba(156, 220, 254, 200), // light blue
+    }
+}
+
+fn trim_detail<'a>(detail: &'a str, max_w: f32, font_size: f32, gpu: &mut Gpu) -> Cow<'a, str> {
+    let w = gpu::measure_text(gpu, detail, font_size);
+    if w <= max_w { return detail.into(); }
+
+    let ellipsis = "…";
+    let ew = gpu::measure_text(gpu, ellipsis, font_size);
+
+    let mut out = String::new();
+    let mut cur_w = 0.0f32;
+    for c in detail.chars() {
+        let cw = gpu::get_glyph(gpu, c, font_size).map(|g| g.advance).unwrap_or(font_size * 0.6);
+        if cur_w + cw + ew > max_w { break; }
+        out.push(c);
+        cur_w += cw;
+    }
+    out.push('…');
+
+    out.into()
 }

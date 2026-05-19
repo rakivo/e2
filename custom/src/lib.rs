@@ -10,6 +10,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod lsp;
 
+use editor::ts::{TreeSitter, extract_prefix_at_cursor, query_completions};
 use editor::ui::{Axis, BoxCustom, BoxRef, ListerItemInfo, Size};
 use lsp::*;
 
@@ -2091,6 +2092,141 @@ pub fn indent_region(cx: &mut CommandContext) {  // :BufferScratch
     buf.reset_buffer_to(reindented.into(), &mut view.cursor);
 }
 
+#[inline]
+fn update_ghost_text(state: &mut CompletionState, tree_sitter: &TreeSitter) {
+    if !state.active || state.items.is_empty() {
+        state.ghost_text = None;
+        return;
+    }
+
+    let selected = &state.items[state.selected];
+
+    //
+    // Ghost text is the suffix after the prefix
+    //
+    let selected_name = tree_sitter.atom_table.lookup_ref(selected.name);
+    if selected_name.starts_with(state.prefix.as_ref()) {
+        state.ghost_text = Some(selected_name[state.prefix.len()..].into());
+    } else {
+        state.ghost_text = None;
+    }
+}
+
+#[command]
+pub fn completion_next(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    let cursor = view.cursor.char_index;
+
+    if !view.completion.active {
+        //
+        // Open completion
+        //
+        let (start, prefix) = extract_prefix_at_cursor(buf, cursor);
+        if prefix.is_empty() { return }
+
+        let text = buf.text.clone();
+        let buffer_id = view.buffer_id;
+        let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
+        let tree_ref = cx.editor.tree_sitter.trees.get(&buffer_id);
+        let items = query_completions(
+            &prefix,
+            &cx.editor.tree_sitter.symbol_table,
+            &cx.editor.tree_sitter.func_table,
+            &cx.editor.tree_sitter.atom_table,
+            buffer_id,
+            cursor_byte,
+            tree_ref.as_deref().map(|t| &t.tree),
+            &text,
+            24,
+        );
+        drop(tree_ref);
+
+        if items.is_empty() { return; }
+
+        let (view, _buf) = cx.editor.active_view_and_buffer_mut();
+        view.completion = CompletionState {
+            active:       true,
+            prefix:       prefix.into(),
+            prefix_start: start,
+            selected:     0,
+            ghost_text:   None,
+            items,
+        };
+    } else {
+        // cycle forward
+        let len = view.completion.items.len();
+        view.completion.selected = (view.completion.selected + 1) % len;
+    }
+
+    let view_id = cx.editor.active_view_id();
+    let view = &mut cx.editor.views[view_id];
+    update_ghost_text(&mut view.completion, &cx.editor.tree_sitter);
+}
+
+#[command]
+pub fn completion_prev(cx: &mut CommandContext) {
+    let (view, _buf) = cx.editor.active_view_and_buffer_mut();
+    if !view.completion.active { return; }
+
+    let view_id = cx.editor.active_view_id();
+    let view = &mut cx.editor.views[view_id];
+    let len = view.completion.items.len();
+    view.completion.selected = view.completion.selected.checked_sub(1).unwrap_or(len - 1);
+    update_ghost_text(&mut view.completion, &cx.editor.tree_sitter);
+}
+
+// @Incomplete:
+//
+// For example if i type: `tokeN_`, then I select `token_cursor` completion,
+// its gonna not only just append, but replace whole thing,
+// so that `tokeN_` becomes `token_`.
+//
+#[command]
+pub fn completion_confirm(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    if !view.completion.active {
+        if let Some(ghost) = &view.completion.ghost_text {
+            if !ghost.is_empty() {
+                buf.insert_literal(ghost, &mut view.cursor);
+                view.completion.ghost_text = None;
+            }
+        }
+
+        return;
+    }
+
+    let view_id = cx.editor.active_view_id();
+    let view = &mut cx.editor.views[view_id];
+
+    let item = &view.completion.items[view.completion.selected];
+    let full_name = cx.editor.tree_sitter.atom_table.lookup_ref(item.name).to_owned();
+    let prefix_start = view.completion.prefix_start;
+    let cursor = view.cursor.char_index;
+
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    // Replace prefix_start..cursor with full_name
+    buf.text.remove(prefix_start..cursor);
+    let mut insert_at = prefix_start;
+    for c in full_name.chars() {
+        buf.text.insert_char(insert_at, c);
+        insert_at += 1;
+    }
+    view.cursor.char_index    = insert_at;
+    view.cursor.preferred_col = None;
+    buf.is_dirty = true;
+    buf.last_edit_generation += 1;
+
+    view.completion = CompletionState::default();
+}
+
+#[command]
+pub fn completion_dismiss(cx: &mut CommandContext) {
+    let (view, _) = cx.editor.active_view_and_buffer_mut();
+    view.completion = CompletionState::default();
+}
+
 #[command]
 pub fn save_session(cx: &mut CommandContext) {
     let path = default_session_path();
@@ -2216,6 +2352,10 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::alt('{'), cx.command_table.intern("move_backward_paragraph"));   // nocheckin
     cx.keymap.bind(KeyCombo::alt('}'), cx.command_table.intern("move_forward_paragraph"));    // nocheckin
     cx.keymap.bind(KeyCombo::alt('k'), cx.command_table.intern("kill_paragraph_forward"));    // nocheckin
+
+    cx.keymap.bind(KeyCombo::alt('['), cx.command_table.intern("completion_prev"));   // nocheckin
+    cx.keymap.bind(KeyCombo::alt(']'), cx.command_table.intern("completion_next"));   // nocheckin
+    cx.keymap.bind(KeyCombo::named_alt(NamedKey::Tab), cx.command_table.intern("completion_confirm"));   // nocheckin
 
     setup_hooks(cx);
     editor_initialize_custom_data(cx.editor, cx.gpu);
