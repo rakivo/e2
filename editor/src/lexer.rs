@@ -545,24 +545,33 @@ pub fn lex_from(
 
             C_TICK => {
                 //
-                // Scan forward to find a closing ' OR a newline on this line
+                // Scan forward to find a closing ' OR a newline
                 //
 
                 let mut j = i + 1;
                 let mut found_closing_quote = false;
 
-                while j < len && bytes[j] != b'\n' {
-                    if bytes[j] == b'\'' {
+                while j < len {
+                    let c = bytes[j];
+
+                    if c == b'\'' {
                         found_closing_quote = true;
                         j += 1;
                         break;
                     }
 
-                    if bytes[j] == b'\\' {
-                        j += 1; // Consume backslash
-                        if i < len {
-                            j += 1; // Consume escaped char only if it's in this buffer
+                    if c == b'\n' {
+                        break;
+                    }
+
+                    if c == b'\\' {
+                        j += 1;  // Consume backslash
+
+                        if j < len {
+                            j += 1;
                         }
+
+                        continue;
                     }
 
                     j += 1;
