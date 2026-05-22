@@ -404,10 +404,8 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
         editor.buffers[buf_id].is_dirty          = true;
 
         {
-            let rect = editor.panels[editor.active_panel].rect;
-            let max_scroll = editor.max_scroll_of_impl(total_lines, rect);
-            let scroll     = (sv.scroll_anim / line_h).round() * line_h;
-            let scroll     = scroll.clamp(0.0, max_scroll);
+            let scroll = (sv.scroll_anim / line_h).round() * line_h;
+            let scroll = scroll.max(0.0);
 
             editor.views[view_id].scroll      = scroll;
             editor.views[view_id].scroll_anim = scroll;

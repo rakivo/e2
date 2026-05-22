@@ -1918,6 +1918,7 @@ pub fn scope_end_byte(node: Node) -> usize {
             return child.end_byte().saturating_sub(1);
         }
     }
+
     node.end_byte().saturating_sub(1)
 }
 
@@ -1949,9 +1950,10 @@ pub fn ascend_to_next_sibling(mut node: Node) -> Option<Node> {
 // This is the reverse pre-order: prev sibling's rightmost leaf, then parent.
 pub fn prev_node<'a>(node: Node<'a>) -> Option<Node<'a>> {
     if let Some(sib) = node.prev_sibling() {
-        // rightmost leaf of the previous sibling
+        // Rightmost leaf of the previous sibling
         return Some(rightmost_leaf(sib));
     }
+
     node.parent()
 }
 

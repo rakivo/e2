@@ -4,7 +4,6 @@ use cranelift_entity::{PrimaryMap, entity_impl};
 use indexmap::IndexMap;
 use libloading::Library;
 use rustc_hash::FxHashMap;
-use winit::{event::KeyEvent, keyboard::{Key, KeyCode, NamedKey, PhysicalKey}};
 
 use crate::{Editor, Hooks, gpu::Gpu};
 
@@ -17,8 +16,9 @@ pub struct CommandContext<'a> {
 
     pub dont_reset_blink: bool,
 
-    // @Cleanup: This shouldn't take in KeyEvent, make our own thing
-    pub event_and_mods: Option<(&'a KeyEvent, Mods)>,
+    pub text_input_char: Option<char>,
+
+    pub key_input: Option<KeyInput>,
 }
 
 impl<'a> CommandContext<'a> {
@@ -143,11 +143,10 @@ impl CommandTable {
     }
 }
 
-#[derive(Hash, PartialEq, Eq, Clone)]
-pub enum KeyCombo {
-    Named(NamedKey, Mods),
-    Char(char, Mods),
-    Physical(KeyCode, Mods),
+#[derive(Debug, Clone, Copy)]
+pub enum ScrollDelta {
+    Lines(f32, f32),  // (x, y) - y positive => scroll up/away
+    Pixels(f32, f32),
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, Default)]
@@ -158,13 +157,89 @@ pub struct Mods {  // @Memory: Make Mods bitflags
 }
 
 impl Mods {
-    pub fn ctrl()            -> Self { Self { ctrl:  true, ..Default::default() } }
-    pub fn alt()             -> Self { Self { alt:   true, ..Default::default() } }
-    pub fn shift()           -> Self { Self { shift: true, ..Default::default() } }
-    pub fn ctrl_and_shift()  -> Self { Self { ctrl:  true, shift: true, ..Default::default() } }
-    pub fn ctrl_and_alt()    -> Self { Self { ctrl:  true, alt:   true, ..Default::default() } }
-    pub fn alt_and_shift()   -> Self { Self { alt:   true, shift: true, ..Default::default() } }
-    pub fn ctrl_alt_shift()  -> Self { Self { ctrl:  true, alt:   true, shift: true, ..Default::default() } }
+    #[inline] pub fn ctrl()            -> Self { Self { ctrl:  true, ..Default::default() } }
+    #[inline] pub fn alt()             -> Self { Self { alt:   true, ..Default::default() } }
+    #[inline] pub fn shift()           -> Self { Self { shift: true, ..Default::default() } }
+    #[inline] pub fn ctrl_and_shift()  -> Self { Self { ctrl:  true, shift: true, ..Default::default() } }
+    #[inline] pub fn ctrl_and_alt()    -> Self { Self { ctrl:  true, alt:   true, ..Default::default() } }
+    #[inline] pub fn alt_and_shift()   -> Self { Self { alt:   true, shift: true, ..Default::default() } }
+    #[inline] pub fn ctrl_alt_shift()  -> Self { Self { ctrl:  true, alt:   true, shift: true, ..Default::default() } }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KeyInput {
+    pub logical:  LogicalKey,
+    pub physical: Option<PhysicalKey>,
+    pub mods:     Mods,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum LogicalKey {
+    Char(char),    // Printable, shift already applied
+    Named(NamedKey),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NamedKey {
+    //
+    // Navigation
+    //
+    Left, Right, Up, Down,
+    Home, End,
+    PageUp, PageDown,
+
+    //
+    // Editing
+    //
+    Enter,
+    Backspace,
+    Delete,
+    Tab,
+    Escape,
+    Insert,
+    Space,  // Bound separately so Ctrl+Space works as a combo
+
+    //
+    // Function keys
+    //
+    F1,  F2,  F3,  F4,
+    F5,  F6,  F7,  F8,
+    F9,  F10, F11, F12,
+}
+
+/// Physical key position - layout-independent, used for fallback bindings
+/// Only keys a code editor would plausibly bind by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhysicalKey {
+    A, B, C, D, E, F, G, H, I, J, K, L, M,
+    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+
+    N0, N1, N2, N3, N4, N5, N6, N7, N8, N9,  // Top row digits
+
+    Minus, Equals,
+    LeftBracket, RightBracket,
+    Backslash, Semicolon, Apostrophe,
+    Grave, Comma, Period, Slash,
+
+    //
+    // Numpad
+    //
+    Kp0, Kp1, Kp2, Kp3, Kp4,
+    Kp5, Kp6, Kp7, Kp8, Kp9,
+    KpPlus, KpMinus, KpMultiply, KpDivide, KpEnter, KpPeriod,
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+pub enum KeyCombo {
+    /// Printable character, layout-dependent. Shift already baked into the char.
+    /// Shift is stripped from Mods so Alt+Shift+, can bind to Alt+'<'.
+    Char(char, Mods),
+
+    /// Non-printable named key.
+    Named(NamedKey, Mods),
+
+    /// Physical position fallback - same key regardless of keyboard layout.
+    Physical(PhysicalKey, Mods),
 }
 
 impl KeyCombo {
@@ -197,15 +272,15 @@ impl KeyCombo {
     //
     // Physical variants
     //
-    pub fn physical(k: KeyCode)                   -> Self { Self::Physical(k, Mods::default()) }
-    pub fn physical_mods(k: KeyCode, mods: Mods) -> Self { Self::Physical(k, mods) }
-    pub fn physical_ctrl(k: KeyCode)              -> Self { Self::Physical(k, Mods::ctrl()) }
-    pub fn physical_alt(k: KeyCode)               -> Self { Self::Physical(k, Mods::alt()) }
-    pub fn physical_shift(k: KeyCode)             -> Self { Self::Physical(k, Mods::shift()) }
-    pub fn physical_ctrl_shift(k: KeyCode)        -> Self { Self::Physical(k, Mods::ctrl_and_shift()) }
-    pub fn physical_ctrl_alt(k: KeyCode)          -> Self { Self::Physical(k, Mods::ctrl_and_alt()) }
-    pub fn physical_alt_shift(k: KeyCode)         -> Self { Self::Physical(k, Mods::alt_and_shift()) }
-    pub fn physical_ctrl_alt_shift(k: KeyCode)    -> Self { Self::Physical(k, Mods::ctrl_alt_shift()) }
+    pub fn physical(k: PhysicalKey)                   -> Self { Self::Physical(k, Mods::default()) }
+    pub fn physical_mods(k: PhysicalKey, mods: Mods) -> Self { Self::Physical(k, mods) }
+    pub fn physical_ctrl(k: PhysicalKey)              -> Self { Self::Physical(k, Mods::ctrl()) }
+    pub fn physical_alt(k: PhysicalKey)               -> Self { Self::Physical(k, Mods::alt()) }
+    pub fn physical_shift(k: PhysicalKey)             -> Self { Self::Physical(k, Mods::shift()) }
+    pub fn physical_ctrl_shift(k: PhysicalKey)        -> Self { Self::Physical(k, Mods::ctrl_and_shift()) }
+    pub fn physical_ctrl_alt(k: PhysicalKey)          -> Self { Self::Physical(k, Mods::ctrl_and_alt()) }
+    pub fn physical_alt_shift(k: PhysicalKey)         -> Self { Self::Physical(k, Mods::alt_and_shift()) }
+    pub fn physical_ctrl_alt_shift(k: PhysicalKey)    -> Self { Self::Physical(k, Mods::ctrl_alt_shift()) }
 }
 
 pub struct Keymap {
@@ -234,10 +309,10 @@ impl Keymap {
         let mut km = Self::empty(table);
 
         // Movement
-        km.bind(KeyCombo::named(ArrowLeft),  table.intern("move_left"));
-        km.bind(KeyCombo::named(ArrowRight), table.intern("move_right"));
-        km.bind(KeyCombo::named(ArrowUp),    table.intern("move_up"));
-        km.bind(KeyCombo::named(ArrowDown),  table.intern("move_down"));
+        km.bind(KeyCombo::named(Left),  table.intern("move_left"));
+        km.bind(KeyCombo::named(Right), table.intern("move_right"));
+        km.bind(KeyCombo::named(Up),    table.intern("move_up"));
+        km.bind(KeyCombo::named(Down),  table.intern("move_down"));
         km.bind(KeyCombo::named(Home),       table.intern("move_line_start"));
         km.bind(KeyCombo::named(End),        table.intern("move_line_end"));
         km.bind(KeyCombo::named(Tab),        table.intern("tab"));
@@ -304,34 +379,28 @@ impl Keymap {
         self.bindings.insert(key, cmd.into());
     }
 
-    pub fn lookup(&self, event: &KeyEvent, mods: Mods) -> Option<CommandAtom> {
-        let (combo, mods) = match &event.logical_key {
-            Key::Named(k) => (KeyCombo::Named(k.clone(), mods), mods),
-            Key::Character(s) => {
-                let c = s.chars().next()?;
+    pub fn lookup(&self, key: &KeyInput) -> Option<CommandAtom> {
+        let (combo, mods) = match &key.logical {
+            LogicalKey::Named(k) => (KeyCombo::Named(*k, key.mods), key.mods),
 
+            LogicalKey::Char(c) => {
                 //
                 // Shift is baked into the character already; strip it from mods
                 // so Alt+Shift+, matches a binding on Alt+'<'
                 //
-                let char_mods = Mods { shift: false, ..mods };
+                let char_mods = Mods { shift: false, ..key.mods };
 
-                (KeyCombo::Char(c, char_mods), char_mods)
+                (KeyCombo::Char(*c, char_mods), char_mods)
 
             }
-            _ => return None,
         };
 
         //
         // Check explicit binding first
         //
-        let found = self.bindings.get(&combo).or_else(|| {
-            if let PhysicalKey::Code(code) = event.physical_key {
-                self.bindings.get(&KeyCombo::Physical(code, mods))
-            } else {
-                None
-            }
-        }).copied();
+        let found = self.bindings.get(&combo)
+            .or_else(|| key.physical.map(|p| self.bindings.get(&KeyCombo::Physical(p, key.mods))).flatten())
+            .copied();
 
         if found.is_some() {
             return found;
@@ -341,16 +410,11 @@ impl Keymap {
         // For named keys (non-printable), fall back to unshifted version
         //
         if mods.shift {
-            if let Key::Named(k) = &event.logical_key {
-                let unshifted = Mods { shift: false, ..mods };
-                let unshifted_combo = KeyCombo::Named(k.clone(), unshifted);
-                let found = self.bindings.get(&unshifted_combo).or_else(|| {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        self.bindings.get(&KeyCombo::Physical(code, unshifted))
-                    } else {
-                        None
-                    }
-                }).copied();
+            if let LogicalKey::Named(k) = &key.logical {
+                let unshifted = Mods { shift: false, ..key.mods };
+                let found = self.bindings.get(&KeyCombo::Named(*k, unshifted))
+                    .or_else(|| key.physical.map(|p| self.bindings.get(&KeyCombo::Physical(p, unshifted))).flatten())
+                    .copied();
 
                 if found.is_some() {
                     return found;
@@ -361,8 +425,8 @@ impl Keymap {
         //
         // Fall back to basic_character for printable input
         //
-        match &event.logical_key {
-            Key::Character(_) | Key::Named(NamedKey::Space) => Some(self.basic_character_atom),
+        match &key.logical {
+            LogicalKey::Char(_) | LogicalKey::Named(NamedKey::Space) => Some(self.basic_character_atom),
             _ => None,
         }
     }

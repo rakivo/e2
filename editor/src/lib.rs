@@ -30,11 +30,18 @@ pub mod tracy;
 pub mod director;
 pub mod lexer;
 pub mod session;
-pub mod audioer;
 pub mod messager;
 pub mod ts;
 pub mod atum;
 pub mod ui;
+
+#[cfg(feature = "audioer")]
+pub mod audioer;
+
+#[cfg(not(feature = "audioer"))]
+pub mod audioer_blank;
+#[cfg(not(feature = "audioer"))]
+pub use audioer_blank as audioer;
 
 use atum::{Atom, AtomTable};
 use audioer::Audioer;
@@ -65,7 +72,6 @@ use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use smallstr::SmallString;
 use smallvec::SmallVec;
-use winit::window::Window;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 macro_rules! hooks {
@@ -347,7 +353,7 @@ pub fn draw_metrics(editor: &Editor, gpu: &mut Gpu, refresh_rate_millihertz: u32
     let build  = editor.build_us;
     let relex  = editor.relex_us;
     let render = editor.render_us;
-    let frame  = build + relex + render;
+    let frame  = editor.frame_time_in_seconds * 1_000_000.0;
 
     let hud_y   = gpu.win_h - HUD_LINE_H * 5.0 - 10.0;
     let x_right = (gpu.win_w - PAD_RIGHT).clamp(0.0, f32::MAX);
@@ -691,6 +697,7 @@ pub struct TextLayout {
     pub font_size:         f32,
 
     pub first_buffer_line_including_prelex: u32,
+    pub  last_buffer_line_including_prelex: u32,
 
     pub rect: Rect,
 
@@ -1133,6 +1140,7 @@ pub fn build_text_layout(
         render_settings,
         glyph_insertion_ids: Default::default(),
         first_buffer_line_including_prelex: first_line,
+        last_buffer_line_including_prelex: last_line,
     }
 }
 
@@ -2228,6 +2236,18 @@ pub struct FlyingCursor {
     pub alpha:    f32,  // Fades out as it arrives
 }
 
+pub struct EditorConfig {
+    pub vsync: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            vsync: true
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct EditorLoggerConfig {
     pub log_checked_reserves: bool,
@@ -2351,6 +2371,7 @@ pub struct Editor {
     pub most_recently_used_buffers:  VecDeque<BufferId>,
     pub buffer_cycle_index:          Option<usize>,
 
+    pub config:        EditorConfig,
     pub logger_config: EditorLoggerConfig,
 
     pub tree_sitter: TreeSitter,
@@ -2371,7 +2392,7 @@ pub struct Editor {
     // Mouse
     pub mouse_pos:          (f32, f32),
     pub mouse_left_pressed: bool,
-    pub is_cursor_visible:  bool,
+    pub is_mouse_cursor_visible:  bool,
 
     pub clipboard:       Option<arboard::Clipboard>,
 
@@ -2381,10 +2402,11 @@ pub struct Editor {
 
     pub frame_count:     u32,
     pub fps:             f32,
+    pub fps_acc:         f32,
+    pub frame_time_in_seconds: f32,
 
     pub refresh_rate_millihertz: u32,
 
-    pub last_fps_time:   Instant,
     pub last_frame_time: Instant,
     pub last_input_time: Instant,
 
@@ -2458,6 +2480,7 @@ impl Editor {
             canonicalized_path_to_buffer_id,
             scratch_panel_bar: String::with_capacity(128),
             scratch_panel_bar_dim: String::with_capacity(128),
+            config: Default::default(),
             ui: UiState::new(0.0, 0.0),
             logger_config,
             hooks: Default::default(),
@@ -2466,7 +2489,8 @@ impl Editor {
             win_h: 0.0,
             win_w: 0.0,
             root_buffer,
-            is_cursor_visible: true,
+            fps_acc: 0.0,
+            is_mouse_cursor_visible: true,
             buffer_cycle_index: None,
             custom_data: EditorCustomData::default(),
             last_messager_count: u32::MAX,
@@ -2481,7 +2505,6 @@ impl Editor {
             mouse_left_pressed: false,
             frame_count:   0,
             flying_cursor: None,
-            last_fps_time: Instant::now(),
             fps:           0.0,
             relex_us_acc:  0.0,
             build_us_acc:  0.0,
@@ -2499,6 +2522,7 @@ impl Editor {
             messager: Messager::new(),
             did_we_apply_any_sessions: false,
             redraw_reasons: Vec::with_capacity(64),
+            frame_time_in_seconds: 0.0,
             tree_sitter: crate::ts::spawn(),
         }
     }
@@ -2803,22 +2827,6 @@ impl Editor {
         if let Some(cb) = clipboard {
             _ = cb.set_text(text);
         }
-    }
-
-    #[inline]
-    pub fn hide_cursor(&mut self, win: &Window) {
-        if !self.is_cursor_visible { return }
-
-        self.is_cursor_visible = false;
-        win.set_cursor_visible(false);
-    }
-
-    #[inline]
-    pub fn show_cursor(&mut self, win: &Window) {
-        if self.is_cursor_visible { return }
-
-        self.is_cursor_visible = true;
-        win.set_cursor_visible(true);
     }
 
     pub fn view_and_buffer(&self, view_id: ViewId) -> (&View, &Buffer) {
@@ -3491,6 +3499,28 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
     let line_h  = editor.line_h();
     let active_view_id = editor.active_view_id();
 
+    //
+    // Clamp scroll to valid range before animating
+    //
+    for view_index in 0..editor.views.len() {  // @Robustness, @Cuntpaste from max_scroll_of
+        let view_id = ViewId::new(view_index);
+
+        let (view, buf) = editor.view_and_buffer(view_id);
+        let rect = if let Some(layout) = &view.layout {
+            layout.rect
+        } else if let Some(panel_id) = view.panel_id() {
+            editor.panel(panel_id).rect
+        } else {
+            continue;
+        };
+
+        let line_count = buf.text.len_lines();
+        let max_scroll = editor.max_scroll_of_impl(line_count as _, rect);
+
+        editor.views[view_id].scroll      = editor.views[view_id].scroll.clamp(0.0, max_scroll);
+        editor.views[view_id].scroll_anim = editor.views[view_id].scroll_anim.clamp(0.0, max_scroll);
+    }
+
     for view in editor.views.values_mut() {
         //
         //
@@ -4054,37 +4084,65 @@ pub fn open_buffer_from_path_in(editor: &mut Editor, view: ViewId, path: impl In
 
 pub fn does_view_need_layout_rebuild(
     editor: &Editor,
-
     view: ViewId, buffer: BufferId,
-
     rect: Rect,
 ) -> bool {
     let font_size    = editor.font_size();
     let line_h       = editor.line_h();
-
     let screen_lines = (rect.h / line_h) as u32;
+    let anim_first   = (editor.views[view].scroll_anim / line_h) as u32;
 
-    let anim_first = (editor.views[view].scroll_anim / line_h) as u32;
+    if editor.buffers[buffer].is_dirty {
+        // println!("dirty: buffer is_dirty");
+        return true;
+    }
 
-    let is_dirty = editor.buffers[buffer].is_dirty || editor.views[view].layout.as_ref().map(|l| {
-        let layout_rect = l.rect;
+    let Some(l) = editor.views[view].layout.as_ref() else {
+        // println!("dirty: no layout");
+        return true;
+    };
 
-        anim_first < l.first_buffer_line_including_prelex
-            || (
-                anim_first + screen_lines > l.first_buffer_line_including_prelex + l.lines.len() as u32
-                    && screen_lines < l.lines.len() as u32
-            )
-            || (layout_rect.w - rect.w).abs() > 0.5
-            || (layout_rect.h - rect.h).abs() > 0.5
-            || (l.font_size - font_size).abs() > 0.01
-    }).unwrap_or(true);
+    if anim_first < l.first_buffer_line_including_prelex {
+        // println!("dirty: scrolled above prelex (anim_first={} first_buffer_line={})", anim_first, l.first_buffer_line_including_prelex);
+        return true;
+    }
 
-    let is_custom_dirty = editor.hooks.does_view_need_layout_rebuild.map_or(
-        false,
-        |f| f(editor, view, buffer, rect)
-    );
+    if {
+        let total_lines = editor.buffers[buffer].text.len_lines() as u32;
 
-    is_dirty || is_custom_dirty
+        let p1 = anim_first + screen_lines > l.last_buffer_line_including_prelex;
+        let p2 = screen_lines < l.last_buffer_line_including_prelex;
+        let p3 = l.last_buffer_line_including_prelex < total_lines;
+
+        p1 && p2 && p3
+    } {
+        // println!("dirty: scrolled past end of layout");
+        return true;
+    }
+
+    if (l.rect.w - rect.w).abs() > 0.5 {
+        // println!("dirty: width changed ({} -> {})", l.rect.w, rect.w);
+        return true;
+    }
+
+    if (l.rect.h - rect.h).abs() > 0.5 {
+        // println!("dirty: height changed ({} -> {})", l.rect.h, rect.h);
+        return true;
+    }
+
+    if (l.font_size - font_size).abs() > 0.01 {
+        // println!("dirty: font size changed ({} -> {})", l.font_size, font_size);
+        return true;
+    }
+
+    if let Some(f) = editor.hooks.does_view_need_layout_rebuild {
+        if f(editor, view, buffer, rect) {
+            // println!("dirty: custom hook");
+            return true;
+        }
+    }
+
+    false
 }
 
 pub fn open_initial_buffer(editor: &mut Editor) {

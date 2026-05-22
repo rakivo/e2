@@ -7,13 +7,11 @@ use crate::color::{Color, GpuColor, lerp_color};
 
 use std::ffi::CStr;
 use std::ops::Range;
-use std::sync::Arc;
 
 use ash::vk;
 use smallvec::SmallVec;
-use winit::window::Window;
 use gpu_allocator::MemoryLocation;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{DisplayHandle, WindowHandle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
 
 pub const ATLAS_SIZE: u32          = 4096;
@@ -804,15 +802,17 @@ pub fn draw_text_for_editor(
 }
 
 impl Gpu {
-    pub fn new(window: Arc<Window>) -> Gpu {
-        unsafe { Self::new_impl(window) }
+    pub fn new(
+        window_w: u32, window_h: u32,
+        display_handle: DisplayHandle, window_handle: WindowHandle
+    ) -> Gpu {
+        unsafe { Self::new_impl(window_w, window_h, display_handle, window_handle) }
     }
 
-    unsafe fn new_impl(window: Arc<Window>) -> Gpu {
-        let size  = window.inner_size();
-        let win_w = size.width.max(1);
-        let win_h = size.height.max(1);
-
+    unsafe fn new_impl(
+        win_w: u32, win_h: u32,
+        display_handle: DisplayHandle, window_handle: WindowHandle
+    ) -> Gpu {
         //
         // Entry and instance
         //
@@ -823,7 +823,7 @@ impl Gpu {
         //
         // Surface extensions required by winit
         //
-        let display_handle = window.display_handle().unwrap().as_raw();
+        let display_handle = display_handle.as_raw();
         let surface_extensions = ash_window::enumerate_required_extensions(display_handle)
             .unwrap();
 
@@ -843,8 +843,8 @@ impl Gpu {
         let surface_ext = ash::khr::surface::Instance::new(&entry, &instance);
         let surface = ash_window::create_surface(
             &entry, &instance,
-            window.display_handle().unwrap().as_raw(),
-            window.window_handle().unwrap().as_raw(),
+            display_handle,
+            window_handle.as_raw(),
             None,
         ).unwrap();
 
@@ -1376,6 +1376,16 @@ unsafe fn create_swapchain(
         height: h.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
     };
 
+    let available_present_modes = surface_ext
+        .get_physical_device_surface_present_modes(pdev, surface)
+        .unwrap();
+
+    let present_mode = available_present_modes
+        .iter()
+        .copied()
+        .find(|&m| m == vk::PresentModeKHR::MAILBOX)
+        .unwrap_or(vk::PresentModeKHR::FIFO);
+
     let sc = sc_ext.create_swapchain(
         &vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
@@ -1388,7 +1398,7 @@ unsafe fn create_swapchain(
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(old),
 

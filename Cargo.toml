@@ -6,8 +6,8 @@ resolver = "2"
 editor = { path = "../editor" }
 editor-macros = { path = "../editor-macros" }
 
+raw-window-handle = "0.6"
 rustc-edit-distance = "0.1.0"
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 memchr = "2.8.0"
 cranelift-entity = "0.129.1"
 smallstr = { version = "0.3", features = ["union"], default-features = false }
@@ -74,3 +74,22 @@ debug = false
 strip = true
 debug-assertions = false
 overflow-checks = false
+
+# Want a small binary? Do this:
+# RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none" \
+#     cargo +nightly b \
+#         -Z build-std=std,panic_abort \
+#         -Z build-std-features= \
+#         --no-default-features \
+#         --profile=release-small \
+#         --target=x86_64-unknown-linux-gnu
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+codegen-units = 1
+lto = "fat"
+strip = true
+debug = 0
+overflow-checks = false
+debug-assertions = false

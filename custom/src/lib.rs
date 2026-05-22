@@ -20,11 +20,11 @@ use editor::color::Color;
 use editor::director::{EntryKind, ScanState};
 use editor::gpu::Gpu;
 use editor::session::{CustomChunkId, apply_session, default_session_path, load_session, pretty_path};
-use editor::command::{CommandContext, CommandEntry, CommandTable, KeyCombo, Keymap, LoadedLib, Mods};
+use editor::command::{CommandContext, CommandEntry, CommandTable, KeyCombo, KeyInput, Keymap, LoadedLib, LogicalKey, Mods};
 use editor::*;
 
 use editor_macros::{collect_commands, command, export};
-use memmap2::MmapOptions;
+use editor::command::{NamedKey};
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -35,11 +35,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::fmt::Write;
 
+use memmap2::MmapOptions;
 use smallvec::{SmallVec, smallvec};
 use smallstr::SmallString;
-use winit::event::KeyEvent;
 use cranelift_entity::EntityRef;
-use winit::keyboard::{Key, NamedKey};
 use cranelift_entity::packed_option::ReservedValue;
 
 pub const    LISTER_CUSTOM_CHUNK_ID: CustomChunkId = 42;
@@ -667,13 +666,7 @@ pub fn unset_anchor(cx: &mut CommandContext) {
 
 #[command]
 pub fn basic_character(cx: &mut CommandContext) {
-    let Some(c) = (match &cx.event_and_mods.map(|(e, _)| &e.logical_key) {
-        Some(Key::Character(s))           => s.chars().next(),
-        Some(Key::Named(NamedKey::Space)) => Some(' '),
-        _ => None,
-    }) else {
-        return
-    };
+    let Some(c) = cx.text_input_char else { return };
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     let cursor = &mut view.cursor;
@@ -2656,13 +2649,13 @@ fn setup_hooks(cx: &mut CommandContext) {
             return (false, false);
         }
 
-        let Some((event, mods)) = cx.event_and_mods else {
+        let Some(event) = cx.key_input else {
             return (false, false);
         };
 
         let lister = cx.editor.custom_data.lister_mut();
 
-        let result = lister.lister_key(event, mods);
+        let result = lister.lister_key(event);
         let is_selected = matches!(result, ListerKeyDispatch::Selected);
         match result {
             ListerKeyDispatch::Selected | ListerKeyDispatch::Close => {
@@ -3285,7 +3278,7 @@ pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
     let scale     = editor.scale;
     let font_size = editor.font_size();
     let line_h    = editor.line_h();
-    let is_mouse_cursor_hidden = editor.is_cursor_visible;
+    let is_mouse_cursor_hidden = editor.is_mouse_cursor_visible;
 
     let lister = editor.custom_data.lister_mut();
     if !lister.is_visible() { return; }
@@ -3429,8 +3422,14 @@ pub fn lister_rect(win_w: f32, win_h: f32, anim_w: f32, anim_h: f32, scale: f32)
     let tw = 1.0 - (1.0 - anim_w).powi(3);
     let th = 1.0 - (1.0 - anim_h).powi(3);
 
-    let panel_w = (win_w * 0.60 * scale).clamp(400.0 * scale, win_w * 0.85);
-    let panel_h = (win_h * 0.60).clamp(240.0 * scale, win_h * 0.80);
+    let panel_w = (win_w * 0.60 * scale).clamp(
+        (400.0 * scale).min(win_w * 0.85),
+        win_w * 0.85,
+    );
+    let panel_h = (win_h * 0.60).clamp(
+        (240.0 * scale).min(win_h * 0.80),
+        win_h * 0.80,
+    );
 
     let cx = win_w * 0.50;
     let cy = win_h * 0.48;
@@ -4105,21 +4104,21 @@ impl Lister {
         self.is_query_dirty = false;
     }
 
-    pub fn lister_key(&mut self, event: &KeyEvent, mods: Mods) -> ListerKeyDispatch {
+    pub fn lister_key(&mut self, event: KeyInput) -> ListerKeyDispatch {
         if !self.is_open() { return ListerKeyDispatch::None; }
 
-        let Mods { ctrl, alt, shift: _ } = mods;
+        let Mods { ctrl, alt, shift: _ } = event.mods;
 
-        match &event.logical_key {
-            Key::Named(NamedKey::Escape) => {
+        match &event.logical {
+            LogicalKey::Named(NamedKey::Escape) => {
                 ListerKeyDispatch::Close
             }
 
-            Key::Named(NamedKey::Enter) => {
+            LogicalKey::Named(NamedKey::Enter) => {
                 ListerKeyDispatch::Selected
             }
 
-            Key::Named(NamedKey::ArrowDown) => {
+            LogicalKey::Named(NamedKey::Down) => {
                 if self.selected_index + 1 < self.filtered.len() as u32 {
                     self.selected_index += 1;
                     self.scroll_to_selected();
@@ -4127,7 +4126,7 @@ impl Lister {
                 ListerKeyDispatch::Other
             }
 
-            Key::Named(NamedKey::ArrowUp) => {
+            LogicalKey::Named(NamedKey::Up) => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
                     self.scroll_to_selected();
@@ -4135,8 +4134,8 @@ impl Lister {
                 ListerKeyDispatch::Other
             }
 
-            Key::Character(s) if ctrl => match s.chars().next() {
-                Some('n') => {
+            LogicalKey::Char(c) if ctrl => match c {
+                'n' => {
                     if self.selected_index + 1 < self.filtered.len() as u32 {
                         self.selected_index += 1;
                         self.scroll_to_selected();
@@ -4145,7 +4144,7 @@ impl Lister {
                     ListerKeyDispatch::Other
                 }
 
-                Some('p') => {
+                'p' => {
                     if self.selected_index > 0 {
                         self.selected_index -= 1;
                         self.scroll_to_selected();
@@ -4154,25 +4153,26 @@ impl Lister {
                     ListerKeyDispatch::Other
                 }
 
-                Some('v') => {
+                'v' => {
                     let page = (self.list_h / self.item_h) as u32;
                     self.selected_index = (self.selected_index + page).min(self.filtered.len().saturating_sub(1) as u32);
                     self.scroll_to_selected();
                     ListerKeyDispatch::Other
                 }
 
-                Some('g') => ListerKeyDispatch::Close,
+                'g' => ListerKeyDispatch::Close,
 
                 _ => ListerKeyDispatch::None
             }
 
-            Key::Character(s) if alt => match s.chars().next() {
-                Some('v') => {
+            LogicalKey::Char(c) if alt => match c {
+                'v' => {
                     let page = (self.list_h / self.item_h) as u32;
                     self.selected_index = self.selected_index.saturating_sub(page);
                     self.scroll_to_selected();
                     ListerKeyDispatch::Other
                 }
+
                 _ => ListerKeyDispatch::None
             }
 

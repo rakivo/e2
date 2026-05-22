@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["wayland", "x11"]
+default = ["audioer", "wayland", "bundled"]
+
+bundled = ["sdl2/bundled"]
+static-link = ["sdl2/static-link"]
+
+audioer = ["editor/audioer", "custom/audioer"]
+
+wayland = ["editor/wayland-data-control"]
 
 # profiling
 tracy = ["tracy-client/enable"]
@@ -13,9 +20,6 @@ tracy = ["tracy-client/enable"]
 mimalloc = ["dep:mimalloc", "custom/mimalloc"]
 dhat = ["dep:dhat", "custom/dhat"]
 
-wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
-x11     = ["winit/x11"]
-
 [dependencies]
 editor = { path = "../editor" }
 custom = { path = "../custom" }
@@ -23,10 +27,12 @@ custom = { path = "../custom" }
 mimalloc = { version = "=0.1.47", optional = true }
 dhat = { version = "0.3.3", default-features = false, optional = true }
 
-winit              .workspace = true
 crossbeam-channel  .workspace = true
 libloading         .workspace = true
 tracy-client       .workspace = true
+raw-window-handle  .workspace = true
 
 ctrlc = "3.5.2"
 notify = "8.2.0"
+
+sdl2 = { version = "0.38.0", features = ["raw-window-handle"] }

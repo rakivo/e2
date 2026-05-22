@@ -7,14 +7,15 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [features]
-default = ["wayland", "x11"]
+default = ["audioer", "wayland"]
+
+audioer = ["editor/audioer"]
+
+wayland = ["editor/wayland-data-control"]
 
 # allocators
 mimalloc = ["dep:mimalloc"]
 dhat = ["dep:dhat"]
-
-wayland = ["winit/wayland", "winit/wayland-dlopen", "winit/wayland-csd-adwaita"]
-x11     = ["winit/x11"]
 
 [dependencies]
 editor = { path = "../editor" }
@@ -29,7 +30,6 @@ smallstr           .workspace = true
 smallvec           .workspace = true
 cranelift-entity   .workspace = true
 paste              .workspace = true
-winit              .workspace = true
 crossbeam-channel  .workspace = true
 
 memmap2 = "0.9.10"
