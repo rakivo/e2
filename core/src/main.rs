@@ -575,12 +575,12 @@ fn run(mut app: App) {
                     };
 
                     if new_line != cur_line {
-                        let mut cursor = editor.views[view_id].cursor.clone();
-                        editor.buffers[buf_id].set_cursor_line_col(new_line, cur_col, &mut cursor);
+                        let mut cursor = editor.views[view_id].active_cursor().clone();
+                        editor.buffers[buf_id].set_cursor_line_col(new_line, cur_col, &mut cursor.cursor);
 
                         editor.views[view_id].cursor_target_line = new_line;
                         editor.views[view_id].cursor_target_col  = cur_col;
-                        editor.views[view_id].cursor             = cursor;
+                        editor.views[view_id].normal_cursor      = cursor;
 
                         editor.snap_cursor_to_target(view_id, new_line, cur_col, rect);
                     }

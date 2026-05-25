@@ -703,12 +703,12 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
             gpu::draw_rect(gpu, x + sep*2.0, y, w - sep*4.0, h, a(p.lister_item_hovered_bg));
         }
         if info.is_selected {
-            gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_selected_bg));
+            // gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_selected_bg)); // nocheckin
 
             gpu::draw_rect_gradient_h(
                 gpu, x, y, w, h,
-                a(Color::rgba(220, 15, 25, 40)),  // left
-                a(Color::rgba(220, 15, 25, 0)),   // right
+                a(Color::rgba(220, 15, 25, 70)),  // left
+                a(Color::rgba(220, 15, 25, 20)),   // right
             );
 
             gpu::draw_rect(gpu, x, y, sep * 3.0, h, a(p.lister_accent));

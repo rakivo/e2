@@ -1,3 +1,5 @@
+#![allow(unused, dead_code)]
+
 // @Important @Note: Must match the allocator `core` uses
 
 #[cfg(feature = "dhat")]
@@ -662,6 +664,48 @@ pub fn set_anchor(cx: &mut CommandContext) {
 pub fn unset_anchor(cx: &mut CommandContext) {
     let (view, _buf) = cx.editor.active_view_and_buffer_mut();
     view.cursor.unset_anchor();
+    view.set_unactive_cursor_position_to_normal_cursor_position();
+}
+
+pub fn set_flying_cursor_from_unactive_to_active_cursor(view_id: ViewId, editor: &mut Editor) {
+    let view = &mut editor.views[view_id];
+
+    let (from_x, from_y) = {
+        let uc = view.unactive_cursor();
+        (uc.cursor_anim_x, uc.cursor_anim_y)
+    };
+    let (to_x, to_y) = {
+        let ac = view.active_cursor();
+        (ac.cursor_anim_x, ac.cursor_anim_y)
+    };
+
+    view.cursor_ghost_x = from_x;
+    view.cursor_ghost_y = from_y;
+
+    editor.flying_cursor = Some(FlyingCursor {
+        x: from_x,
+        y: from_y,
+        target_x: to_x,
+        target_y: to_y,
+        alpha: 1.0,
+    });
+}
+
+#[command]
+pub fn toggle_active_cursor(cx: &mut CommandContext) {
+    let (view, _buf) = cx.editor.active_view_and_buffer_mut();
+    view.current_cursor = !view.current_cursor;
+
+    set_flying_cursor_from_unactive_to_active_cursor(view.id, cx.editor);
+}
+
+#[command]
+pub fn toggle_active_cursor_saving_anchor(cx: &mut CommandContext) {
+    let (view, _buf) = cx.editor.active_view_and_buffer_mut();
+    view.current_cursor = !view.current_cursor;
+    view.active_cursor_mut().cursor.anchor_char_index = Some(view.unactive_cursor().cursor.char_index);
+
+    set_flying_cursor_from_unactive_to_active_cursor(view.id, cx.editor);
 }
 
 #[command]
@@ -2179,10 +2223,9 @@ pub fn completion_confirm(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
     if !view.completion.active {
-        if let Some(ghost) = &view.completion.ghost_text {
+        if let Some(ghost) = view.completion.ghost_text.take() {
             if !ghost.is_empty() {
-                buf.insert_literal(ghost, &mut view.cursor);
-                view.completion.ghost_text = None;
+                buf.insert_literal(&ghost, &mut view.cursor);
             }
         }
 
@@ -2332,6 +2375,8 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));     // nocheckin
     cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk"));   // nocheckin
     cx.keymap.bind(KeyCombo::ctrl_alt('\\'), cx.command_table.intern("indent_region"));      // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('w'), cx.command_table.intern("toggle_active_cursor"));      // nocheckin
+    cx.keymap.bind(KeyCombo::alt('W'), cx.command_table.intern("toggle_active_cursor_saving_anchor"));      // nocheckin
 
     cx.keymap.bind(KeyCombo::ctrl_alt('p'), cx.command_table.intern("jump_scope_prev")); // nocheckin
     cx.keymap.bind(KeyCombo::ctrl_alt('n'), cx.command_table.intern("jump_scope_next"));   // nocheckin
@@ -2372,23 +2417,24 @@ fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
     });
     editor.set_custom_transient_data(CustomDataTransient {});
 
+    // nocheckin :Sessions
     //
     // Try to restore session first
     //
-    let session_path = &default_session_path();
+    // let session_path = &default_session_path();
 
-    if let Ok(file)      = std::fs::File::open(session_path)
-    && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
-    && let Some(session) = load_session(&mmap[..])
-    {
-        let time = apply_session(editor, session);
+    // if let Ok(file)      = std::fs::File::open(session_path)
+    // && let Ok(mmap)      = unsafe { MmapOptions::new().populate().map(&file) }
+    // && let Some(session) = load_session(&mmap[..])
+    // {
+    //     let time = apply_session(editor, session);
 
-        let pretty = pretty_path(&session_path);
-        let message = format!("Applied session in {time}ms from '{pretty}'");
-        editor.messager.push(&message, gpu);
+    //     let pretty = pretty_path(&session_path);
+    //     let message = format!("Applied session in {time}ms from '{pretty}'");
+    //     editor.messager.push(&message, gpu);
 
-        did_we_apply_any_sessions = true;
-    }
+    //     did_we_apply_any_sessions = true;
+    // }
 
     //
     // Open the file from argv if user provided it
@@ -2940,10 +2986,19 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             let t1 = Instant::now();
             {
-                let lister_rect = editor.lister().lister_rect(editor.win_w, editor.win_h, editor.scale);
-                let t = 1.0 - (1.0 - editor.lister().panel.anim).powi(3);  // Same easing as lister_rect
-                render_lister_background_frosted(gpu, lister_rect, editor.scale, t);
-                render_lister_background(gpu, editor);
+                let lister = editor.lister();
+                let lister_rect = lister.lister_rect(editor.win_w, editor.win_h, editor.scale);
+                if editor.active_panel == lister.query_split && lister.is_visible() {
+                    // Dim the whole screen
+                    gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
+                }
+
+                // Backdrop blur
+                gpu::draw_blur_rect(
+                    gpu,
+                    lister_rect.x, lister_rect.y, lister_rect.w, lister_rect.h,
+                    palette().lister_bg.with_alpha(0.45)
+                );
             }
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
 
@@ -2955,6 +3010,8 @@ fn setup_hooks(cx: &mut CommandContext) {
             let rect = editor.panels[editor.lister().query_panel].rect_including_panel_bar;
 
             let show_cursor = editor.views[view_id].is_cursor_visible();
+
+            gpu::push_overlay_mode(gpu);
 
             gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
             let t1 = Instant::now();
@@ -2980,6 +3037,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                 ui.tick();
                 ui::render(ui, gpu);
             }
+            gpu::pop_overlay_mode(gpu);
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
         }
 
@@ -3231,45 +3289,6 @@ pub fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {
     on_confirm(cx, item_data);
 }
 
-// Frosted glass approximation - layered semi-transparent rects
-// with slight size variations to fake depth
-pub fn render_lister_background_frosted(gpu: &mut Gpu, lister: Rect, scale: f32, open_anim: f32) {
-    let a = |base: u8| -> u8 { ((base as f32) * open_anim) as u8 };
-
-    // Base dark fill
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h, palette().lister_bg);
-
-    // Warm tint layer
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, lister.h,
-        Color::rgba(40, 25, 8, a(40)));
-
-    // Slightly inset lighter layer - gives illusion of depth/glass
-    let i = scale * 1.0;
-    gpu::draw_rect(gpu, lister.x + i, lister.y + i, lister.w - i*2.0, lister.h - i*2.0,
-        Color::rgba(255, 200, 120, a(12)));
-
-    // Top edge highlight - light catches the glass rim
-    gpu::draw_rect(gpu, lister.x, lister.y, lister.w, scale,
-        Color::rgba(255, 210, 140, a(60)));
-
-    // Left edge highlight
-    gpu::draw_rect(gpu, lister.x, lister.y, scale, lister.h,
-        Color::rgba(255, 210, 140, a(30)));
-
-    // Bottom edge shadow
-    gpu::draw_rect(gpu, lister.x, lister.y + lister.h - scale, lister.w, scale,
-        Color::rgba(0, 0, 0, a(80)));
-}
-
-pub fn render_lister_background(gpu: &mut Gpu, editor: &Editor) {
-    if editor.active_panel != editor.lister().query_split { return; }
-
-    if !editor.lister().is_visible() { return; }
-
-    // Dim the whole screen
-    gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
-}
-
 const fn lister_smaller_font_size(scaled_font_size: f32) -> f32 {
     scaled_font_size * 0.80
 }
@@ -3278,6 +3297,7 @@ pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
     let scale     = editor.scale;
     let font_size = editor.font_size();
     let line_h    = editor.line_h();
+    let cursor_h  = editor.cursor_h();
     let is_mouse_cursor_hidden = editor.is_mouse_cursor_visible;
 
     let lister = editor.custom_data.lister_mut();
@@ -3294,7 +3314,7 @@ pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
     let pad     = (8.0 * scale).round();
     let item_h  = (line_h + pad).round();
     let sep     = scale.max(1.0);
-    let input_h = (line_h + pad).round();
+    let input_h = (line_h + cursor_h + pad).round();
     let list_h  = ph - input_h - sep;
 
     let total_items = lister.filtered.len();
@@ -3362,10 +3382,10 @@ pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
                             .text(&*item.label)
                             .font_size(font_size)
                             .color(if is_selected {
-                                a(Color::rgba(240, 208, 144, 255))
+                                a(Color::rgba(240, 208, 144, 170))
                             } else {
-                                a(Color::rgba(200, 190, 165, 220))
-                            }).build();
+                                a(Color::rgba(200, 190, 165, 190))
+                            }.with_alpha(100.0)).build();
 
                         let label_x = pad + sep * 5.0;
                         let mut highlight_rects: Vec<(f32, f32)> = Default::default();  // @Memory @Speed

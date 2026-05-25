@@ -60,7 +60,7 @@ use ui::UiState;
 use std::any::Any;
 use std::borrow::Cow;
 use std::num::NonZero;
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Not};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -481,7 +481,7 @@ pub const fn palette() -> Palette {
         lister_separator:        Color::rgba(180, 20, 30, 140),
         lister_item_text:        Color::rgba(200, 190, 165, 220),
         lister_item_text_dim:    Color::rgba(130, 120, 100, 160),
-        lister_item_selected_bg: Color::rgba(60,  12, 14, 220),   // dark red tint
+        lister_item_selected_bg: Color::rgba(60,  12, 14, 100),   // dark red tint
         lister_item_selected_text: Color::rgba(255, 200, 200, 255),
         lister_item_hovered_bg:  Color::rgba(35,  10, 10, 140),
         lister_item_alt_tint:    Color::rgba(255, 255, 255, 5),
@@ -849,7 +849,12 @@ pub fn rebuild_text_layout(
 
     let should_snap_cursor_anim_to_buffer =
         view.cursor_anim_x.is_nan() || view.cursor_anim_y.is_nan(); // @Note: See View::new and animate()
+
+    let should_snap_ghost_cursor_anim_to_buffer =
+        view.ghost_cursor.cursor_anim_x.is_nan() || view.ghost_cursor.cursor_anim_y.is_nan(); // @Note: See View::new and animate()
+
     should_snap |= should_snap_cursor_anim_to_buffer;
+    should_snap |= should_snap_ghost_cursor_anim_to_buffer;
 
     let t0 = Instant::now();
     let mut layout = build_text_layout(
@@ -881,6 +886,16 @@ pub fn rebuild_text_layout(
         };
 
         editor.snap_cursor_to_target(view_id, cl, cc, rect);
+
+        if should_snap_ghost_cursor_anim_to_buffer {
+            let view = &editor.views[view_id];
+            let (cl, cc) = editor.buffers[view.buffer_id].cursor_line_col(&view.ghost_cursor.cursor);
+
+            let old = editor.views[view_id].current_cursor;
+            editor.views[view_id].current_cursor = !old; // @KindaHack
+            editor.snap_cursor_to_target(view_id, cl, cc, rect);
+            editor.views[view_id].current_cursor = old;
+        }
 
         if should_snap_cursor_anim_to_buffer {  // @Robustness
             scroll_to_cursor(editor);
@@ -1148,17 +1163,26 @@ pub fn build_text_layout(
 /// and this is done intentionally, in the purposes of convenience.
 pub struct LayoutRenderingContext {
     pub view_id: ViewId,
+
     pub view_scroll_anim: f32,
     pub view_scroll_anim_x: f32,
+
     pub view_cursor_anim_x: f32,
     pub view_cursor_anim_y: f32,
 
+    pub view_ghost_cursor_anim_x: f32,
+    pub view_ghost_cursor_anim_y: f32,
+
     pub layout_cursor_style: CursorStyle,
+    pub view_current_cursor: CurrentCursor,
 
     pub show_cursor: bool,
 
     pub cursor_col:  u32,
     pub cursor_line: u32,
+
+    pub ghost_cursor_col:  u32,
+    pub ghost_cursor_line: u32,
 
     pub rect: Rect,
 
@@ -1179,19 +1203,37 @@ impl LayoutRenderingContext {
         self.rect.y + buffer_line as f32 * self.line_h - self.view_scroll_anim.round()
     }
 
-    pub fn cursor_rect(&self, cursor_glyph_w: f32) -> Rect {
+    pub fn cursor_rect_impl(&self, cursor_anim_x: f32, cursor_anim_y: f32, cursor_glyph_w: f32) -> Rect {
         let cursor_width = if self.layout_cursor_style == CursorStyle::Stick {
             self.cursor_w
         } else {
             cursor_glyph_w
         };
 
+        let (y, h) = if self.layout_cursor_style == CursorStyle::Stick {
+            let y = cursor_anim_y + self.cursor_h*2.0;
+            let h = self.line_h;
+            (y, h)
+        } else {
+            let y = cursor_anim_y + self.cursor_h;
+            let h = self.line_h   + self.cursor_h;
+            (y, h)
+        };
+
         Rect {
-            x: self.view_cursor_anim_x - self.view_scroll_anim_x,
-            y: self.view_cursor_anim_y + self.cursor_h,
+            x: cursor_anim_x - self.view_scroll_anim_x,
+            y,
             w: cursor_width,
-            h: self.line_h + self.cursor_h,
+            h,
         }
+    }
+
+    pub fn cursor_rect(&self, cursor_glyph_w: f32) -> Rect {
+        self.cursor_rect_impl(self.view_cursor_anim_x, self.view_cursor_anim_y, cursor_glyph_w)
+    }
+
+    pub fn ghost_cursor_rect(&self, cursor_glyph_w: f32) -> Rect {
+        self.cursor_rect_impl(self.view_ghost_cursor_anim_x, self.view_ghost_cursor_anim_y, cursor_glyph_w)
     }
 }
 
@@ -1212,7 +1254,8 @@ pub fn render_text_layout(
     let scale = editor.scale;
 
     let active_view_id = editor.active_view_id();
-    let is_our_window_focused = editor.is_our_window_focused;
+    // let is_our_window_focused = editor.is_our_window_focused;
+    let is_our_window_focused = true;
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
 
     let rect         = layout.rect;
@@ -1225,6 +1268,8 @@ pub fn render_text_layout(
     let origin_x     = rect.x + padding_left - view.scroll_anim_x;
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
+
+    let (ghost_cursor_line, ghost_cursor_col) = buffer.cursor_line_col(&view.unactive_cursor().cursor);
 
     let vis_start = layout.first_buffer_line_including_prelex;
     let vis_end   = vis_start + layout.lines.len() as u32;
@@ -1240,6 +1285,11 @@ pub fn render_text_layout(
         cursor_line,
         origin_x,
         min_cursor_w,
+        ghost_cursor_col,
+        ghost_cursor_line,
+        view_current_cursor: view.current_cursor,
+        view_ghost_cursor_anim_x: view.unactive_cursor().cursor_anim_x,
+        view_ghost_cursor_anim_y: view.unactive_cursor().cursor_anim_y,
         first_visible_line: vis_start,
         last_visible_line: vis_end,
         font_size,
@@ -1423,8 +1473,11 @@ pub fn render_text_layout(
                 let x = ghost_x + (crect.x - ghost_x) * t;
                 let y = ghost_y + (crect.y - ghost_y) * t;
                 let alpha = t * 0.4; // linear, fades to nothing at ghost end
-                let w = cursor_glyph_w * 0.6; // @Tune, same size throughout
-                let h = crect.h * 0.7;        // @Tune
+                let (w, h) = if context.layout_cursor_style == CursorStyle::Stick {
+                    (crect.w, crect.h)
+                } else {
+                    (crect.w * 0.6, crect.h * 0.7)
+                };
                 let y_centered = y + (crect.h - h) * 0.5;
                 let x_centered = x + (crect.w - w) * 0.5;
                 gpu::draw_rect(gpu, x_centered, y_centered, w, h, palette().cursor.with_alpha(alpha));
@@ -1634,10 +1687,18 @@ pub fn render_text_layout(
     //
     //
     if !is_this_view_focused && layout.cursor_style == CursorStyle::Block
-        && let Some(ll) = layout.line_for_buffer_line(cursor_line)
+    && let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         let rect = context.cursor_rect(cursor_glyph_w);
+        gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
+    }
+
+    if layout.cursor_style == CursorStyle::Block
+    && let Some(ll) = layout.line_for_buffer_line(ghost_cursor_line)
+    {
+        let cursor_glyph_w = layout.glyph_width_at_col(ghost_cursor_col, min_cursor_w, ll).max(min_cursor_w);
+        let rect = context.ghost_cursor_rect(cursor_glyph_w);
         gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
     }
 }
@@ -1992,19 +2053,7 @@ pub struct ViewState {
 }
 
 #[derive(Clone)]
-pub struct View {
-    pub        id: ViewId,
-    pub buffer_id: BufferId,
-    pub  panel_id: PanelId,
-
-    // Vertical scrolling
-    pub scroll:        f32,  // Target scroll (set instantly on any scroll event)
-    pub scroll_anim:   f32,  // Animated scroll (what actually gets rendered)
-
-    // Horizontal scrolling
-    pub scroll_x:      f32,
-    pub scroll_anim_x: f32,
-
+pub struct ViewCursor {
     pub cursor_anim_x: f32,  // Animated cursor screen position @Redundant (We currently only animate cursor's Y movements)
     pub cursor_anim_y: f32,  // Animated cursor screen position
 
@@ -2017,6 +2066,180 @@ pub struct View {
     pub cursor_target_col:  u32,
 
     pub cursor: Cursor,
+}
+
+impl Default for ViewCursor {
+    fn default() -> Self {
+        Self {
+            cursor: Default::default(),
+            cursor_ghost_y: 0.0,
+            cursor_ghost_x: 0.0,
+            cursor_anim_x: f32::NAN,
+            cursor_anim_y: f32::NAN,
+            cursor_target_line: 0, cursor_target_col: 0,
+            cursor_opacity: 1.0,
+        }
+    }
+}
+
+impl ViewCursor {
+    /// Animates the cursor and returns a tuple indicating what changed:
+    /// (pos_changed, ghost_changed, opacity_changed)
+    pub fn animate(
+        &mut self,
+        dt: f32,
+        layout: &TextLayout,
+        scroll_anim: f32,
+        line_h: f32,
+        epsilon: f32,
+        is_active: bool,
+        since_input: u128,
+        blink_t: f32,
+    ) -> (bool, bool, bool) {
+        let mut pos_changed = false;
+        let mut ghost_changed = false;
+        let mut opacity_changed = false;
+
+        //
+        //
+        // Cursor position
+        //
+        //
+
+        if let Some(target_x) = layout.cursor_x_content(self.cursor_target_line, self.cursor_target_col) {
+            let target_y = layout.rect.y + self.cursor_target_line as f32 * line_h - scroll_anim;
+            let dy = target_y - self.cursor_anim_y;
+
+            if self.cursor_anim_y.is_nan() {  // @Redundant
+                // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
+
+            } else if dy.abs() < line_h * 1.5 {
+                // Single line down, just snap don't animate
+                self.cursor_anim_y = target_y;
+
+            } else if dy.abs() > layout.rect.h {
+                self.cursor_anim_y = target_y;
+
+            } else if dy.abs() > epsilon {
+                self.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
+                pos_changed = true;
+
+            } else {
+                self.cursor_anim_y = target_y;
+            }
+
+            //
+            // @Design: Don't animate cursor's horizontal movements.
+            //
+
+            self.cursor_anim_x = target_x;
+
+            // let dx = target_x - self.cursor_anim_x;
+            // if self.cursor_anim_x.is_nan() {
+            //     // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
+            //
+            // } else if dx.abs() > layout.rect.w {
+            //     self.cursor_anim_x = target_x;
+            //
+            // } else if dx.abs() > epsilon {
+            //     self.cursor_anim_x += dx * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
+            //     still_animating = true;
+            //
+            // } else {
+            //     self.cursor_anim_x = target_x;
+            // }
+        }
+
+        //
+        // Cursor ghost trail
+        //
+        {
+            let dx = self.cursor_anim_x - self.cursor_ghost_x;
+            let dy = self.cursor_anim_y - self.cursor_ghost_y;
+
+            if dx.abs() > epsilon || dy.abs() > epsilon {
+                const GHOST_RATE: f32 = 25.0; // @Tune - lower = longer/slower trail
+                self.cursor_ghost_x += dx * (1.0 - (-GHOST_RATE * dt).exp());
+                self.cursor_ghost_y += dy * (1.0 - (-GHOST_RATE * dt).exp());
+                ghost_changed = true;
+            } else {
+                self.cursor_ghost_x = self.cursor_anim_x;
+                self.cursor_ghost_y = self.cursor_anim_y;
+            }
+        }
+
+        // :Configuration
+        //
+        // Cursor opacity
+        //
+        {
+            let target_opacity = if !is_active {
+                0.25
+            } else if since_input < BLINK_START_DELAY_MS || since_input > BLINK_STOP_IDLE_MS {
+                // Solid - just typed, or been idle too long
+                1.0
+            } else {
+                let period = 2.0 * std::f32::consts::PI / 6.0;
+                let phase = (blink_t % period) / period;
+                let k = 0.15;
+                let wave = if phase < k {
+                    phase / k
+                } else if phase < 0.5 {
+                    1.0
+                } else if phase < 0.5 + k {
+                    1.0 - (phase - 0.5) / k
+                } else {
+                    0.0
+                };
+                wave * 0.8
+            };
+
+            let delta = target_opacity - self.cursor_opacity;
+            if delta.abs() > 0.01 {
+                let rate = 18.0;
+                self.cursor_opacity += delta * (1.0 - (-rate * dt).exp());
+                opacity_changed = true;
+            } else {
+                self.cursor_opacity = target_opacity;
+            }
+        }
+
+        (pos_changed, ghost_changed, opacity_changed)
+    }
+}
+
+#[derive(Eq, PartialEq, Default, Clone, Copy)]
+pub enum CurrentCursor { #[default] Normal, Ghost }
+
+impl Not for CurrentCursor {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        match self {
+            Self::Ghost => Self::Normal,
+            Self::Normal => Self::Ghost,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct View {
+    pub        id: ViewId,
+    pub buffer_id: BufferId,
+    pub  panel_id: PanelId,
+
+    pub current_cursor: CurrentCursor,
+
+    // Vertical scrolling
+    pub scroll:        f32,  // Target scroll (set instantly on any scroll event)
+    pub scroll_anim:   f32,  // Animated scroll (what actually gets rendered)
+
+    // Horizontal scrolling
+    pub scroll_x:      f32,
+    pub scroll_anim_x: f32,
+
+    pub normal_cursor: ViewCursor,
+    pub ghost_cursor:  ViewCursor,
+
     pub layout: Option<TextLayout>,
 
     pub completion: CompletionState,
@@ -2025,19 +2248,32 @@ pub struct View {
     pub persistent_state_per_buffer: FxHashMap<BufferId, ViewState>,
 }
 
+impl Deref for View {
+    type Target = ViewCursor;
+    fn deref(&self) -> &Self::Target {
+        self.active_cursor()
+    }
+}
+
+impl DerefMut for View {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.active_cursor_mut()
+    }
+}
+
 impl View {
     pub fn new_with_scroll(id: ViewId, buffer_id: BufferId, scroll: f32) -> Self {
         Self {
-            id, buffer_id, scroll, cursor: Cursor::new(), layout: None,
-            cursor_ghost_y: 0.0,
-            cursor_ghost_x: 0.0,
+            layout: None,
+
+            current_cursor: Default::default(),
+
+            id, buffer_id, scroll,
             scroll_x: 0.0,
-            cursor_anim_x: f32::NAN,
-            cursor_anim_y: f32::NAN,
             scroll_anim_x: 0.0,
-            cursor_target_line: 0, cursor_target_col: 0,
             scroll_anim: scroll,
-            cursor_opacity: 1.0,
+            normal_cursor: Default::default(),
+            ghost_cursor: Default::default(),
             completion: Default::default(),
             persistent_state_per_buffer: Default::default(),
             overlay: Default::default(),
@@ -2047,6 +2283,45 @@ impl View {
 
     pub fn new(id: ViewId, buffer_id: BufferId) -> Self {
         Self::new_with_scroll(id, buffer_id, 0.0)
+    }
+
+    #[inline]
+    pub fn active_cursor(&self) -> &ViewCursor {
+        match self.current_cursor {
+            CurrentCursor::Normal => &self.normal_cursor,
+            CurrentCursor::Ghost  => &self.ghost_cursor,
+        }
+    }
+
+    #[inline]
+    pub fn active_cursor_mut(&mut self) -> &mut ViewCursor {
+        match self.current_cursor {
+            CurrentCursor::Normal => &mut self.normal_cursor,
+            CurrentCursor::Ghost  => &mut self.ghost_cursor,
+        }
+    }
+
+    #[inline]
+    pub fn unactive_cursor(&self) -> &ViewCursor {
+        match !self.current_cursor {
+            CurrentCursor::Normal => &self.normal_cursor,
+            CurrentCursor::Ghost  => &self.ghost_cursor,
+        }
+    }
+
+    #[inline]
+    pub fn unactive_cursor_mut(&mut self) -> &mut ViewCursor {
+        match !self.current_cursor {
+            CurrentCursor::Normal => &mut self.normal_cursor,
+            CurrentCursor::Ghost  => &mut self.ghost_cursor,
+        }
+    }
+
+    #[inline]
+    pub fn set_unactive_cursor_position_to_normal_cursor_position(&mut self) {
+        self.unactive_cursor_mut().cursor = self.active_cursor().cursor;
+        self.unactive_cursor_mut().cursor_target_line = self.active_cursor().cursor_target_line;
+        self.unactive_cursor_mut().cursor_target_col = self.active_cursor().cursor_target_col;
     }
 
     #[inline]
@@ -2099,7 +2374,7 @@ impl View {
         // Restore if exists
         //
         if let Some(state) = self.persistent_state_per_buffer.get(&new) {
-            self.cursor = state.cursor;
+            self.normal_cursor.cursor = state.cursor;
             self.scroll = state.scroll;
             self.scroll_anim = state.scroll_anim;
             self.scroll_anim_x = state.scroll_anim_x;
@@ -3521,6 +3796,15 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
         editor.views[view_id].scroll_anim = editor.views[view_id].scroll_anim.clamp(0.0, max_scroll);
     }
 
+    // Snapshot timings once so we don't borrow `editor` inside the loop
+    let since_input = editor.last_input_time.elapsed().as_millis();
+    let blink_t = editor.blink_epoch.elapsed().as_secs_f32();
+
+    // Accumulators for redraw requests
+    let mut req_pos_redraw = false;
+    let mut req_ghost_redraw = false;
+    let mut req_opacity_redraw = false;
+
     for view in editor.views.values_mut() {
         //
         //
@@ -3561,141 +3845,50 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
                 view.scroll_anim_x = target;
             }
         }
-        //
-        //
-        // Cursor position
-        //
-        //
 
         let Some(layout) = &view.layout else { continue };
 
-        let (cursor_line, cursor_col) = (view.cursor_target_line, view.cursor_target_col);
-
-        if let Some(target_x) = layout.cursor_x_content(cursor_line, cursor_col) {
-            //
-            // Compute target Y from scroll_anim so cursor tracks the animated scroll,
-            // not the settled scroll position
-            //
-
-            let target_y = layout.rect.y + cursor_line as f32 * line_h - view.scroll_anim;
-            let dy = target_y - view.cursor_anim_y;
-
-            if view.cursor_anim_y.is_nan() {  // @Redundant
-                // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
-
-            } else if dy.abs() < line_h * 1.5 {
-                // Single line down, just snap don't animate
-                view.cursor_anim_y = target_y;
-
-            } else if dy.abs() > layout.rect.h {
-                view.cursor_anim_y = target_y;
-
-            } else if dy.abs() > epsilon {
-                view.cursor_anim_y += dy * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
-                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
-                    "Cursor anim", &mut editor.redraw_reasons
-                ));
-
-            } else {
-                view.cursor_anim_y = target_y;
-            }
-
-            //
-            // @Design: Don't animate cursor's horizontal movements.
-            //
-
-            view.cursor_anim_x = target_x;
-
-            // let dx = target_x - view.cursor_anim_x;
-            // if view.cursor_anim_x.is_nan() {
-            //     // ... Fallthrough, keep it NAN for should_snap inside rebuild_text_layout
-            //
-            // } else if dx.abs() > layout.rect.w {
-            //     view.cursor_anim_x = target_x;
-            //
-            // } else if dx.abs() > epsilon {
-            //     view.cursor_anim_x += dx * (1.0 - (-CURSOR_ANIM_RATE * dt).exp());
-            //     still_animating = true;
-            //
-            // } else {
-            //     view.cursor_anim_x = target_x;
-            // }
-        }
+        let is_active = view.id == active_view_id;
+        let scroll_anim = view.scroll_anim;
 
         //
-        // Cursor ghost trail
+        // Animate the Normal Cursor
         //
-        {
-            let gx = view.cursor_ghost_x;
-            let gy = view.cursor_ghost_y;
-            let tx = view.cursor_anim_x;
-            let ty = view.cursor_anim_y;
+        let (p1, g1, o1) = view.normal_cursor.animate(
+            dt, layout, scroll_anim, line_h, epsilon,
+            is_active && view.current_cursor == CurrentCursor::Normal,
+            since_input, blink_t
+        );
 
-            let dx = tx - gx;
-            let dy = ty - gy;
-
-            if dx.abs() > epsilon || dy.abs() > epsilon {
-                const GHOST_RATE: f32 = 25.0; // @Tune - lower = longer/slower trail
-
-                view.cursor_ghost_x += dx * (1.0 - (-GHOST_RATE * dt).exp());
-                view.cursor_ghost_y += dy * (1.0 - (-GHOST_RATE * dt).exp());
-                should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
-                    "Cursor ghost trail", &mut editor.redraw_reasons
-                ));
-            } else {
-                view.cursor_ghost_x = tx;
-                view.cursor_ghost_y = ty;
-            }
-        }
-
-        // :Configuration
         //
-        // Cursor opacity
+        // Animate the Ghost Cursor
+        // (Passed `false` for active state so it sits at 0.25 opacity, adjust if desired)
         //
-        {
-            let target_opacity = if active_view_id != view.id {
-                0.25
-            } else {
-                let since_input = editor.last_input_time.elapsed().as_millis();
+        let (p2, g2, o2) = view.ghost_cursor.animate(
+            dt, layout, scroll_anim, line_h, epsilon,
+            is_active && view.current_cursor == CurrentCursor::Ghost,
+            since_input, blink_t
+        );
 
-                if since_input < BLINK_START_DELAY_MS || since_input > BLINK_STOP_IDLE_MS {
-                    // Solid - just typed, or been idle too long
-                    1.0
-                } else {
-                    let t = editor.blink_epoch.elapsed().as_secs_f32();
-                    let period = 2.0 * std::f32::consts::PI / 6.0;
-                    let phase = (t % period) / period;
-                    let k = 0.15;
-                    let wave = if phase < k {
-                        phase / k
-                    } else if phase < 0.5 {
-                        1.0
-                    } else if phase < 0.5 + k {
-                        1.0 - (phase - 0.5) / k
-                    } else {
-                        0.0
-                    };
-                    wave * 0.8
-                }
-            };
+        req_pos_redraw     |= p1 || p2;
+        req_ghost_redraw   |= g1 || g2;
+        req_opacity_redraw |= o1 || o2;
+    }
 
-            let delta = target_opacity - view.cursor_opacity;
-
-            if delta.abs() > 0.01 {
-                let rate = 18.0;
-
-                view.cursor_opacity += delta * (1.0 - (-rate * dt).exp());
-
-                should_redraw = should_redraw.or(
-                    ShouldRequestFrameRedraw::yes(
-                        "Cursor opacity",
-                        &mut editor.redraw_reasons,
-                    )
-                );
-            } else {
-                view.cursor_opacity = target_opacity;
-            }
-        }
+    if req_pos_redraw {
+        should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+            "Cursor anim", &mut editor.redraw_reasons
+        ));
+    }
+    if req_ghost_redraw {
+        should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+            "Cursor ghost trail", &mut editor.redraw_reasons
+        ));
+    }
+    if req_opacity_redraw {
+        should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
+            "Cursor opacity", &mut editor.redraw_reasons
+        ));
     }
 
     if let Some(fc) = &mut editor.flying_cursor {
