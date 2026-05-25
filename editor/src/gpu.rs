@@ -17,6 +17,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, 
 pub const ATLAS_SIZE: u32          = 4096;
 pub const ATLAS_RESET_RATIO: f32   = 0.8;
 pub const INITIAL_VERTEX_BUFFER_CAPACITY: u64 = 8 * 1024 * 1024;
+pub const INITIAL_BLUR_VERTEX_BUFFER_CAPACITY: u64 = 4 * 1024 * 1024;
 pub const FRAMES_IN_FLIGHT: usize      = 2;
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -59,6 +60,9 @@ struct Frame {
     image_available: vk::Semaphore,
     render_done:     vk::Semaphore,
     fence:           vk::Fence,
+
+    // Buffers retired this frame, destroyed when fence signals next time
+    retired_buffers: Vec<(vk::Buffer, Allocation)>,
 }
 
 struct AllocBuffer {
@@ -85,7 +89,13 @@ pub struct PendingAtlasUpload {
 const VERT_SPV: &[u8] = include_bytes!("../assets/vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../assets/frag.spv");
 
+const BLUR_H_SPV: &[u8] = include_bytes!("../assets/blur_h.spv");
+const BLUR_V_SPV: &[u8] = include_bytes!("../assets/blur_v.spv");
+
+#[allow(unused)]
 pub struct Gpu {
+    pub overlay_mode: bool,
+
     //
     // Swash font state
     //
@@ -149,6 +159,35 @@ pub struct Gpu {
     pub upload_fence:       vk::Fence,
     pub upload_in_flight:   bool,
 
+    pub blur_batch_pool:  Vec<Batch>,
+    pub blur_batch_count: usize,
+    blur_vertex_buffer:               Option<AllocBuffer>,
+    current_blur_vertex_buffer_capacity: u64,
+    blur_draw_scratch: Vec<DrawCmd>,
+
+    captured_image:  Option<AllocImage>,
+    captured_view:   vk::ImageView,
+    blur_image_a:    Option<AllocImage>,
+    blur_view_a:     vk::ImageView,
+    blur_image_b:    Option<AllocImage>,
+    blur_view_b:     vk::ImageView,
+    blur_sampler:    vk::Sampler,
+
+    composite_render_pass:   vk::RenderPass,
+    composite_framebuffers:  Vec<vk::Framebuffer>,
+    composite_pipeline:      vk::Pipeline,
+
+    blur_desc_set_layout: vk::DescriptorSetLayout,
+    blur_pipeline_layout: vk::PipelineLayout,
+    blur_h_pipeline:      vk::Pipeline,
+    blur_v_pipeline:      vk::Pipeline,
+    blur_desc_set_h:      vk::DescriptorSet,
+    blur_desc_set_v:      vk::DescriptorSet,
+    blur_descriptor_pool: vk::DescriptorPool,
+
+    swapchain_images: Vec<vk::Image>,
+    queue_family:     u32,
+
     framebuffers:    Vec<vk::Framebuffer>,
     swapchain_views: Vec<vk::ImageView>,
     swapchain:       vk::SwapchainKHR,
@@ -165,17 +204,45 @@ pub struct Gpu {
     surface_ext:    ash::khr::surface::Instance,
     _instance:      ash::Instance,
     _entry:         ash::Entry,
+
+    // Per-frame blur resources
+    captured_images:  [Option<AllocImage>; FRAMES_IN_FLIGHT],
+    captured_views:   [vk::ImageView;      FRAMES_IN_FLIGHT],
+    blur_images_a:    [Option<AllocImage>; FRAMES_IN_FLIGHT],
+    blur_views_a:     [vk::ImageView;      FRAMES_IN_FLIGHT],
+    blur_images_b:    [Option<AllocImage>; FRAMES_IN_FLIGHT],
+    blur_views_b:     [vk::ImageView;      FRAMES_IN_FLIGHT],
+    blur_desc_sets_h: [vk::DescriptorSet;  FRAMES_IN_FLIGHT],
+    blur_desc_sets_v: [vk::DescriptorSet;  FRAMES_IN_FLIGHT],
 }
 
 impl Gpu {
     #[inline]
     pub fn verts_mut(&mut self) -> &mut Vec<Vert> {
-        &mut self.batch_pool[self.batch_count - 1].verts
+        if self.overlay_mode {
+            &mut self.blur_batch_pool[self.blur_batch_count - 1].verts
+        } else {
+            &mut self.batch_pool[self.batch_count - 1].verts
+        }
     }
 
     #[inline]
     pub fn current_clip(&self) -> [f32; 4] {
-        self.batch_pool[self.batch_count - 1].clip
+        if self.overlay_mode {
+            self.blur_batch_pool[self.blur_batch_count - 1].clip
+        } else {
+            self.batch_pool[self.batch_count - 1].clip
+        }
+    }
+
+    #[inline]
+    pub fn blur_verts_mut(&mut self) -> &mut Vec<Vert> {
+        &mut self.blur_batch_pool[self.blur_batch_count - 1].verts
+    }
+
+    #[inline]
+    pub fn blur_current_clip(&self) -> [f32; 4] {
+        self.blur_batch_pool[self.blur_batch_count - 1].clip
     }
 
     #[inline]
@@ -188,6 +255,7 @@ impl Gpu {
         self.win_w = w as f32;
         self.win_h = h as f32;
         self.batch_pool[0].clip = [0.0, 0.0, self.win_w, self.win_h];
+        self.blur_batch_pool[0].clip = [0.0, 0.0, self.win_w, self.win_h];
         unsafe { self.recreate_swapchain() };
     }
 
@@ -503,18 +571,33 @@ pub fn reset_atlas(gpu: &mut Gpu) {
 }
 
 #[inline]
+pub fn push_overlay_mode(gpu: &mut Gpu) {
+    gpu.overlay_mode = true;
+}
+
+#[inline]
+pub fn pop_overlay_mode(gpu: &mut Gpu) {
+    gpu.overlay_mode = false;
+}
+
+#[inline]
 pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
     gpu.clip_depth += 1;
 
-    let i = gpu.batch_count;
-    if i >= gpu.batch_pool.len() {
-        gpu.batch_pool.push(Batch::new([x, y, w, h]));
+    let (pool, count) = if gpu.overlay_mode {
+        (&mut gpu.blur_batch_pool, &mut gpu.blur_batch_count)
     } else {
-        gpu.batch_pool[i].clip = [x, y, w, h];
-        gpu.batch_pool[i].verts.clear();
-    }
+        (&mut gpu.batch_pool, &mut gpu.batch_count)
+    };
 
-    gpu.batch_count += 1;
+    let i = *count;
+    if i >= pool.len() {
+        pool.push(Batch::new([x, y, w, h]));
+    } else {
+        pool[i].clip = [x, y, w, h];
+        pool[i].verts.clear();
+    }
+    *count += 1;
 }
 
 #[inline]
@@ -522,21 +605,46 @@ pub fn pop_clip(gpu: &mut Gpu) {
     gpu.clip_depth -= 1;
     debug_assert!(gpu.clip_depth >= 0, "unbalanced pop_clip");
 
-    let clip = if gpu.batch_count >= 2 {
-        gpu.batch_pool[gpu.batch_count - 2].clip
+    let (pool, count) = if gpu.overlay_mode {
+        (&mut gpu.blur_batch_pool, &mut gpu.blur_batch_count)
+    } else {
+        (&mut gpu.batch_pool, &mut gpu.batch_count)
+    };
+
+    let clip = if *count >= 2 {
+        pool[*count - 2].clip
     } else {
         [0.0, 0.0, gpu.win_w, gpu.win_h]
     };
 
-    let i = gpu.batch_count;
-    if i >= gpu.batch_pool.len() {
-        gpu.batch_pool.push(Batch::new(clip));
+    let i = *count;
+    if i >= pool.len() {
+        pool.push(Batch::new(clip));
     } else {
-        gpu.batch_pool[i].clip = clip;
-        gpu.batch_pool[i].verts.clear();
+        pool[i].clip = clip;
+        pool[i].verts.clear();
     }
+    *count += 1;
+}
 
-    gpu.batch_count += 1;
+#[inline(always)]
+pub fn draw_blur_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, tint: Color) {
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let x0 =  x       * inv_sw * 2.0 - 1.0;
+    let x1 = (x + w)  * inv_sw * 2.0 - 1.0;
+    let y0 =  1.0 - y       * inv_sh * 2.0;
+    let y1 =  1.0 - (y + h) * inv_sh * 2.0;
+
+    let verts = gpu.blur_verts_mut();
+    let c  = tint.into_gpu();
+    let uv = [-1.0f32, -1.0f32];
+    verts.push(Vert { pos: [x0, y0], uv, color: c });
+    verts.push(Vert { pos: [x1, y0], uv, color: c });
+    verts.push(Vert { pos: [x0, y1], uv, color: c });
+    verts.push(Vert { pos: [x1, y0], uv, color: c });
+    verts.push(Vert { pos: [x1, y1], uv, color: c });
+    verts.push(Vert { pos: [x0, y1], uv, color: c });
 }
 
 /// 4 rects, 24 verts
@@ -897,12 +1005,6 @@ impl Gpu {
         let framebuffers    = create_framebuffers(&device, &swapchain_views, render_pass, win_w, win_h);
 
         let desc_set_layout = create_desc_set_layout(&device);
-        let pipeline_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default()
-                .set_layouts(std::slice::from_ref(&desc_set_layout)),
-            None,
-        ).unwrap();
-        let pipeline = create_pipeline(&device, pipeline_layout, render_pass);
 
         //
         // Atlas texture
@@ -947,8 +1049,8 @@ impl Gpu {
         // Descriptor pool
         //
         let pool_sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLED_IMAGE,   descriptor_count: 1 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER,         descriptor_count: 1 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLED_IMAGE, descriptor_count: 2 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER,       descriptor_count: 2 },
         ];
         let descriptor_pool = device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
@@ -985,6 +1087,142 @@ impl Gpu {
         device.update_descriptor_sets(&writes, &[]);
 
         //
+        // Composite render pass + pipeline
+        //
+        let composite_render_pass = create_composite_render_pass(&device, surface_format.format);
+        let composite_framebuffers = create_framebuffers(
+            &device, &swapchain_views, composite_render_pass, win_w, win_h
+        );
+
+        //
+        // Add push constants to pipeline layout for screen_size
+        //
+        let push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(8);
+        let pipeline_layout = device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&desc_set_layout))
+                .push_constant_ranges(std::slice::from_ref(&push_range)),
+            None,
+        ).unwrap();
+        let pipeline = create_pipeline(&device, pipeline_layout, render_pass);
+        let composite_pipeline = create_pipeline(&device, pipeline_layout, composite_render_pass);
+
+        // Blur images
+        let blur_fmt = vk::Format::R8G8B8A8_UNORM;
+        let (cap_img_raw, cap_alloc) = create_captured_image(
+            &device, &mut allocator, win_w, win_h, surface_format.format,
+        );
+        let captured_view = create_image_view(&device, cap_img_raw, surface_format.format);
+
+        let (blur_a_raw, blur_a_alloc) = create_blur_image(
+            &device, &mut allocator, win_w, win_h, blur_fmt,
+        );
+        let blur_view_a = create_image_view(&device, blur_a_raw, blur_fmt);
+
+        let (blur_b_raw, blur_b_alloc) = create_blur_image(
+            &device, &mut allocator, win_w, win_h, blur_fmt,
+        );
+        let blur_view_b = create_image_view(&device, blur_b_raw, blur_fmt);
+
+        // Transition all blur images to initial layouts
+        {
+            let pool = create_cmd_pool(&device, queue_family);
+            let cmd  = alloc_cmd_buf(&device, pool);
+            begin_one_shot(&device, cmd);
+            transition_image_layout(&device, cmd, cap_img_raw,
+                                    vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            transition_image_layout(&device, cmd, blur_a_raw,
+                                    vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+            transition_image_layout(&device, cmd, blur_b_raw,
+                                    vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            submit_one_shot(&device, cmd, queue);
+            device.destroy_command_pool(pool, None);
+        }
+
+        let blur_sampler = device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        ).unwrap();
+
+        // Blur compute descriptor sets
+        let blur_pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: (FRAMES_IN_FLIGHT * 2) as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: (FRAMES_IN_FLIGHT * 2) as u32,
+            },
+        ];
+        let blur_descriptor_pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets((FRAMES_IN_FLIGHT * 2) as u32)
+                .pool_sizes(&blur_pool_sizes),
+            None,
+        ).unwrap();
+
+        let blur_desc_set_layout = create_blur_desc_set_layout(&device);
+        let blur_desc_set_layouts: Vec<_> = (0..FRAMES_IN_FLIGHT * 2)
+            .map(|_| blur_desc_set_layout)
+            .collect();
+        let all_blur_sets = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(blur_descriptor_pool)
+                .set_layouts(&blur_desc_set_layouts),
+        ).unwrap();
+        let mut blur_desc_sets_h = [vk::DescriptorSet::null(); FRAMES_IN_FLIGHT];
+        let mut blur_desc_sets_v = [vk::DescriptorSet::null(); FRAMES_IN_FLIGHT];
+        for i in 0..FRAMES_IN_FLIGHT {
+            blur_desc_sets_h[i] = all_blur_sets[i * 2];
+            blur_desc_sets_v[i] = all_blur_sets[i * 2 + 1];
+        }
+        let blur_desc_set_h = blur_desc_sets_h[0];
+        let blur_desc_set_v = blur_desc_sets_v[1];
+
+        let blur_pipeline_layout = device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&blur_desc_set_layout)),
+            None,
+        ).unwrap();
+        let blur_h_pipeline = create_blur_pipeline(&device, blur_pipeline_layout, BLUR_H_SPV);
+        let blur_v_pipeline = create_blur_pipeline(&device, blur_pipeline_layout, BLUR_V_SPV);
+
+        // Write blur_b into main descriptor set at bindings 2+3
+        let blur_img_info = [vk::DescriptorImageInfo::default()
+                             .image_view(blur_view_b)
+                             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let blur_smp_info = [vk::DescriptorImageInfo::default()
+                             .sampler(blur_sampler)];
+        device.update_descriptor_sets(&[
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&blur_img_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&blur_smp_info),
+        ], &[]);
+
+        // Blur vertex buffer
+        let (blur_vbuf, blur_valloc) = create_buffer(
+            &device, &mut allocator,
+            INITIAL_BLUR_VERTEX_BUFFER_CAPACITY,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            MemoryLocation::CpuToGpu,
+        );
+
+        //
         // Vertex buffer
         //
         let (vbuf, valloc) = create_buffer(
@@ -1016,7 +1254,10 @@ impl Gpu {
             let fence = device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None,
             ).unwrap();
-            Frame { cmd_pool: pool, cmd_buf: cmd, image_available, render_done, fence }
+            Frame {
+                cmd_pool: pool, cmd_buf: cmd, image_available, render_done, fence,
+                retired_buffers: Default::default()
+            }
         }).collect();
 
         // :Configuration
@@ -1031,7 +1272,86 @@ impl Gpu {
         let one_shot_cmd_pool = create_cmd_pool(&device, queue_family);
         let one_shot_cmd_buf  = alloc_cmd_buf(&device, one_shot_cmd_pool);
 
+        let blur_fmt = vk::Format::R8G8B8A8_UNORM;
+        let mut captured_images  = std::array::from_fn::<_, FRAMES_IN_FLIGHT, _>(|_| None);
+        let mut captured_views   = [vk::ImageView::null(); FRAMES_IN_FLIGHT];
+        let mut blur_images_a    = std::array::from_fn::<_, FRAMES_IN_FLIGHT, _>(|_| None);
+        let mut blur_views_a     = [vk::ImageView::null(); FRAMES_IN_FLIGHT];
+        let mut blur_images_b    = std::array::from_fn::<_, FRAMES_IN_FLIGHT, _>(|_| None);
+        let mut blur_views_b     = [vk::ImageView::null(); FRAMES_IN_FLIGHT];
+
+        {
+            let pool = create_cmd_pool(&device, queue_family);
+            let cmd  = alloc_cmd_buf(&device, pool);
+            begin_one_shot(&device, cmd);
+
+            for i in 0..FRAMES_IN_FLIGHT {
+                let (cap_raw, cap_alloc) = create_captured_image(
+                    &device, &mut allocator, win_w, win_h, surface_format.format,
+                );
+                let cap_view = create_image_view(&device, cap_raw, surface_format.format);
+                transition_image_layout(&device, cmd, cap_raw,
+                                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                captured_images[i] = Some(AllocImage { img: cap_raw, allocation: cap_alloc });
+                captured_views[i]  = cap_view;
+
+                let (a_raw, a_alloc) = create_blur_image(
+                    &device, &mut allocator, win_w, win_h, blur_fmt,
+                );
+                let a_view = create_image_view(&device, a_raw, blur_fmt);
+                transition_image_layout(&device, cmd, a_raw,
+                                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+                blur_images_a[i] = Some(AllocImage { img: a_raw, allocation: a_alloc });
+                blur_views_a[i]  = a_view;
+
+                let (b_raw, b_alloc) = create_blur_image(
+                    &device, &mut allocator, win_w, win_h, blur_fmt,
+                );
+                let b_view = create_image_view(&device, b_raw, blur_fmt);
+                transition_image_layout(&device, cmd, b_raw,
+                                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                blur_images_b[i] = Some(AllocImage { img: b_raw, allocation: b_alloc });
+                blur_views_b[i]  = b_view;
+
+                write_blur_desc_set(&device, blur_desc_sets_h[i], cap_view,  blur_sampler, a_view);
+                write_blur_desc_set(&device, blur_desc_sets_v[i], a_view,    blur_sampler, b_view);
+            }
+
+            submit_one_shot(&device, cmd, queue);
+            device.destroy_command_pool(pool, None);
+        }
+
+        // Write frame 0's blur_b into main descriptor set
+        let blur_img_info = [vk::DescriptorImageInfo::default()
+                             .image_view(blur_views_b[0])
+                             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let blur_smp_info = [vk::DescriptorImageInfo::default()
+                             .sampler(blur_sampler)];
+        device.update_descriptor_sets(&[
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&blur_img_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&blur_smp_info),
+        ], &[]);
+
         Gpu {
+            blur_desc_sets_h,
+            blur_desc_sets_v,
+            blur_images_a,
+            blur_images_b,
+            blur_views_a,
+            blur_views_b,
+            captured_images,
+            captured_views,
+
+            overlay_mode: true,
+
             one_shot_cmd_pool,
             one_shot_cmd_buf,
             upload_fence:       device.create_fence(
@@ -1085,6 +1405,30 @@ impl Gpu {
             device,
             surface,
             surface_ext,
+            queue_family,
+            swapchain_images,
+            blur_batch_pool:  vec![Batch::full_window(win_w as _, win_h as _)],
+            blur_batch_count: 1,
+            blur_vertex_buffer: Some(AllocBuffer { buffer: blur_vbuf, allocation: blur_valloc }),
+            current_blur_vertex_buffer_capacity: INITIAL_BLUR_VERTEX_BUFFER_CAPACITY,
+            blur_draw_scratch: Vec::with_capacity(16),
+            captured_image: Some(AllocImage { img: cap_img_raw, allocation: cap_alloc }),
+            captured_view,
+            blur_image_a: Some(AllocImage { img: blur_a_raw, allocation: blur_a_alloc }),
+            blur_view_a,
+            blur_image_b: Some(AllocImage { img: blur_b_raw, allocation: blur_b_alloc }),
+            blur_view_b,
+            blur_sampler,
+            composite_render_pass,
+            composite_framebuffers,
+            composite_pipeline,
+            blur_desc_set_layout,
+            blur_pipeline_layout,
+            blur_h_pipeline,
+            blur_v_pipeline,
+            blur_desc_set_h,
+            blur_desc_set_v,
+            blur_descriptor_pool,
             _instance: instance,
             _entry: entry,
         }
@@ -1099,9 +1443,38 @@ impl Gpu {
         //
         self.device.wait_for_fences(&[frame.fence], true, u64::MAX).unwrap();
 
+        // Flush retired buffers from this frame slot (fence just signaled)
+        let frame = &mut self.frames[fi];
+        for (buf, alloc) in frame.retired_buffers.drain(..) {
+            self.allocator.as_mut().unwrap().free(alloc).unwrap();
+            self.device.destroy_buffer(buf, None);
+        }
+
+        let blur_total: usize = self.blur_batch_pool[..self.blur_batch_count]
+            .iter().map(|b| b.verts.len()).sum();
+        let blur_bytes = (blur_total * std::mem::size_of::<Vert>()) as u64;
+
+        //
+        // Blur vertex buffer resize
+        //
+        if blur_bytes > self.current_blur_vertex_buffer_capacity {
+            let new_cap = (blur_bytes * 2).max(INITIAL_BLUR_VERTEX_BUFFER_CAPACITY);
+            let alloc   = self.allocator.as_mut().unwrap();
+            let old     = self.blur_vertex_buffer.take().unwrap();
+            // Retire instead of immediately destroying
+            self.frames[fi].retired_buffers.push((old.buffer, old.allocation));
+            let (buf, allocation) = create_buffer(
+                &self.device, alloc, new_cap,
+                vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu,
+            );
+            self.blur_vertex_buffer = Some(AllocBuffer { buffer: buf, allocation });
+            self.current_blur_vertex_buffer_capacity = new_cap;
+        }
+
         //
         // Acquire swapchain image
         //
+        let frame = &self.frames[fi];
         let (img_idx, suboptimal) = match self.swapchain_ext.acquire_next_image(
             self.swapchain, u64::MAX, frame.image_available, vk::Fence::null(),
         ) {
@@ -1119,6 +1492,30 @@ impl Gpu {
         //
         // Build vertex data
         //
+
+        self.blur_draw_scratch.clear();
+
+        if blur_bytes > 0 {
+            let vb  = self.blur_vertex_buffer.as_mut().unwrap();
+            let ptr = vb.allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+            let mut offset = 0usize;
+            let mut vert_offset = 0u32;
+            for batch in &self.blur_batch_pool[..self.blur_batch_count] {
+                if batch.verts.is_empty() { continue; }
+                let bytes = bytemuck::cast_slice::<Vert, u8>(&batch.verts);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), bytes.len());
+                let end = vert_offset + batch.verts.len() as u32;
+                self.blur_draw_scratch.push(DrawCmd { range: vert_offset..end, clip: batch.clip });
+                offset      += bytes.len();
+                vert_offset  = end;
+            }
+        }
+
+        // Reset blur batches
+        for batch in &mut self.blur_batch_pool[..self.blur_batch_count] { batch.verts.clear(); }
+        self.blur_batch_count = 1;
+        self.blur_batch_pool[0].clip = [0.0, 0.0, self.win_w, self.win_h];
+
         let total_verts: usize = self.batch_pool[..self.batch_count].iter().map(|b| b.verts.len()).sum();
         let byte_size = (total_verts * std::mem::size_of::<Vert>()) as u64;
 
@@ -1226,6 +1623,214 @@ impl Gpu {
         }
 
         self.device.cmd_end_render_pass(cmd);
+
+        if blur_bytes > 0 {
+            let cap_img = self.captured_images[fi].as_ref().unwrap().img;
+            let blur_a  = self.blur_images_a[fi].as_ref().unwrap().img;
+            let blur_b  = self.blur_images_b[fi].as_ref().unwrap().img;
+
+            //
+            // Update main descriptor set to this frame's blur_b
+            //
+            let blur_img_info = [vk::DescriptorImageInfo::default()
+                                 .image_view(self.blur_views_b[fi])
+                                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let blur_smp_info = [vk::DescriptorImageInfo::default()
+                                 .sampler(self.blur_sampler)];
+            self.device.update_descriptor_sets(&[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&blur_img_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .image_info(&blur_smp_info),
+            ], &[]);
+
+            // swapchain -> TRANSFER_SRC
+            image_barrier(&self.device, cmd, self.swapchain_images[img_idx as usize],
+                          vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                          vk::PipelineStageFlags::TRANSFER,
+                          vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                          vk::AccessFlags::TRANSFER_READ,
+                          vk::ImageLayout::PRESENT_SRC_KHR,
+                          vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            );
+
+            // captured -> TRANSFER_DST
+            image_barrier(&self.device, cmd, cap_img,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::PipelineStageFlags::TRANSFER,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::AccessFlags::TRANSFER_WRITE,
+                          vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                          vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+
+            let subresource = vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0, base_array_layer: 0, layer_count: 1,
+            };
+            self.device.cmd_copy_image(
+                cmd,
+                self.swapchain_images[img_idx as usize],
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                cap_img,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::ImageCopy::default()
+                  .src_subresource(subresource)
+                  .dst_subresource(subresource)
+                  .extent(vk::Extent3D {
+                      width: self.win_w as u32, height: self.win_h as u32, depth: 1,
+                  })],
+            );
+
+            // swapchain -> PRESENT_SRC (restore)
+            image_barrier(&self.device, cmd, self.swapchain_images[img_idx as usize],
+                          vk::PipelineStageFlags::TRANSFER,
+                          vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                          vk::AccessFlags::TRANSFER_READ,
+                          vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                          vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                          vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+
+            // captured -> SHADER_READ for compute
+            image_barrier(&self.device, cmd, cap_img,
+                          vk::PipelineStageFlags::TRANSFER,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::AccessFlags::TRANSFER_WRITE,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                          vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+
+            //
+            // blur_a ready for write
+            //
+            image_barrier(&self.device, cmd, blur_a,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::AccessFlags::SHADER_WRITE,
+                          vk::ImageLayout::GENERAL,
+                          vk::ImageLayout::GENERAL,
+            );
+
+            // Blur H
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.blur_h_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE,
+                self.blur_pipeline_layout, 0, &[self.blur_desc_sets_h[fi]], &[],
+            );
+            let gx = (self.win_w as u32 + 15) / 16;
+            let gy = (self.win_h as u32 + 15) / 16;
+            self.device.cmd_dispatch(cmd, gx, gy, 1);
+
+            // blur_a -> SHADER_READ
+            image_barrier(&self.device, cmd, blur_a,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::AccessFlags::SHADER_WRITE,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::ImageLayout::GENERAL,
+                          vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+
+            // blur_b -> GENERAL for write
+            image_barrier(&self.device, cmd, blur_b,
+                          vk::PipelineStageFlags::FRAGMENT_SHADER,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::AccessFlags::SHADER_WRITE,
+                          vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                          vk::ImageLayout::GENERAL,
+            );
+
+            // Blur V
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.blur_v_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE,
+                self.blur_pipeline_layout, 0, &[self.blur_desc_sets_v[fi]], &[],
+            );
+            self.device.cmd_dispatch(cmd, gx, gy, 1);
+
+            // blur_b -> SHADER_READ for frag
+            image_barrier(&self.device, cmd, blur_b,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::PipelineStageFlags::FRAGMENT_SHADER,
+                          vk::AccessFlags::SHADER_WRITE,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::ImageLayout::GENERAL,
+                          vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+
+            //
+            // restore blur_a to GENERAL for next frame
+            //
+            image_barrier(&self.device, cmd, blur_a,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::PipelineStageFlags::COMPUTE_SHADER,
+                          vk::AccessFlags::SHADER_READ,
+                          vk::AccessFlags::SHADER_WRITE,
+                          vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                          vk::ImageLayout::GENERAL,
+            );
+
+            //
+            //
+            // Composite pass
+            //
+            //
+
+            let rp_begin = vk::RenderPassBeginInfo::default()
+                .render_pass(self.composite_render_pass)
+                .framebuffer(self.composite_framebuffers[img_idx as usize])
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D { width: self.win_w as u32, height: self.win_h as u32 },
+                })
+                .clear_values(&[]);
+
+            self.device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.composite_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout, 0, &[self.descriptor_set], &[],
+            );
+            self.device.cmd_set_viewport(cmd, 0, &[vk::Viewport {
+                x: 0.0, y: 0.0, width: self.win_w, height: self.win_h,
+                min_depth: 0.0, max_depth: 1.0,
+            }]);
+            self.device.cmd_push_constants(
+                cmd, self.pipeline_layout, vk::ShaderStageFlags::FRAGMENT,
+                0, bytemuck::cast_slice(&[self.win_w, self.win_h]),
+            );
+
+            self.device.cmd_bind_vertex_buffers(
+                cmd, 0, &[self.blur_vertex_buffer.as_ref().unwrap().buffer], &[0],
+            );
+            for DrawCmd { range, clip } in &self.blur_draw_scratch {
+                let cx     = clip[0].max(0.0) as u32;
+                let cy     = clip[1].max(0.0) as u32;
+                let right  = (clip[0] + clip[2]).min(self.win_w) as u32;
+                let bottom = (clip[1] + clip[3]).min(self.win_h) as u32;
+                let cw = right.saturating_sub(cx);
+                let ch = bottom.saturating_sub(cy);
+                if cw == 0 || ch == 0 { continue; }
+                self.device.cmd_set_scissor(cmd, 0, &[vk::Rect2D {
+                    offset: vk::Offset2D { x: cx as i32, y: cy as i32 },
+                    extent: vk::Extent2D { width: cw, height: ch },
+                }]);
+                self.device.cmd_draw(cmd, range.end - range.start, 1, range.start, 0);
+            }
+
+            self.device.cmd_end_render_pass(cmd);
+        }
+
         self.device.end_command_buffer(cmd).unwrap();
 
         //
@@ -1282,6 +1887,100 @@ impl Gpu {
             &self.device, &self.swapchain_views, self.render_pass,
             self.win_w as u32, self.win_h as u32,
         );
+
+        self.swapchain_images = images;
+        self.composite_framebuffers = create_framebuffers(
+            &self.device, &self.swapchain_views, self.composite_render_pass,
+            self.win_w as u32, self.win_h as u32,
+        );
+
+        // Destroy per-frame blur resources
+        for i in 0..FRAMES_IN_FLIGHT {
+            self.device.destroy_image_view(self.captured_views[i], None);
+            self.device.destroy_image_view(self.blur_views_a[i], None);
+            self.device.destroy_image_view(self.blur_views_b[i], None);
+            if let Some(img) = self.captured_images[i].take() {
+                self.allocator.as_mut().unwrap().free(img.allocation).unwrap();
+                self.device.destroy_image(img.img, None);
+            }
+            if let Some(img) = self.blur_images_a[i].take() {
+                self.allocator.as_mut().unwrap().free(img.allocation).unwrap();
+                self.device.destroy_image(img.img, None);
+            }
+            if let Some(img) = self.blur_images_b[i].take() {
+                self.allocator.as_mut().unwrap().free(img.allocation).unwrap();
+                self.device.destroy_image(img.img, None);
+            }
+        }
+
+        // Recreate
+        let blur_fmt = vk::Format::R8G8B8A8_UNORM;
+        {
+            let pool = create_cmd_pool(&self.device, self.queue_family);
+            let cmd  = alloc_cmd_buf(&self.device, pool);
+            begin_one_shot(&self.device, cmd);
+
+            for i in 0..FRAMES_IN_FLIGHT {
+                let (cap_raw, cap_alloc) = create_captured_image(
+                    &self.device, self.allocator.as_mut().unwrap(),
+                    self.win_w as u32, self.win_h as u32, self.surface_format.format,
+                );
+                let cap_view = create_image_view(&self.device, cap_raw, self.surface_format.format);
+                transition_image_layout(&self.device, cmd, cap_raw,
+                                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                self.captured_images[i] = Some(AllocImage { img: cap_raw, allocation: cap_alloc });
+                self.captured_views[i]  = cap_view;
+
+                let (a_raw, a_alloc) = create_blur_image(
+                    &self.device, self.allocator.as_mut().unwrap(),
+                    self.win_w as u32, self.win_h as u32, blur_fmt,
+                );
+                let a_view = create_image_view(&self.device, a_raw, blur_fmt);
+                transition_image_layout(&self.device, cmd, a_raw,
+                                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+                self.blur_images_a[i] = Some(AllocImage { img: a_raw, allocation: a_alloc });
+                self.blur_views_a[i]  = a_view;
+
+                let (b_raw, b_alloc) = create_blur_image(
+                    &self.device, self.allocator.as_mut().unwrap(),
+                    self.win_w as u32, self.win_h as u32, blur_fmt,
+                );
+                let b_view = create_image_view(&self.device, b_raw, blur_fmt);
+                transition_image_layout(&self.device, cmd, b_raw,
+                                        vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                self.blur_images_b[i] = Some(AllocImage { img: b_raw, allocation: b_alloc });
+                self.blur_views_b[i]  = b_view;
+
+                write_blur_desc_set(&self.device, self.blur_desc_sets_h[i],
+                                    cap_view, self.blur_sampler, a_view);
+                write_blur_desc_set(&self.device, self.blur_desc_sets_v[i],
+                                    a_view, self.blur_sampler, b_view);
+            }
+
+            submit_one_shot(&self.device, cmd, self.queue);
+            self.device.destroy_command_pool(pool, None);
+        }
+
+        // Update main descriptor set to frame 0's new blur_b
+        let blur_img_info = [vk::DescriptorImageInfo::default()
+                             .image_view(self.blur_views_b[0])
+                             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let blur_smp_info = [vk::DescriptorImageInfo::default()
+                             .sampler(self.blur_sampler)];
+        self.device.update_descriptor_sets(&[
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&blur_img_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&blur_smp_info),
+        ], &[]);
+
+        self.blur_batch_pool[0].clip = [0.0, 0.0, self.win_w, self.win_h];
     }
 }
 
@@ -1495,14 +2194,22 @@ unsafe fn create_desc_set_layout(device: &ash::Device) -> vk::DescriptorSetLayou
             .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-
         vk::DescriptorSetLayoutBinding::default()
             .binding(1)
             .descriptor_type(vk::DescriptorType::SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
     ];
-
     device.create_descriptor_set_layout(
         &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
         None,
@@ -1695,17 +2402,23 @@ unsafe fn transition_image_layout(
             vk::AccessFlags::SHADER_READ,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
         ),
-        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
-            vk::AccessFlags::empty(),
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-        ),
         (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
             vk::AccessFlags::SHADER_READ,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
+        ),
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL) => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+        ),
+        (vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
+            vk::AccessFlags::empty(),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
         ),
 
         _ => panic!("unsupported layout transition {from:?} -> {to:?}"),
@@ -1762,4 +2475,175 @@ unsafe fn submit_one_shot(device: &ash::Device, cmd: vk::CommandBuffer, queue: v
     device.end_command_buffer(cmd).unwrap();
     device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
     device.queue_wait_idle(queue).unwrap();
+}
+
+unsafe fn create_captured_image(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    w: u32, h: u32,
+    format: vk::Format,
+) -> (vk::Image, Allocation) {
+    create_image(
+        device, allocator, w, h, format,
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+    )
+}
+
+unsafe fn create_blur_image(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    w: u32, h: u32,
+    format: vk::Format,
+) -> (vk::Image, Allocation) {
+    create_image(
+        device, allocator, w, h, format,
+        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+    )
+}
+
+unsafe fn create_blur_desc_set_layout(device: &ash::Device) -> vk::DescriptorSetLayout {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE),
+    ];
+    device.create_descriptor_set_layout(
+        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+        None,
+    ).unwrap()
+}
+
+unsafe fn create_blur_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    spv: &[u8],
+) -> vk::Pipeline {
+    // SPIR-V words must be 4-byte aligned
+    assert!(spv.len() % 4 == 0, "SPIR-V size not multiple of 4");
+    let spv_words: Vec<u32> = spv.chunks(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+
+    let module = device.create_shader_module(
+        &vk::ShaderModuleCreateInfo::default()
+            .code(&spv_words),
+        None,
+    ).unwrap();
+    let pipeline = device.create_compute_pipelines(
+        vk::PipelineCache::null(),
+        &[vk::ComputePipelineCreateInfo::default()
+            .stage(vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(c"main"))
+            .layout(layout)],
+        None,
+    ).unwrap()[0];
+    device.destroy_shader_module(module, None);
+    pipeline
+}
+
+unsafe fn write_blur_desc_set(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    src_view: vk::ImageView,
+    src_sampler: vk::Sampler,
+    dst_view: vk::ImageView,
+) {
+    let src_info = [vk::DescriptorImageInfo::default()
+        .image_view(src_view)
+        .sampler(src_sampler)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+    let dst_info = [vk::DescriptorImageInfo::default()
+        .image_view(dst_view)
+        .image_layout(vk::ImageLayout::GENERAL)];
+    device.update_descriptor_sets(&[
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&src_info),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&dst_info),
+    ], &[]);
+}
+
+unsafe fn image_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+) {
+    let barrier = vk::ImageMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask:      vk::ImageAspectFlags::COLOR,
+            base_mip_level:   0,
+            level_count:      1,
+            base_array_layer: 0,
+            layer_count:      1,
+        });
+    device.cmd_pipeline_barrier(
+        cmd, src_stage, dst_stage,
+        vk::DependencyFlags::empty(),
+        &[], &[], &[barrier],
+    );
+}
+
+unsafe fn create_composite_render_pass(
+    device: &ash::Device,
+    format: vk::Format,
+) -> vk::RenderPass {
+    let attachment = vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .initial_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+
+    let color_ref = vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+
+    let subpass = vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(std::slice::from_ref(&color_ref));
+
+    let dependency = vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+    device.create_render_pass(
+        &vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&attachment))
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(std::slice::from_ref(&dependency)),
+        None,
+    ).unwrap()
 }
