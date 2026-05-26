@@ -1254,8 +1254,7 @@ pub fn render_text_layout(
     let scale = editor.scale;
 
     let active_view_id = editor.active_view_id();
-    // let is_our_window_focused = editor.is_our_window_focused;
-    let is_our_window_focused = true;
+    let is_our_window_focused = editor.is_our_window_focused;
     let is_this_view_focused = is_our_window_focused && active_view_id == view.id;
 
     let rect         = layout.rect;
@@ -3406,6 +3405,7 @@ impl Editor {
         }
 
         self.active_panel = panel_id;
+        self.active_view_mut().panel_id = panel_id;
     }
 
     pub fn snap_cursor_to_target(&mut self, view_id: ViewId, target_line: u32, target_col: u32, panel_rect: Rect) {
