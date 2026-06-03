@@ -515,7 +515,7 @@ fn apply_panel(editor: &mut Editor, node: &SessionPanel, leaf_views: &[ViewId]) 
                     rect_including_panel_bar: Rect::default(),
                     kind: PanelKind::Leaf { view_id },
                 });
-                editor.views[view_id].panel_id = panel_id;
+                editor.views[view_id].panel_id = panel_id.into();
                 panel_id
             }
         }

@@ -1,0 +1,11 @@
+[package]
+name = "tracy"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# profiling
+enable = ["tracy-client/enable"]
+
+[dependencies]
+tracy-client = { version = "0.17.3", default-features = false }

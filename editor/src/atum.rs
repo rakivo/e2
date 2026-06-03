@@ -66,15 +66,6 @@ impl AtomTable {
     }
 
     /// Intern a string. Fast-path is zero-allocation for existing strings.
-    ///
-    /// ```rust
-    /// use atum::AtomTable;
-    /// let tbl = AtomTable::new();
-    /// let atom = tbl.intern("Hello, Sailor!");
-    /// assert_eq!(tbl.lookup_ref(atom).as_ref(), "Hello, Sailor!");
-    /// assert_eq!(tbl.intern("Hello, Sailor!"), atom);
-    /// ```
-    ///
     /// Returns an `Atom` unique for the interned string.
     #[inline(always)]
     pub fn intern(&self, s: &str) -> Atom {
@@ -141,18 +132,6 @@ impl AtomTable {
     /// Pin a guard for batch operations.
     ///
     /// Use this with `intern_with_guard` when interning many strings:
-    /// ```rust
-    /// use atum::AtomTable;
-    /// let tbl = AtomTable::new();
-    /// let guard = tbl.pin();
-    /// let strings: &[&str] = &[
-    ///     "unfortunately", "there's", "a",
-    ///     "radio", "connected", "to", "my", "brain"
-    /// ];
-    /// for s in strings {
-    ///     tbl.intern_with_guard(s, &guard);
-    /// }
-    /// ```
     #[inline]
     pub fn pin(&self) -> StrToIdMapRef<'_, '_> {
         self.str_to_atom_id.pin()

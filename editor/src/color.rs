@@ -70,6 +70,11 @@ impl Color {
     }
 
     #[inline(always)]
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Color { r, g, b, a: 255 }
+    }
+
+    #[inline(always)]
     pub fn with_alpha(self, alpha: f32) -> Self {
         Self::rgba(self.r, self.g, self.b, (alpha * 255.0) as u8)
     }

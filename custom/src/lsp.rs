@@ -68,6 +68,14 @@ impl LspClient {
         Self(None)
     }
 
+    pub fn is_disabled(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
     // Spawn the LSP server process and send initialize/initialized.
     // Blocks until the server responds to initialize - this is the right
     // place to block because the editor isn't ready to use LSP yet anyway.

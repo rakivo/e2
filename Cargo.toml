@@ -1,5 +1,5 @@
 [workspace]
-members = ["editor", "core", "editor-macros", "custom"]
+members = ["editor", "core", "editor-macros", "custom", "tracy"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -15,7 +15,7 @@ smallvec = "1.15.1"
 paste = "1.0.15"
 crossbeam-channel = { version = "0.5.15", default-features = false, features = ["std"] }
 libloading = { version = "0.9.0", default-features = false, features = ["std"] }
-tracy-client = { version = "0.17.3", default-features = false }
+piece-tree = { version = "0.1.6", features = ["runtime-dispatch-simd"] }
 
 [profile.dev]
 debug = false  # default off for everything
@@ -35,7 +35,7 @@ debug = true
 [profile.dev.package.rustc-edit-distance]
 debug = true
 
-[profile.dev.package.ropey]
+[profile.dev.package.piece-tree]
 debug = true
 
 [profile.dev.package.smallvec]
@@ -93,3 +93,14 @@ strip = true
 debug = 0
 overflow-checks = false
 debug-assertions = false
+
+# also: set RUSTFLAGS="-C force-frame-pointers=yes"
+[profile.profiling]
+inherits = "release"
+debug = true                      # keep DWARF symbols
+split-debuginfo = "packed"        # so perf can find them easily (Linux)
+strip = "none"                    # don’t strip symbols
+lto = false
+codegen-units = 16
+overflow-checks = false
+panic = "abort"                   # optional: less noise, smaller code

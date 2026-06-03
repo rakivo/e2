@@ -229,7 +229,7 @@ fn main() {
     // #[cfg(feature = "dhat")]
     // let _profiler = dhat::Profiler::new_heap();
 
-    let _client = tracy_client::Client::start();
+    let _client = tracy::Client::start();
 
     // @Note: We want to start Audio initialization as soon as possible,
     // because audio servers tend to be VERY slow when trying to initialize a connection,
@@ -367,7 +367,6 @@ fn run(mut app: App) {
         // Tick messager
         //
         let messager_needs_redraw = {
-
             let now = Instant::now();
             let dt_for_messager = now.duration_since(editor.last_frame_time).as_secs_f32().min(0.05);
             editor.messager.tick(dt_for_messager);
@@ -425,6 +424,7 @@ fn run(mut app: App) {
             //
             if let Event::KeyDown { keymod, .. } | Event::KeyUp { keymod, .. } = event {
                 app.mods = mods_from_sdl(keymod);
+                app.editor.modifiers = app.mods; // @Cleanup nocheckin
             }
 
             let gpu    = app.gpu.as_mut().unwrap();
@@ -487,7 +487,7 @@ fn run(mut app: App) {
                     );
                 }
 
-                Event::TextInput { text, .. } => {
+                Event::TextInput { ref text, .. } => {
                     input_this_frame = true;
 
                     let Mods { ctrl, alt, .. } = app.mods;
@@ -522,7 +522,7 @@ fn run(mut app: App) {
 
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
 
-                    let dy = y as f32;
+                    let dy = y as f32*20.5;
 
                     let mouse_wheel_scrolled = editor.hooks.mouse_wheel_scrolled;
                     let (
@@ -552,7 +552,7 @@ fn run(mut app: App) {
                     let line_h  = editor.line_h();
 
                     let old_scroll = editor.views[view_id].scroll;
-                    let new_scroll = (old_scroll - dy * 75.0).max(0.0); // @Tune
+                    let new_scroll = (old_scroll - dy * 3.0).max(0.0); // @Tune
                     let max_scroll = editor.max_scroll_of(view_id);
                     editor.views[view_id].scroll = new_scroll.min(max_scroll);
 
@@ -564,7 +564,7 @@ fn run(mut app: App) {
                     let first_vis  = (scroll / line_h) as u32;
                     let last_vis = (((scroll + rect.h) / line_h) as usize)
                         .saturating_sub(1)
-                        .min(total.saturating_sub(1)) as u32;
+                        .min(total.saturating_sub(1) as usize) as u32;
 
                     let new_line = if cur_line < first_vis {
                         first_vis
@@ -600,6 +600,11 @@ fn run(mut app: App) {
                     }
 
                     editor.mouse_left_pressed = true;
+
+                    editor.ui.update_interaction(
+                        [editor.mouse_pos.0, editor.mouse_pos.1],
+                        editor.mouse_left_pressed,
+                    );
                 }
 
                 Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
@@ -607,6 +612,11 @@ fn run(mut app: App) {
 
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
                     editor.mouse_left_pressed = false;
+
+                    editor.ui.update_interaction(
+                        [editor.mouse_pos.0, editor.mouse_pos.1],
+                        editor.mouse_left_pressed,
+                    );
                 }
 
                 Event::MouseMotion { x, y, .. } => {
@@ -615,6 +625,11 @@ fn run(mut app: App) {
                     last_input_time = Instant::now();
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
                     editor.mouse_pos = (x as f32, y as f32);
+
+                    editor.ui.update_interaction(
+                        [editor.mouse_pos.0, editor.mouse_pos.1],
+                        editor.mouse_left_pressed,
+                    );
 
                     let (custom_redraw, short_circuit) = run_hook!(
                         editor.hooks.mouse_moved,
@@ -656,12 +671,19 @@ fn run(mut app: App) {
             if !input_this_frame && app.editor.config.vsync {
                 let elapsed = app.editor.last_frame_time.elapsed();
                 if elapsed < target_frame_time {
-                    //
-                    // Sleep but wake immediately on input
-                    //
-                    let remaining = target_frame_time - elapsed;
-                    if let Some(early_event_) = event_pump.wait_event_timeout(remaining.as_millis() as u32) {
-                        early_event = Some(early_event_);
+                    let remaining_micros = (target_frame_time - elapsed).as_micros();
+
+                    // Sleep for most of the time to yield the CPU, but wake up ~2ms early
+                    if remaining_micros > 1500 {
+                        let sleep_ms = ((remaining_micros - 1500) / 1000) as u32;
+                        if let Some(early_event_) = event_pump.wait_event_timeout(sleep_ms) {
+                            early_event = Some(early_event_);
+                        }
+                    }
+
+                    // Spin-wait (busy loop) the final <2 milliseconds for perfect precision
+                    while app.editor.last_frame_time.elapsed() < target_frame_time {
+                        std::hint::spin_loop();
                     }
                 }
             }
@@ -764,8 +786,8 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
         keymap = keymap
     );
 
-    tracy_client::frame_mark();
-    let _render_span = tracy_client::span!("Render Frame");
+    tracy::frame_mark();
+    let _render_span = tracy::span!("Render Frame");
 
     ShouldRequestFrameRedraw::begin_frame(&mut editor.redraw_reasons);
 
@@ -921,7 +943,7 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
         let h = line_h * 0.7;
         let x = fc.x + (w * 0.5);  // Center it
         let y = fc.y + (line_h - h) * 0.5;
-        gpu::draw_rect(gpu, x, y, w, h, palette().cursor.with_alpha(fc.alpha * 0.6));
+        gpu::draw_rect_rounded(gpu, x, y, w, h, editor.cursor_radius(), palette().cursor.with_alpha(fc.alpha * 0.6));
 
         redraw = redraw.or_msg("Flying cursor", &mut editor.redraw_reasons);
     }
@@ -941,7 +963,9 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
             [w, font_size]
         });
 
+        gpu::push_overlay_mode(gpu);
         ui::render(&editor.ui, gpu);
+        gpu::pop_overlay_mode(gpu);
     }
 
     for buffer in editor.buffers.values_mut() {

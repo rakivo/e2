@@ -1,24 +1,30 @@
 #![allow(unused, dead_code)]
 
-use std::{borrow::Cow, fmt::Display, path::MAIN_SEPARATOR};
+use std::{borrow::Cow, fmt::{Write, Display}, path::MAIN_SEPARATOR};
+
+use smallstr::SmallString;
 
 #[inline]
-pub fn format_bytes(bytes: usize) -> String {
+pub fn format_bytes(bytes: usize) -> SmallString<[u8; 16]> {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
 
     let b = bytes as f64;
 
+    let mut s = SmallString::new();
+
     if b >= GB {
-        format!("{:.2} GB", b / GB)
+        _ = write!(&mut s, "{:.2} GB", b / GB);
     } else if b >= MB {
-        format!("{:.2} MB", b / MB)
+        _ = write!(&mut s, "{:.2} MB", b / MB);
     } else if b >= KB {
-        format!("{:.2} KB", b / KB)
+        _ = write!(&mut s, "{:.2} KB", b / KB);
     } else {
-        format!("{bytes} B")
+        _ = write!(&mut s, "{bytes} B");
     }
+
+    s
 }
 
 // pixel coords -> NDC (Y flipped: screen top = NDC +1)

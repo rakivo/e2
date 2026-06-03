@@ -2,7 +2,7 @@
 
 use crate::messager::MESSAGER_FONT_SIZE;
 use crate::util::format_bytes;
-use crate::{Editor, Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, scale_base_font_size, tracy};
+use crate::{Editor, Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, scale_base_font_size};
 use crate::color::{Color, GpuColor, lerp_color};
 
 use std::ffi::CStr;
@@ -21,6 +21,13 @@ pub const INITIAL_BLUR_VERTEX_BUFFER_CAPACITY: u64 = 4 * 1024 * 1024;
 pub const FRAMES_IN_FLIGHT: usize      = 2;
 
 #[derive(Default, Debug, Clone, Copy)]
+pub struct GpuStar {
+    pub atlas_x: u16,
+    pub atlas_y: u16,
+    pub size:    u16,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
 pub struct GpuGlyph {
     pub uv_x: u16, pub uv_y: u16,
     pub uv_w: u16, pub uv_h: u16,
@@ -30,11 +37,19 @@ pub struct GpuGlyph {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vert {
     pub pos:   [f32; 2],
     pub uv:    [f32; 2],
+    pub uv2:   [f32; 3],
     pub color: GpuColor,
+}
+
+impl Vert {
+    #[inline]
+    pub const fn new(pos: [f32; 2], uv: [f32; 2], color: GpuColor) -> Self {
+        Self { color, pos, uv, uv2: [0.0; _] }
+    }
 }
 
 pub struct Batch {
@@ -211,6 +226,10 @@ pub struct Gpu {
 
     blur_resources:  [Option<BlurFrameResources>; FRAMES_IN_FLIGHT],
     descriptor_sets: [vk::DescriptorSet; FRAMES_IN_FLIGHT],
+
+    pub star: GpuStar,
+
+    _star_pixels: Vec<Box<[u8]>>
 }
 
 impl Gpu {
@@ -531,7 +550,7 @@ pub fn get_glyph_no_upload(gpu: &mut Gpu, c: char, size: f32) -> Option<GpuGlyph
     gpu.glyph_pixels.insert(key, image_data);
     gpu.pending_atlas_uploads.push(PendingAtlasUpload {
         x: atlas_x as u32, y: atlas_y as u32,
-        w: w as u32,        h: h as u32,
+        w: w as u32,       h: h as u32,
         data, data_len
     });
 
@@ -625,6 +644,62 @@ pub fn pop_clip(gpu: &mut Gpu) {
 }
 
 #[inline(always)]
+pub fn draw_rect_rounded(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) {
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let hw = w * 0.5;
+    let hh = h * 0.5;
+    let x0 =  x       * inv_sw * 2.0 - 1.0;
+    let x1 = (x + w)  * inv_sw * 2.0 - 1.0;
+    let y0 =  1.0 - y       * inv_sh * 2.0;
+    let y1 =  1.0 - (y + h) * inv_sh * 2.0;
+    let c: GpuColor = color.into();
+    let r_norm = (radius / hh.min(hw)).clamp(0.0, 1.0);
+    let verts = gpu.verts_mut();
+    verts.reserve(6);
+    macro_rules! v {
+        ($px:expr, $py:expr) => {
+            Vert { pos: [$px, $py], uv: [29000.0 + x, y], uv2: [x + w, y + h, r_norm], color: c }
+        };
+    }
+    verts.push(v!(x0, y0));
+    verts.push(v!(x1, y0));
+    verts.push(v!(x0, y1));
+    verts.push(v!(x1, y0));
+    verts.push(v!(x1, y1));
+    verts.push(v!(x0, y1));
+}
+
+#[inline(always)]
+pub fn draw_rect_rounded_outline(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, radius: f32, thickness: f32, color: Color) {
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let hw = w * 0.5;
+    let hh = h * 0.5;
+    let x0 =  x       * inv_sw * 2.0 - 1.0;
+    let x1 = (x + w)  * inv_sw * 2.0 - 1.0;
+    let y0 =  1.0 - y       * inv_sh * 2.0;
+    let y1 =  1.0 - (y + h) * inv_sh * 2.0;
+    let c: GpuColor = color.into();
+    let r_norm = (radius    / hh.min(hw)).clamp(0.0, 1.0);
+    let t_norm = (thickness / hh.min(hw)).clamp(0.0, 1.0);
+    let c = [c[0], c[1], c[2], r_norm];
+    let verts = gpu.verts_mut();
+    verts.reserve(6);
+    macro_rules! v {
+        ($px:expr, $py:expr) => {
+            Vert { pos: [$px, $py], uv: [39000.0 + x, y], uv2: [x + w, y + h, t_norm], color: GpuColor(c) }
+        };
+    }
+    verts.push(v!(x0, y0));
+    verts.push(v!(x1, y0));
+    verts.push(v!(x0, y1));
+    verts.push(v!(x1, y0));
+    verts.push(v!(x1, y1));
+    verts.push(v!(x0, y1));
+}
+
+#[inline(always)]
 pub fn draw_blur_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, tint: Color) {
     let inv_sw = 1.0 / gpu.win_w;
     let inv_sh = 1.0 / gpu.win_h;
@@ -636,12 +711,12 @@ pub fn draw_blur_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, tint: Color
     let verts = gpu.blur_verts_mut();
     let c  = tint.into_gpu();
     let uv = [-1.0f32, -1.0f32];
-    verts.push(Vert { pos: [x0, y0], uv, color: c });
-    verts.push(Vert { pos: [x1, y0], uv, color: c });
-    verts.push(Vert { pos: [x0, y1], uv, color: c });
-    verts.push(Vert { pos: [x1, y0], uv, color: c });
-    verts.push(Vert { pos: [x1, y1], uv, color: c });
-    verts.push(Vert { pos: [x0, y1], uv, color: c });
+    verts.push(Vert::new([x0, y0], uv, c));
+    verts.push(Vert::new([x1, y0], uv, c));
+    verts.push(Vert::new([x0, y1], uv, c));
+    verts.push(Vert::new([x1, y0], uv, c));
+    verts.push(Vert::new([x1, y1], uv, c));
+    verts.push(Vert::new([x0, y1], uv, c));
 }
 
 /// 4 rects, 24 verts
@@ -678,12 +753,12 @@ pub fn draw_rect_impl(
     let base = verts.len();
     unsafe {
         let p = verts.as_mut_ptr().add(base);
-        p.add(0).write(Vert { pos: [x0, y0], uv: [0.0, 0.0], color });
-        p.add(1).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color });
-        p.add(2).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color });
-        p.add(3).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color });
-        p.add(4).write(Vert { pos: [x1, y1], uv: [0.0, 0.0], color });
-        p.add(5).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color });
+        p.add(0).write(Vert::new([x0, y0], [0.0, 0.0], color));
+        p.add(1).write(Vert::new([x1, y0], [0.0, 0.0], color));
+        p.add(2).write(Vert::new([x0, y1], [0.0, 0.0], color));
+        p.add(3).write(Vert::new([x1, y0], [0.0, 0.0], color));
+        p.add(4).write(Vert::new([x1, y1], [0.0, 0.0], color));
+        p.add(5).write(Vert::new([x0, y1], [0.0, 0.0], color));
         verts.set_len(base + 6);
     }
 }
@@ -714,14 +789,111 @@ pub fn draw_rect_gradient_h(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color
     let base = verts.len();
     unsafe {
         let p = verts.as_mut_ptr().add(base);
-        p.add(0).write(Vert { pos: [x0, y0], uv: [0.0, 0.0], color: cl }); // top-left
-        p.add(1).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color: cr }); // top-right
-        p.add(2).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color: cl }); // bottom-left
-        p.add(3).write(Vert { pos: [x1, y0], uv: [0.0, 0.0], color: cr }); // top-right
-        p.add(4).write(Vert { pos: [x1, y1], uv: [0.0, 0.0], color: cr }); // bottom-right
-        p.add(5).write(Vert { pos: [x0, y1], uv: [0.0, 0.0], color: cl }); // bottom-left
+        p.add(0).write(Vert::new([x0, y0], [0.0, 0.0], cl)); // top-left
+        p.add(1).write(Vert::new([x1, y0], [0.0, 0.0], cr)); // top-right
+        p.add(2).write(Vert::new([x0, y1], [0.0, 0.0], cl)); // bottom-left
+        p.add(3).write(Vert::new([x1, y0], [0.0, 0.0], cr)); // top-right
+        p.add(4).write(Vert::new([x1, y1], [0.0, 0.0], cr)); // bottom-right
+        p.add(5).write(Vert::new([x0, y1], [0.0, 0.0], cl)); // bottom-left
         verts.set_len(base + 6);
     }
+}
+
+#[inline]
+pub fn draw_star(gpu: &mut Gpu, cx: f32, cy: f32, radius: f32, color: Color, star: GpuStar) {
+    let x = cx - radius;
+    let y = cy - radius;
+    let w = radius * 2.0;
+    let h = radius * 2.0;
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let color: GpuColor = color.into();
+
+    let u0 = star.atlas_x as f32;
+    let v0 = star.atlas_y as f32;
+    let u1 = star.atlas_x as f32 + star.size as f32;
+    let v1 = star.atlas_y as f32 + star.size as f32;
+
+    let x0 =  x      * inv_sw * 2.0 - 1.0;
+    let x1 = (x + w) * inv_sw * 2.0 - 1.0;
+    let y0 = 1.0 -  y      * inv_sh * 2.0;
+    let y1 = 1.0 - (y + h) * inv_sh * 2.0;
+
+    let verts = gpu.verts_mut();
+    verts.reserve(6);
+    let base = verts.len();
+    unsafe {
+        let p = verts.as_mut_ptr().add(base);
+        p.add(0).write(Vert::new([x0, y0], [u0, v0], color));
+        p.add(1).write(Vert::new([x1, y0], [u1, v0], color));
+        p.add(2).write(Vert::new([x0, y1], [u0, v1], color));
+        p.add(3).write(Vert::new([x1, y0], [u1, v0], color));
+        p.add(4).write(Vert::new([x1, y1], [u1, v1], color));
+        p.add(5).write(Vert::new([x0, y1], [u0, v1], color));
+        verts.set_len(base + 6);
+    }
+}
+
+pub fn generate_star8_texture(size: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (size * size) as usize];
+    let half      = size as f32 * 0.5;
+    let outer_r   = half * 0.82;
+    let inner_r   = outer_r * 0.72;
+    let glow_r    = half * 0.98;
+
+    for py in 0..size {
+        for px in 0..size {
+            let x = px as f32 - half + 0.5;
+            let y = py as f32 - half + 0.5;
+
+            let d = sdf_star8(x, y, outer_r, inner_r);
+
+            let aa    = 1.2_f32;
+            let core  = smoothstep(aa, -aa, d);
+            let glow_t = (d / (glow_r - outer_r)).max(0.0);
+            let glow  = (-glow_t * glow_t * 2.0).exp() * 0.5 * (1.0 - core);
+            let alpha = (core + glow).min(1.0);
+
+            pixels[(py * size + px) as usize] = (alpha * 255.0 + 0.5) as u8;
+        }
+    }
+
+    pixels
+}
+
+fn sdf_star8(x: f32, y: f32, outer_r: f32, inner_r: f32) -> f32 {
+    use std::f32::consts::PI;
+    let an = PI / 8.0;
+    let en = PI / 4.0;
+
+    let angle  = y.atan2(x);
+    let sector = (angle / en).round() * en;
+    let (s, c) = sector.sin_cos();
+    let px =  c * x + s * y;
+    let py = -s * x + c * y;
+
+    // Reflect into upper half
+    let py = py.abs();
+
+    let tip   = (outer_r, 0.0f32);
+    let inner = (an.cos() * inner_r, an.sin() * inner_r);
+
+    let edge  = (inner.0 - tip.0, inner.1 - tip.1);
+    let to_p  = (px - tip.0,      py - tip.1);
+    let len_sq = edge.0*edge.0 + edge.1*edge.1;
+    let t      = ((to_p.0*edge.0 + to_p.1*edge.1) / len_sq).clamp(0.0, 1.0);
+    let closest = (tip.0 + t*edge.0, tip.1 + t*edge.1);
+
+    let dist  = ((px-closest.0).powi(2) + (py-closest.1).powi(2)).sqrt();
+    let cross = edge.0*to_p.1 - edge.1*to_p.0;
+
+    // Positive cross = left of edge = inside star
+    if cross > 0.0 { -dist } else { dist }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[inline(always)]
@@ -781,12 +953,12 @@ pub fn draw_text_colored(
 
         unsafe {
             let v = ptr.add(count);
-            v.add(0).write(Vert { pos: [x0, y0], uv: [u0, v0], color });
-            v.add(1).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            v.add(2).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
-            v.add(3).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            v.add(4).write(Vert { pos: [x1, y1], uv: [u1, v1], color });
-            v.add(5).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
+            v.add(0).write(Vert::new([x0, y0], [u0, v0], color));
+            v.add(1).write(Vert::new([x1, y0], [u1, v0], color));
+            v.add(2).write(Vert::new([x0, y1], [u0, v1], color));
+            v.add(3).write(Vert::new([x1, y0], [u1, v0], color));
+            v.add(4).write(Vert::new([x1, y1], [u1, v1], color));
+            v.add(5).write(Vert::new([x0, y1], [u0, v1], color));
         }
         count += 6;
     }
@@ -893,17 +1065,194 @@ pub fn draw_text_for_editor(
 
         unsafe {
             let v = ptr.add(count);
-            v.add(0).write(Vert { pos: [x0, y0], uv: [u0, v0], color });
-            v.add(1).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            v.add(2).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
-            v.add(3).write(Vert { pos: [x1, y0], uv: [u1, v0], color });
-            v.add(4).write(Vert { pos: [x1, y1], uv: [u1, v1], color });
-            v.add(5).write(Vert { pos: [x0, y1], uv: [u0, v1], color });
+            v.add(0).write(Vert::new([x0, y0], [u0, v0], color));
+            v.add(1).write(Vert::new([x1, y0], [u1, v0], color));
+            v.add(2).write(Vert::new([x0, y1], [u0, v1], color));
+            v.add(3).write(Vert::new([x1, y0], [u1, v0], color));
+            v.add(4).write(Vert::new([x1, y1], [u1, v1], color));
+            v.add(5).write(Vert::new([x0, y1], [u0, v1], color));
         }
         count += 6;
     }
 
     unsafe { verts.set_len(base + count); }
+}
+
+pub fn draw_line(
+    gpu: &mut Gpu,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    thickness: f32,
+    color: Color,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= 0.0001 {
+        return;
+    }
+
+    let dir_x = dx / len;
+    let dir_y = dy / len;
+
+    //
+    // Perpendicular vector
+    //
+    let nx = -dir_y;
+    let ny =  dir_x;
+
+    //
+    // SDF Math setup
+    // Prevent division by zero if thickness is exactly 0
+    //
+    let r_visual = (thickness * 0.5).max(0.1);
+    let aa_margin = 1.5;  // 1.5 pixels of padding for soft anti-aliasing
+    let r_quad = r_visual + aa_margin;
+
+    //
+    // Normalize the UV coordinates so that `1.0` is exactly the visual edge
+    //
+    let v_edge = r_quad / r_visual;
+
+    let ox = nx * r_quad;
+    let oy = ny * r_quad;
+
+    let ax = x0 - ox;
+    let ay = y0 - oy;
+
+    let bx = x0 + ox;
+    let by = y0 + oy;
+
+    let cx = x1 + ox;
+    let cy = y1 + oy;
+
+    //
+    // Renamed to avoid shadowing the dx/dy calculation above
+    //
+    let dx_vert = x1 - ox;
+    let dy_vert = y1 - oy;
+
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+
+    let verts = gpu.verts_mut();
+    let color: GpuColor = color.into();
+
+    verts.reserve(6);
+
+    let line_sentinel = 20000.0;
+
+    let mut push = |x: f32, y: f32, v: f32| {
+        let px = x * inv_sw * 2.0 - 1.0;
+        let py = 1.0 - y * inv_sh * 2.0;
+
+        verts.push(Vert::new(
+            [px, py],
+            [line_sentinel, v],
+            color,
+        ));
+    };
+
+    // Tri 1
+    push(ax, ay, -v_edge);
+    push(bx, by, v_edge);
+    push(cx, cy, v_edge);
+
+    // Tri 2
+    push(ax, ay, -v_edge);
+    push(cx, cy, v_edge);
+    push(dx_vert, dy_vert, -v_edge);
+}
+
+pub fn draw_circle(
+    gpu: &mut Gpu,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    color: Color,
+) {
+    let cx = cx.round();
+    let cy = cy.round();
+
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let verts = gpu.verts_mut();
+    let color: GpuColor = color.into();
+
+    verts.reserve(6);
+
+    let mut push = |x: f32, y: f32, uv_x: f32, uv_y: f32| {
+        let px = x * inv_sw * 2.0 - 1.0;
+        let py = 1.0 - y * inv_sh * 2.0;
+
+        verts.push(Vert::new(
+            [px, py],
+            [uv_x, uv_y],
+            color,
+        ));
+    };
+
+    let min_x = cx - radius;
+    let max_x = cx + radius;
+    let min_y = cy - radius;
+    let max_y = cy + radius;
+
+    let circle_sentinel = 10000.0;
+
+    // Tri 1
+    push(min_x, min_y, -1.0 + circle_sentinel, -1.0 + circle_sentinel);
+    push(max_x, min_y,  1.0 + circle_sentinel, -1.0 + circle_sentinel);
+    push(max_x, max_y,  1.0 + circle_sentinel,  1.0 + circle_sentinel);
+
+    // Tri 2
+    push(min_x, min_y, -1.0 + circle_sentinel, -1.0 + circle_sentinel);
+    push(max_x, max_y,  1.0 + circle_sentinel,  1.0 + circle_sentinel);
+    push(min_x, max_y, -1.0 + circle_sentinel,  1.0 + circle_sentinel);
+}
+
+pub fn draw_circle_with_border(
+    gpu: &mut Gpu,
+    cx: f32, cy: f32, radius: f32,
+    thickness: f32,
+    fill_color: Color,
+    border_color: Color,
+) {
+    // 1. Draw the border circle (slightly larger)
+    draw_circle(gpu, cx, cy, radius + thickness, border_color);
+    // 2. Draw the inner circle (the core)
+    draw_circle(gpu, cx, cy, radius, fill_color);
+}
+
+pub fn upload_star_texture(gpu: &mut Gpu, size: u32) -> GpuStar {
+    let pixels = generate_star8_texture(size);
+    let s = size as u16;
+
+    if gpu.atlas_cur_x + s > ATLAS_SIZE as u16 {
+        gpu.atlas_cur_x  = 1;
+        gpu.atlas_cur_y += gpu.atlas_row_h + 1;
+        gpu.atlas_row_h  = 0;
+    }
+    let ax = gpu.atlas_cur_x;
+    let ay = gpu.atlas_cur_y;
+    gpu.atlas_cur_x += s + 1;
+    gpu.atlas_row_h  = gpu.atlas_row_h.max(s);
+
+    gpu._star_pixels.push(pixels.into_boxed_slice());  // @KindaHack
+
+    let pixels = gpu._star_pixels.last().unwrap();
+    gpu.pending_atlas_uploads.push(PendingAtlasUpload {
+        x: ax as u32,
+        y: ay as u32,
+        w: size,
+        h: size,
+        data_len: pixels.len(),
+        data: pixels.as_ptr(),
+    });
+
+    GpuStar { atlas_x: ax, atlas_y: ay, size: s }
 }
 
 impl Gpu {
@@ -1322,7 +1671,7 @@ impl Gpu {
         let one_shot_cmd_pool = create_cmd_pool(&device, queue_family);
         let one_shot_cmd_buf  = alloc_cmd_buf(&device, one_shot_cmd_pool);
 
-        Gpu {
+        let mut gpu = Gpu {
             overlay_mode: false,
 
             blur_desc_sets_h_stored,
@@ -1402,7 +1751,14 @@ impl Gpu {
             surface_ext,
             _instance: instance,
             _entry: entry,
-        }
+
+            star: Default::default(),
+            _star_pixels: Default::default()
+        };
+
+        gpu.star = upload_star_texture(&mut gpu, 100);
+
+        gpu
     }
 
     unsafe fn submit_frame_impl(&mut self) -> Result<(), vk::Result> {
@@ -2021,24 +2377,34 @@ unsafe fn create_swapchain(
 ) -> (vk::SwapchainKHR, Vec<vk::Image>) {
     let caps = surface_ext.get_physical_device_surface_capabilities(pdev, surface).unwrap();
 
-    let image_count = (caps.min_image_count + 1).min(
-        if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count }
-    );
+    let available_present_modes = surface_ext
+        .get_physical_device_surface_present_modes(pdev, surface)
+        .unwrap();
+
+    let present_mode = if available_present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else if available_present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+        vk::PresentModeKHR::IMMEDIATE
+    } else {
+        vk::PresentModeKHR::FIFO
+    };
+
+    let target_image_count = if present_mode == vk::PresentModeKHR::MAILBOX {
+        caps.min_image_count.max(3)
+    } else {
+        caps.min_image_count.max(2)
+    };
+
+    let image_count = if caps.max_image_count > 0 {
+        target_image_count.min(caps.max_image_count)
+    } else {
+        target_image_count
+    };
 
     let extent = vk::Extent2D {
         width:  w.clamp(caps.min_image_extent.width,  caps.max_image_extent.width),
         height: h.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
     };
-
-    let available_present_modes = surface_ext
-        .get_physical_device_surface_present_modes(pdev, surface)
-        .unwrap();
-
-    let present_mode = available_present_modes
-        .iter()
-        .copied()
-        .find(|&m| m == vk::PresentModeKHR::MAILBOX)
-        .unwrap_or(vk::PresentModeKHR::FIFO);
 
     let sc = sc_ext.create_swapchain(
         &vk::SwapchainCreateInfoKHR::default()
@@ -2205,9 +2571,10 @@ unsafe fn create_pipeline(
         input_rate: vk::VertexInputRate::VERTEX,
     }];
     let attributes = [
-        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT,          offset: 0  },
-        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT,          offset: 8  },
-        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT,    offset: 16 },
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT,       offset: 0  }, // pos
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT,       offset: 8  }, // uv
+        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32B32_SFLOAT,    offset: 16 }, // uv2
+        vk::VertexInputAttributeDescription { location: 3, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 28 }, // color
     ];
 
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
@@ -2238,6 +2605,7 @@ unsafe fn create_pipeline(
     let blend_attachment = [vk::PipelineColorBlendAttachmentState {
         blend_enable: vk::TRUE,
         src_color_blend_factor: vk::BlendFactor::ONE,
+        // src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
         dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
         color_blend_op:         vk::BlendOp::ADD,
         src_alpha_blend_factor: vk::BlendFactor::ONE,

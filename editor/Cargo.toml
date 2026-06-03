@@ -11,22 +11,22 @@ audioer = ["dep:rodio"]
 wayland-data-control = ["arboard/wayland-data-control"]
 
 # profiling
-tracy = ["tracy-client/enable"]
+tracy = ["tracy/enable"]
 
 [dependencies]
 memchr             .workspace = true
+piece-tree         .workspace = true
 smallstr           .workspace = true
 smallvec           .workspace = true
 cranelift-entity   .workspace = true
 paste              .workspace = true
 crossbeam-channel  .workspace = true
 libloading         .workspace = true
-tracy-client       .workspace = true
 raw-window-handle  .workspace = true
 
+tracy = { path = "../tracy" }
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2.11.0"
-ropey = "1.6.1"
 tempfile = { version = "3.27.0", default-features = false }
 swash = { version = "0.2.7", default-features = false, features = ["scale", "std", "render"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"], optional = true }

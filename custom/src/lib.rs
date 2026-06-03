@@ -14,10 +14,11 @@ mod lsp;
 
 use editor::ts::{TreeSitter, extract_prefix_at_cursor, query_completions};
 use editor::ui::{Axis, BoxCustom, BoxRef, ListerItemInfo, Size};
+use editor::util::format_bytes;
 use lsp::*;
 
 use crossbeam_channel::{Receiver, Sender};
-use editor::buffer::Buffer;
+use editor::buffer::{Buffer, EditKind, UndoGraphLayout, UndoNodeRef, UndoTree, format_age, seconds_ago, undo_graph_hit_test};
 use editor::color::Color;
 use editor::director::{EntryKind, ScanState};
 use editor::gpu::Gpu;
@@ -29,6 +30,7 @@ use editor_macros::{collect_commands, command, export};
 use editor::command::{NamedKey};
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
@@ -136,6 +138,11 @@ custom_data! {
             // If you know your types are gonna use virtual dispatch, put them inside the `transient {}` block below.
             //
 
+            recenter_stage: u8,                    // 0 = center, 1 = top, 2 = bottom
+            recenter_last_cursor_char_index: u32,  // Naive but okm
+
+            undo_graph_is_open: bool,
+
             do_draw_metrics: bool,
 
             lister: Lister,
@@ -224,14 +231,14 @@ pub fn move_to_first_character_in_current_line(cx: &mut CommandContext) {
 
     let (line, _col) = buf.char_to_line_col(view.cursor.char_index);
 
-    let char_count_before_first_non_whitespace_in_line = buf.text.line(line as usize)
+    let char_count_before_first_non_whitespace_in_line = buf.text.line(line)
         .chars()
         .take_while(|c| c.is_whitespace())
         .count();
 
-    let character_index_of_line = buf.text.line_to_char(line as usize);
+    let character_index_of_line = buf.text.line_to_byte(line);
 
-    view.cursor.char_index = character_index_of_line + char_count_before_first_non_whitespace_in_line;
+    view.cursor.char_index = character_index_of_line as usize + char_count_before_first_non_whitespace_in_line;
     view.cursor.preferred_col = None;
 }
 
@@ -242,15 +249,15 @@ macro_rules! ts_nav_command {
             let (view, buf) = cx.editor.active_view_and_buffer_mut();
             let buffer_id   = view.buffer_id;
             let char_index  = view.cursor.char_index;
-            let cursor_byte = buf.text.char_to_byte(char_index);
+            let cursor_byte = buf.text.char_to_byte(char_index as _);
 
             let Some(tree) = cx.editor.tree_sitter.trees.get(&buffer_id) else { return };
-            let target_byte = $nav_fn(tree.root_node(), cursor_byte);
+            let target_byte = $nav_fn(tree.root_node(), cursor_byte as _);
             drop(tree);
 
             if let Some(byte) = target_byte {
                 let (view, buf) = cx.editor.active_view_and_buffer_mut();
-                view.cursor.char_index    = buf.text.byte_to_char(byte);
+                view.cursor.char_index    = buf.text.byte_to_char(byte as _) as _;
                 view.cursor.preferred_col = None;
             }
         }
@@ -266,7 +273,7 @@ ts_nav_command!(jump_matching_delim_forward,   editor::ts::jump_matching_delim_f
 
 fn find_prev_blank_line(buf: &Buffer, from_char: usize) -> usize {
     let text = &buf.text;
-    let current_line = text.char_to_line(from_char);
+    let current_line = text.char_to_line(from_char as _);
 
     // search backward from line above current
     let mut line = current_line.saturating_sub(1);
@@ -274,7 +281,7 @@ fn find_prev_blank_line(buf: &Buffer, from_char: usize) -> usize {
         let line_text = text.line(line);
         let is_blank = line_text.chars().all(|c| c == '\n' || c.is_whitespace());
         if is_blank {
-            return text.line_to_char(line);
+            return text.line_to_byte(line as _) as _;
         }
         if line == 0 { return 0; }
         line -= 1;
@@ -284,18 +291,19 @@ fn find_prev_blank_line(buf: &Buffer, from_char: usize) -> usize {
 fn find_next_blank_line(buf: &Buffer, from_char: usize) -> usize {
     let text = &buf.text;
     let total_lines = text.len_lines();
-    let current_line = text.char_to_line(from_char);
+    let current_line = text.char_to_line(from_char as _);
 
     let mut line = current_line + 1;
     while line < total_lines {
         let line_text = text.line(line);
         let is_blank = line_text.chars().all(|c| c == '\n' || c.is_whitespace());
         if is_blank {
-            return text.line_to_char(line);
+            return text.line_to_byte(line) as _;
         }
         line += 1;
     }
-    text.len_chars()
+
+    text.len_chars() as _
 }
 
 #[command]
@@ -317,13 +325,16 @@ pub fn move_forward_paragraph(cx: &mut CommandContext) {
 #[command]
 pub fn kill_paragraph_forward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
     let from  = view.cursor.char_index;
-    let len   = buf.text.len_chars();
+    let len   = buf.text.len_chars() as usize;
     if from >= len { return; }
 
     let target = find_next_blank_line(buf, from);
     let end    = target.min(len);
     if end == from { return; }
+
+    buf.begin_transaction(view.cursor.char_index);
 
     view.cursor.anchor_char_index = Some(end);
     copy_impl(cx, false, false);
@@ -342,7 +353,7 @@ pub fn mark_sexp(cx: &mut CommandContext) {  // @Refactor
 
     let text    = &buf.text;
     let len     = text.len_chars();
-    let mut i   = search_from;
+    let mut i   = search_from as u32;
 
     //
     // Skip whitespace and comments
@@ -411,19 +422,19 @@ pub fn mark_sexp(cx: &mut CommandContext) {  // @Refactor
         }
     };
 
-    if new_anchor == search_from { return }
+    if new_anchor == search_from as u32 { return }
 
-    view.cursor.anchor_char_index = Some(new_anchor);
+    view.cursor.anchor_char_index = Some(new_anchor as _);
     view.cursor.preferred_col     = None;
 }
 
 fn selected_line_range(view: &View, buf: &Buffer) -> (usize, usize) {
-    let cursor_line = buf.text.char_to_line(view.cursor.char_index);
+    let cursor_line = buf.text.char_to_line(view.cursor.char_index as _);
     let Some(anchor) = view.cursor.anchor_char_index else {
-        return (cursor_line, cursor_line);
+        return (cursor_line as _, cursor_line as _);
     };
 
-    let anchor_line = buf.text.char_to_line(anchor);
+    let anchor_line = buf.text.char_to_line(anchor as _);
     let first = cursor_line.min(anchor_line);
     let mut last  = cursor_line.max(anchor_line);
 
@@ -435,17 +446,19 @@ fn selected_line_range(view: &View, buf: &Buffer) -> (usize, usize) {
     } else {
         anchor
     };
-    let last_line_start = buf.text.line_to_char(last);
+    let last_line_start = buf.text.line_to_byte(last) as usize;
     if last_char == last_line_start && last > first {
         last -= 1;
     }
 
-    (first, last)
+    (first as _, last as _)
 }
 
 #[command]
 pub fn move_line_up(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     let (first, last) = selected_line_range(view, buf);
     buf.move_lines(&mut view.cursor, first, last, true);
 }
@@ -453,6 +466,8 @@ pub fn move_line_up(cx: &mut CommandContext) {
 #[command]
 pub fn move_line_down(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     let (first, last) = selected_line_range(view, buf);
     buf.move_lines(&mut view.cursor, first, last, false);
 }
@@ -460,6 +475,8 @@ pub fn move_line_down(cx: &mut CommandContext) {
 #[command]
 pub fn delete_word_forward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     view.cursor.unset_anchor();
     buf.delete_word_forward(&mut view.cursor);
 }
@@ -467,6 +484,8 @@ pub fn delete_word_forward(cx: &mut CommandContext) {
 #[command]
 pub fn delete_word_backward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     view.cursor.unset_anchor();
     buf.delete_word_backward(&mut view.cursor);
 }
@@ -474,6 +493,8 @@ pub fn delete_word_backward(cx: &mut CommandContext) {
 #[command]
 pub fn delete_forward(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     view.cursor.unset_anchor();
     buf.delete_forward(&mut view.cursor);
 }
@@ -486,6 +507,7 @@ pub fn delete_backward(cx: &mut CommandContext) {
     let is_lister_buffer = cx.editor.active_view().buffer_id == cx.editor.lister().query_buffer;
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
 
     //
     // If there's a selection, always just delete the selection
@@ -499,7 +521,7 @@ pub fn delete_backward(cx: &mut CommandContext) {
     if cursor_pos == 0 { return; }
 
     if is_lister_buffer {
-        let char_to_left = buf.text.char(cursor_pos - 1);
+        let char_to_left = buf.text.char(cursor_pos as u32 - 1);
 
         if char_to_left == MAIN_SEPARATOR {
             //
@@ -510,7 +532,7 @@ pub fn delete_backward(cx: &mut CommandContext) {
             // Start the deletion range at the current cursor
             let mut target_start = cursor_pos - 1;
 
-            let iter = buf.text.chars_at(cursor_pos - 1).reversed();
+            let iter = buf.text.chars_at_rev(cursor_pos as u32 - 1);
             for c in iter {
                 if c == MAIN_SEPARATOR { break; }
                 target_start -= 1;
@@ -531,17 +553,17 @@ pub fn delete_backward(cx: &mut CommandContext) {
 pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
-    let len = buf.text.len_chars();
+    let len = buf.text.len_chars() as usize;
     if view.cursor.char_index >= len { return; }
 
-    buf.flatten_rope_into_scratch(  // :BufferScratch
-        buf.text.char_to_byte(view.cursor.char_index),
-        buf.text.len_bytes(),
+    buf.flatten_tree_into_scratch(  // :BufferScratch
+        buf.text.char_to_byte(view.cursor.char_index as _) as usize,
+        buf.text.len_bytes() as usize,
     );
 
     let mut chars_to_delete = 0;
     {
-        let slice = &buf.scratch_space_to_flatten_rope_into;
+        let slice = &buf.scratch_space_to_flatten_tree_into;
 
         let mut all_whitespace = true;
 
@@ -573,21 +595,25 @@ pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratc
     copy_impl(cx, false, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+    buf.begin_transaction(view.cursor.char_index);
     buf.delete_selection_without_animation(&mut view.cursor);
 }
 
 #[command]
 pub fn insert_newline(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     view.cursor.unset_anchor();
 
-    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
+    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index as _);
 
     // Cap context line search to 4KB
     let start_byte = cursor_byte.saturating_sub(4096); // :Configuration
-    buf.flatten_rope_into_scratch(start_byte, cursor_byte);
+    buf.flatten_tree_into_scratch(start_byte as _, cursor_byte as _);
 
-    let flat = buf.scratch_space_to_flatten_rope_into.as_bytes();
+    let flat = buf.scratch_space_to_flatten_tree_into.as_bytes();
 
     // Walk backwards to find last non-blank line
     let context_start = {
@@ -629,7 +655,10 @@ pub fn insert_newline(cx: &mut CommandContext) {
 
     let open = matches!(last_meaningful, Some(b'{') | Some(b'(') | Some(b'['));
 
-    let mut indent = SmallString::<[u8; 128]>::new();
+    let mut indent = SmallString::<[u8; 128]>::with_capacity(
+        1 + line_bytes[..indent_len].len() + 4 * open as usize
+    );
+    indent.push('\n');
 
     //
     // Preserve tabs vs spaces
@@ -641,15 +670,14 @@ pub fn insert_newline(cx: &mut CommandContext) {
         for _ in 0..4 { indent.push(' '); }
     }
 
-    buf.insert_char('\n', &mut view.cursor);
-    if !indent.is_empty() {
-        buf.insert_literal(&indent, &mut view.cursor);
-    }
+    buf.insert_literal(&indent, &mut view.cursor);
 }
 
 #[command]
 pub fn insert_newline_after(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     view.cursor.unset_anchor();
     buf.insert_char_after('\n', &mut view.cursor);
 }
@@ -713,12 +741,14 @@ pub fn basic_character(cx: &mut CommandContext) {
     let Some(c) = cx.text_input_char else { return };
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     let cursor = &mut view.cursor;
     cursor.unset_anchor();
 
     if matches!(c, '}' | ')' | ']') {  // :Configuration
         let (line, col) = buf.cursor_line_col(cursor);
-        let line_str = buf.text.line(line as usize);
+        let line_str = buf.text.line(line);
         let only_ws = col > 0 && line_str.chars().take(col as usize).all(|c| c == ' ' || c == '\t');
         if only_ws && col >= 4 {
             for _ in 0..4 {
@@ -731,8 +761,46 @@ pub fn basic_character(cx: &mut CommandContext) {
 }
 
 #[command]
+pub fn undo(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    view.graph_camera.prev_head = buf.undo.head;
+    buf.undo(&mut view.cursor);
+
+    view.graph_camera.last_nav_was_forward = false;
+
+    let is_undo_graph_open = *cx.editor.undo_graph_is_open();
+    if is_undo_graph_open {
+        center_undo_graph_on_head(cx.editor);
+    }
+}
+
+#[command]
+pub fn redo(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    view.graph_camera.prev_head = buf.undo.head;
+    buf.redo(&mut view.cursor);
+
+    view.graph_camera.last_nav_was_forward = true;
+
+    let is_undo_graph_open = *cx.editor.undo_graph_is_open();
+    if is_undo_graph_open {
+        center_undo_graph_on_head(cx.editor);
+    }
+}
+
+#[command]
 pub fn toggle_draw_metrics(cx: &mut CommandContext) {
     *cx.editor.do_draw_metrics_mut() = !cx.editor.do_draw_metrics();
+}
+
+#[command]
+pub fn toggle_undo_graph(cx: &mut CommandContext) {
+    *cx.editor.undo_graph_is_open_mut() = !cx.editor.undo_graph_is_open();
+
+    let is_undo_graph_open = *cx.editor.undo_graph_is_open();
+    if is_undo_graph_open {
+        center_undo_graph_on_head(cx.editor);
+    }
 }
 
 #[command]
@@ -752,6 +820,8 @@ pub fn kill_language_server(cx: &mut CommandContext) {
 #[command]
 pub fn tab(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+
     let cursor = &mut view.cursor;
     cursor.unset_anchor();
     buf.insert_literal("    ", &mut view.cursor);
@@ -759,12 +829,29 @@ pub fn tab(cx: &mut CommandContext) {
 
 #[command]
 pub fn recenter_top_bottom(cx: &mut CommandContext) {
-    let line_h = cx.editor.line_h();
     let (view, buf) = cx.editor.active_view_and_buffer();
+    let cursor_char_index = view.cursor.char_index;
+
     let (line, _) = buf.cursor_line_col(&view.cursor);
-    let rect = cx.editor.panels[view.panel_id].rect;
+    let rect = cx.editor.panels[view.panel_id.unwrap()].rect;
+
+    let stage = if *cx.editor.recenter_last_cursor_char_index() == view.cursor.char_index as u32 {
+        *cx.editor.recenter_stage()
+    } else {
+        0
+    };
+
+    let line_h = cx.editor.line_h();
     let (view, _buf) = cx.editor.active_view_and_buffer_mut();
-    view.scroll_to_cursor_centered(line, line_h, rect);
+
+    match stage {
+        0 => view.scroll_to_cursor_centered(line, line_h, rect),
+        1 => view.scroll_to_cursor_top(line, line_h, rect),
+        _ => view.scroll_to_cursor_bottom(line, line_h, rect),
+    }
+
+    *cx.editor.recenter_stage_mut() = (stage + 1) % 3;
+    *cx.editor.recenter_last_cursor_char_index_mut() = cursor_char_index as _;
 }
 
 #[command]
@@ -876,6 +963,7 @@ pub fn paste(cx: &mut CommandContext) {
     };
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
 
     buf.delete_selection_without_animation(&mut view.cursor);
     buf.insert_literal(&clipboard, &mut view.cursor);
@@ -890,23 +978,21 @@ pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool, animate: bool) { /
     };
 
     let char_index = view.cursor.char_index;
-    let slice = if anchor_char_index < char_index {
-        buf.text.slice(anchor_char_index..char_index)
-    } else {
-        buf.text.slice(char_index..anchor_char_index)
-    };
 
-    buf.scratch_space_to_flatten_rope_into.clear(); // :BufferScratch
-    buf.scratch_space_to_flatten_rope_into.extend(slice.chars());
+    let (start, end) = if anchor_char_index < char_index {
+        (anchor_char_index, char_index)
+    } else {
+        (char_index, anchor_char_index)
+    };
+    let byte_start = buf.text.char_to_byte(start as u32);
+    let byte_end   = buf.text.char_to_byte(end as u32);
+
+    let slice = buf.text.slice(byte_start..byte_end);
+
+    buf.scratch_space_to_flatten_tree_into.clear(); // :BufferScratch
+    buf.scratch_space_to_flatten_tree_into.extend(slice.chars());
 
     if animate {
-        let (start, end) = if anchor_char_index < char_index {
-            (anchor_char_index, char_index)
-        } else {
-            (char_index, anchor_char_index)
-        };
-        let byte_start = buf.text.char_to_byte(start);
-        let byte_end   = buf.text.char_to_byte(end);
         buf.animate_copy(byte_start as _, (byte_end - byte_start) as _);
     }
 
@@ -917,7 +1003,7 @@ pub fn copy_impl(cx: &mut CommandContext, unset_anchor: bool, animate: bool) { /
     let buffer_id = view.buffer_id;
     Editor::set_clipboard(
         &mut cx.editor.clipboard,
-        &cx.editor.buffers[buffer_id].scratch_space_to_flatten_rope_into
+        &cx.editor.buffers[buffer_id].scratch_space_to_flatten_tree_into
     );
 }
 
@@ -931,6 +1017,7 @@ pub fn delete_selection_and_copy(cx: &mut CommandContext) {
     copy_impl(cx, false, false);
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
     buf.delete_selection_with_animation(&mut view.cursor);
 }
 
@@ -2099,14 +2186,16 @@ pub fn indent_region_impl(text: &str, start_line: usize, end_line: usize, indent
 #[command]
 pub fn indent_region(cx: &mut CommandContext) {  // :BufferScratch
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
 
     let (start_char, end_char) = if let Some(anchor) = view.cursor.anchor_char_index {
-        let c = view.cursor.char_index;
+        let c = view.cursor.char_index as u32;
+        let anchor = anchor as u32;
         if anchor <= c { (anchor, c) } else { (c, anchor) }
     } else {
-        let line  = buf.text.char_to_line(view.cursor.char_index);
-        let start = buf.text.line_to_char(line);
-        let end   = buf.text.line_to_char((line + 1).min(buf.text.len_lines()));
+        let line  = buf.text.char_to_line(view.cursor.char_index as u32);
+        let start = buf.text.line_to_byte(line);
+        let end   = buf.text.line_to_byte((line + 1).min(buf.text.len_lines()));
         (start, end)
     };
 
@@ -2114,13 +2203,13 @@ pub fn indent_region(cx: &mut CommandContext) {  // :BufferScratch
     let end_line   = buf.text.char_to_line(end_char);
 
     let total_bytes = buf.text.len_bytes();
-    buf.flatten_rope_into_scratch(0, total_bytes);  // :BufferScratch
+    buf.flatten_tree_into_scratch(0, total_bytes as usize);  // :BufferScratch
 
     view.cursor.unset_anchor();
 
-    let text = &buf.scratch_space_to_flatten_rope_into;
+    let text = &buf.scratch_space_to_flatten_tree_into;
     let reindented = indent_region_impl(
-        text, start_line, end_line, 4  // :Configuration
+        text, start_line as usize, end_line as usize, 4  // :Configuration
     );
     if &reindented == text {
         return;
@@ -2161,9 +2250,9 @@ pub fn completion_next(cx: &mut CommandContext) {
         let (start, prefix) = extract_prefix_at_cursor(buf, cursor);
         if prefix.is_empty() { return }
 
-        let text = buf.text.clone();
+        let tree = buf.text.clone();
         let buffer_id = view.buffer_id;
-        let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
+        let cursor_byte = buf.text.char_to_byte(view.cursor.char_index as _);
         let tree_ref = cx.editor.tree_sitter.trees.get(&buffer_id);
         let items = query_completions(
             &prefix,
@@ -2171,9 +2260,9 @@ pub fn completion_next(cx: &mut CommandContext) {
             &cx.editor.tree_sitter.func_table,
             &cx.editor.tree_sitter.atom_table,
             buffer_id,
-            cursor_byte,
+            cursor_byte as _,
             tree_ref.as_deref().map(|t| &t.tree),
-            &text,
+            &tree,
             24,
         );
         drop(tree_ref);
@@ -2221,6 +2310,7 @@ pub fn completion_prev(cx: &mut CommandContext) {
 #[command]
 pub fn completion_confirm(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
 
     if !view.completion.active {
         if let Some(ghost) = view.completion.ghost_text.take() {
@@ -2242,11 +2332,15 @@ pub fn completion_confirm(cx: &mut CommandContext) {
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
 
+    let start_byte = buf.text.char_to_byte(prefix_start as _);
+    let end_byte = buf.text.char_to_byte(cursor as _);
+
     // Replace prefix_start..cursor with full_name
-    buf.text.remove(prefix_start..cursor);
+    buf.text.remove(start_byte..end_byte);
     let mut insert_at = prefix_start;
     for c in full_name.chars() {
-        buf.text.insert_char(insert_at, c);
+        let byte = buf.text.char_to_byte(insert_at as _);
+        buf.text.insert_char(byte, c);
         insert_at += 1;
     }
     view.cursor.char_index    = insert_at;
@@ -2289,20 +2383,20 @@ pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32
 
     let line_char_index = {
         let (_view, buf) = editor.view_and_buffer_mut(view_id);
-        buf.text.line_to_char(line as _)
+        buf.text.line_to_byte(line as _)
     };
 
     let line_h = editor.line_h();
 
     let panel_id = {
         let (view, _buf) = editor.view_and_buffer_mut(view_id);
-        view.panel_id
+        view.panel_id.unwrap()
     };
 
     let rect = editor.panels[panel_id].rect;
 
     let (view, _buf) = editor.view_and_buffer_mut(view_id);
-    view.cursor.char_index = line_char_index + col as usize;
+    view.cursor.char_index = (line_char_index + col) as usize;
     view.scroll_to_cursor_centered(line, line_h, rect);
 
     view.cursor_target_col = col;
@@ -2350,7 +2444,7 @@ pub fn cargo_build(cx: &mut CommandContext) { // nocheckin
     }
 
     let buf = &mut cx.editor.buffers[commander_buffer];
-    let end = buf.text.len_chars();
+    let end = buf.text.len_bytes();
     buf.text.insert(end, "[Running cargo build]\n\n");
     buf.is_dirty = true;
 
@@ -2388,12 +2482,16 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::ctrl_alt('f'), cx.command_table.intern("jump_matching_delim_forward"));   // nocheckin
 
     cx.keymap.bind(KeyCombo::alt('{'), cx.command_table.intern("move_backward_paragraph"));   // nocheckin
-    cx.keymap.bind(KeyCombo::alt('}'), cx.command_table.intern("move_forward_paragraph"));    // nocheckin
+   cx.keymap.bind(KeyCombo::alt('}'), cx.command_table.intern("move_forward_paragraph"));    // nocheckin
     cx.keymap.bind(KeyCombo::alt('k'), cx.command_table.intern("kill_paragraph_forward"));    // nocheckin
 
     cx.keymap.bind(KeyCombo::alt('['), cx.command_table.intern("completion_prev"));   // nocheckin
     cx.keymap.bind(KeyCombo::alt(']'), cx.command_table.intern("completion_next"));   // nocheckin
     cx.keymap.bind(KeyCombo::named_alt(NamedKey::Tab), cx.command_table.intern("completion_confirm"));   // nocheckin
+
+    cx.keymap.bind(KeyCombo::ctrl('u'), cx.command_table.intern("undo"));   // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl('U'), cx.command_table.intern("redo"));   // nocheckin
+    cx.keymap.bind(KeyCombo::named(NamedKey::F1), cx.command_table.intern("toggle_undo_graph"));   // nocheckin
 
     setup_hooks(cx);
     editor_initialize_custom_data(cx.editor, cx.gpu);
@@ -2409,6 +2507,9 @@ fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
 
     editor.set_custom_data(CustomData {
         do_draw_metrics: false,
+        undo_graph_is_open: false,
+        recenter_last_cursor_char_index: u32::MAX,
+        recenter_stage: 0,
 
         lister: Lister::new(),
         commander: Commander::new(),
@@ -2460,7 +2561,7 @@ fn lister_create_fresh_buffers_views_panels(editor: &mut Editor) {
         rect_including_panel_bar: Rect::default(),
         kind: PanelKind::Leaf { view_id: lister_query_view },
     });
-    editor.views[lister_query_view].panel_id = lister_query_panel;
+    editor.views[lister_query_view].panel_id = lister_query_panel.into();
 
     let lister_split_panel = editor.panels.next_key();
     editor.panels.push(Panel {
@@ -2526,7 +2627,7 @@ pub fn find_matching_paren(
         let mut line = start_line;
 
         while line < buffer.text.len_lines() as u32 && line < start_line + MAX_SCAN_LINES {
-            let text = buffer.text.line(line as usize);
+            let text = buffer.text.line(line);
 
             let start_col_in_line = if line == start_line { start_col } else { 0 };
 
@@ -2546,7 +2647,7 @@ pub fn find_matching_paren(
     } else {
         let mut line = start_line;
         loop {
-            let text = buffer.text.line(line as usize);
+            let text = buffer.text.line(line);
             let end_col = if line == start_line { start_col + 1 } else { text.chars().count() as u32 };
 
             scratch_paren.clear();
@@ -2608,6 +2709,11 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.animate = Some(|editor, dt, should_redraw| {
+        if *editor.undo_graph_is_open() {
+            editor.active_view_mut().graph_camera.animate(dt); // @Cleanup
+            *should_redraw = should_redraw.or_msg("Graph camera animation", &mut editor.redraw_reasons);
+        }
+
         let lister = editor.custom_data.lister_mut();
 
         //
@@ -2682,47 +2788,103 @@ fn setup_hooks(cx: &mut CommandContext) {
             }
         }
 
+        if *cx.editor.undo_graph_is_open() {
+            let (mx, my) = cx.editor.mouse_pos;
+            let graph_rect = get_graph_rect_and_do_scroll_if_necessary(cx.editor);
+
+            let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+            let cam_x = view.graph_camera.x;
+            let cam_y = view.graph_camera.y;
+
+            let layout = buf.undo.get_or_build_layout(); // Use the cache!
+
+            if graph_rect.contains(mx, my) {
+                let hit = undo_graph_hit_test(
+                    layout,
+                    mx, my,
+                    graph_rect,
+                    cam_x, // Pass camera X
+                    cam_y  // Pass camera Y
+                );
+
+                if let Some(node_id) = hit {
+                    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+
+                    view.graph_camera.prev_head = buf.undo.head;
+                    let is_forward = buf.jump_to(node_id, &mut view.cursor);
+                    view.graph_camera.last_nav_was_forward = is_forward;
+                    cx.editor.reset_blink();
+
+                    return (true, true);
+                }
+            }
+        }
+
+
         (false, false)
     });
 
     cx.editor.hooks.key_pressed = Some(|cx| {
-        let is_active_view_query = cx.editor.active_view_id() == cx.editor.lister().query_view;
-
-        if !is_active_view_query {
-            //
-            // Let core handle input
-            //
-            return (false, false);
-        }
-
         let Some(event) = cx.key_input else {
             return (false, false);
         };
 
-        let lister = cx.editor.custom_data.lister_mut();
+        let is_active_view_query = cx.editor.active_view_id() == cx.editor.lister().query_view;
+        if is_active_view_query {
+            let lister = cx.editor.custom_data.lister_mut();
 
-        let result = lister.lister_key(event);
-        let is_selected = matches!(result, ListerKeyDispatch::Selected);
-        match result {
-            ListerKeyDispatch::Selected | ListerKeyDispatch::Close => {
-                let panel_before_opening_lister = lister.close().unwrap();
+            let result = lister.lister_key(event);
+            let is_selected = matches!(result, ListerKeyDispatch::Selected);
+            match result {
+                ListerKeyDispatch::Selected | ListerKeyDispatch::Close => {
+                    let panel_before_opening_lister = lister.close().unwrap();
 
-                cx.editor.set_active_panel(panel_before_opening_lister);
+                    cx.editor.set_active_panel(panel_before_opening_lister);
 
-                if is_selected {
-                    editor_dispatch_lister_confirm(cx);
+                    if is_selected {
+                        editor_dispatch_lister_confirm(cx);
+                    }
+
+                    return (true, true);
                 }
 
-                (true, true)
-            }
+                ListerKeyDispatch::Other => {
+                    cx.editor.reset_blink();
+                    return (true, true);
+                }
 
-            ListerKeyDispatch::Other => {
-                cx.editor.reset_blink();
-                (true, true)
+                ListerKeyDispatch::None => {}
             }
-
-            ListerKeyDispatch::None => (false, false)
         }
+
+        if *cx.editor.undo_graph_is_open() {
+            match editor_handle_undo_graph_key(cx.editor, &event) {
+                UndoGraphKeyDispatch::Close => {
+                    *cx.editor.undo_graph_is_open_mut() = false;
+                    return (true, true);
+                }
+                UndoGraphKeyDispatch::Navigated => {
+                    // Optional Bonus: Auto-scroll to keep the active node in view!
+                    let buf = cx.editor.active_buffer_mut();
+                    let head = buf.undo.head;
+                    let layout = buf.undo.get_or_build_layout();
+
+                    return (true, true);
+                }
+                UndoGraphKeyDispatch::None => {
+                    // If they press unhandled keys (like typing text),
+                    // you can either block it or auto-close the graph.
+                    // Blocking is usually safer so they don't accidentally edit while scrubbing.
+                    return (true, false);
+                }
+            }
+        }
+
+        //
+        // Let core handle input
+        //
+        (false, false)
     });
 
     cx.editor.hooks.pre_command_execution = Some(|cx, command_atom| {
@@ -2756,6 +2918,12 @@ fn setup_hooks(cx: &mut CommandContext) {
             } else {
                 0
             };
+        }
+
+        let is_undo_graph_open = *cx.editor.undo_graph_is_open();
+        if is_undo_graph_open {
+            center_undo_graph_on_head(cx.editor);
+            center_screen_so_that_cursor_isnt_covered_by_undo_graph(cx.editor);
         }
 
         (false, false)
@@ -2803,6 +2971,8 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.inside_about_to_wait_should_request_redraw = Some(|editor| {
+        let _tracy = tracy::span!("inside_about_to_wait_should_request_redraw");
+
         let mut redraw = ShouldRequestFrameRedraw::No;
 
         if editor.lister().panel.is_visible() && !editor.lister().is_open() {
@@ -2825,6 +2995,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.mouse_wheel_scrolled = Some(|cx, dy| {
         let editor = &mut cx.editor;
+        let gpu = &mut cx.gpu;
 
         if editor.lister().is_open() {
             //
@@ -2850,12 +3021,33 @@ fn setup_hooks(cx: &mut CommandContext) {
                 // Update hovered index for new scroll position
                 //
                 if my >= list_y {
-                    let local_y = my - list_y + lister.scroll_anim;
+                    let local_y = my - list_y;
                     let hovered_index_before = lister.hovered_index;
                     lister.hovered_index = lister.hovered_index(local_y);
                     if lister.hovered_index.map_or(false, |after| Some(after) != hovered_index_before) {
                         editor.audioer.play_lister_item_hover_sound();
                     }
+                }
+
+                return (true, true);
+            }
+        }
+
+        if *cx.editor.undo_graph_is_open() {
+            let graph_rect = get_graph_rect_and_do_scroll_if_necessary(cx.editor);
+            let (mx, my) = cx.editor.mouse_pos;
+
+            if graph_rect.contains(mx, my) {
+                let mods = cx.editor.modifiers;
+                let (view, _) = cx.editor.active_view_and_buffer_mut();
+
+                let pan_speed = 10.5;
+
+                // Update the targets based on scroll delta
+                if mods.shift {
+                    view.graph_camera.target_y += dy * pan_speed;
+                } else {
+                    view.graph_camera.target_x += dy * pan_speed;
                 }
 
                 return (true, true);
@@ -2883,7 +3075,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             let lister = editor.custom_data.lister_mut();
 
             if lister_rect.contains(mx, my) && my >= list_y {
-                let local_y = my - list_y + lister.scroll_anim;
+                let local_y = my - list_y;
                 let hovered_index_before = lister.hovered_index;
                 lister.hovered_index = lister.hovered_index(local_y);
                 if lister.hovered_index.map_or(false, |after| Some(after) != hovered_index_before) {
@@ -2914,7 +3106,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         {
             let commander_buffer = editor.commander().command_buffer;
 
-            let char_count = editor.buffers[commander_buffer].text.len_chars();
+            let char_count = editor.buffers[commander_buffer].text.len_chars() as usize;
 
             redraw = redraw.or_if(char_count != editor.commander().last_command_buffer_character_count, "Commander buffer updated", &mut editor.redraw_reasons);
             redraw = redraw.or_if(editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut editor.redraw_reasons);
@@ -2938,7 +3130,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
         {
             let commander_buffer = cx.editor.commander().command_buffer;
-            let char_count = cx.editor.buffers[commander_buffer].text.len_chars();
+            let char_count = cx.editor.buffers[commander_buffer].text.len_chars() as usize;
             cx.editor.commander_mut().last_command_buffer_character_count = char_count;
 
             redraw = redraw.or_if(cx.editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut cx.editor.redraw_reasons);
@@ -2976,8 +3168,22 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.drew_all_leaf_panels = Some(|cx| {
+        let _tracy = tracy::span!("drew_all_leaf_panels");
+
         let editor = &mut cx.editor;
         let gpu = &mut cx.gpu;
+
+        if *editor.undo_graph_is_open() {
+            let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
+            let (view, buf) = editor.active_view_and_buffer_mut();
+            _ = buf.undo.get_or_build_layout();
+
+            gpu::draw_blur_rect(gpu, graph_rect.x, graph_rect.y, graph_rect.w, graph_rect.h, palette().lister_bg.with_alpha(0.5));
+
+            gpu::push_overlay_mode(gpu);
+            draw_undo_tree(editor, gpu);
+            gpu::pop_overlay_mode(gpu);
+        }
 
         if editor.lister().is_open() {
             //
@@ -2989,11 +3195,9 @@ fn setup_hooks(cx: &mut CommandContext) {
                 let lister = editor.lister();
                 let lister_rect = lister.lister_rect(editor.win_w, editor.win_h, editor.scale);
                 if editor.active_panel == lister.query_split && lister.is_visible() {
-                    // Dim the whole screen
                     gpu::draw_rect(gpu, 0.0, 0.0, gpu.win_w, gpu.win_h, Color::rgba(0, 0, 0, 100));
                 }
 
-                // Backdrop blur
                 gpu::draw_blur_rect(
                     gpu,
                     lister_rect.x, lister_rect.y, lister_rect.w, lister_rect.h,
@@ -3011,34 +3215,15 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             let show_cursor = editor.views[view_id].is_cursor_visible();
 
-            gpu::push_overlay_mode(gpu);
-
             gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+            gpu::push_overlay_mode(gpu);
             let t1 = Instant::now();
             render_text_layout(editor, gpu, view_id, show_cursor);
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
+            gpu::pop_overlay_mode(gpu);
             gpu::pop_clip(gpu);
 
-            let t1 = Instant::now();
-            {
-                build_lister_ui(gpu, editor);
-                let ui = &mut editor.ui;
-                ui.layout(|text, font_size| {
-                    let w = text.chars()
-                        .filter_map(|c| gpu::get_glyph(gpu, c, font_size))
-                        .map(|g| g.advance)
-                        .sum();
-                    [w, font_size]
-                });
-                ui.update_interaction(
-                    [editor.mouse_pos.0, editor.mouse_pos.1],
-                    editor.mouse_left_pressed,
-                );
-                ui.tick();
-                ui::render(ui, gpu);
-            }
-            gpu::pop_overlay_mode(gpu);
-            editor.render_us_acc += t1.elapsed().as_micros() as f32;
+            build_lister_ui(gpu, editor);
         }
 
         if *editor.do_draw_metrics() {
@@ -3107,6 +3292,8 @@ fn setup_hooks(cx: &mut CommandContext) {
 
         let buffer = &editor.buffers[view.buffer_id];
 
+        let cursor_radius = editor.cursor_radius();
+
         let cols_to_check: &[_] = if *cursor_col > 0 {
             &[*cursor_col, *cursor_col - 1]
         } else {
@@ -3124,7 +3311,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                         let x = layout.x_for_col(*origin_x, col, ll);
                         let w = layout.glyph_width_at_col(col, *min_cursor_w, ll);
                         let y = context.line_y(line);
-                        gpu::draw_rect(gpu, x, y + cursor_h, w, line_h + cursor_h, palette().paren_match);
+                        gpu::draw_rect_rounded(gpu, x, y + cursor_h, w, line_h + cursor_h, cursor_radius, palette().paren_match);
                     }
                 }
             }
@@ -3214,7 +3401,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                         rect_including_panel_bar: Rect::default(),
                         kind: PanelKind::Leaf { view_id: lister.query_view },
                     });
-                    editor.views[lister.query_view].panel_id = panel_id;
+                    editor.views[lister.query_view].panel_id = panel_id.into();
                     panel_id
                 };
                 editor.lister_mut().query_split = find_panel_by_kind(editor, editor.root_panel, &LISTER_SPLIT_PANEL_KIND)
@@ -3256,19 +3443,35 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.opened_file = Some(|editor, buffer_id| {  // :BufferScratch nocheckin
-        let buffer = &mut editor.buffers[buffer_id];
-        let Some(path) = buffer.path.clone() else { return };
-        let end = buffer.text.len_bytes();
-        buffer.flatten_rope_into_scratch(0, end);  // :BufferScratch
-        editor.custom_data.lsp_mut().did_open_buf(path.to_str().unwrap(), &buffer.scratch_space_to_flatten_rope_into);
+        if editor.lsp().is_enabled() {
+            let buffer = &mut editor.buffers[buffer_id];
+            let Some(path) = buffer.path.clone() else { return };
+            let end = buffer.text.len_bytes() as usize;
+            buffer.flatten_tree_into_scratch(0, end);  // :BufferScratch
+            editor.custom_data.lsp_mut().did_open_buf(
+                path.to_str().unwrap(),
+                &buffer.scratch_space_to_flatten_tree_into
+            );
+        }
     });
 
     cx.editor.hooks.modified_file = Some(|editor, buffer_id| {  // :BufferScratch
-        let buffer = &mut editor.buffers[buffer_id];
-        let Some(path) = buffer.path.clone() else { return };
-        let end = buffer.text.len_bytes();
-        buffer.flatten_rope_into_scratch(0, end);  // :BufferScratch
-        editor.custom_data.lsp_mut().did_change_buf(path.to_str().unwrap(), &buffer.scratch_space_to_flatten_rope_into, 1); // nocheckin
+        let is_undo_graph_open = *editor.undo_graph_is_open();
+        if is_undo_graph_open {
+            center_undo_graph_on_head(editor);
+        }
+
+        if editor.lsp().is_enabled() {
+            let buffer = &mut editor.buffers[buffer_id];
+
+            let Some(path) = buffer.path.clone() else { return };
+            let end = buffer.text.len_bytes() as usize;
+            buffer.flatten_tree_into_scratch(0, end);  // :BufferScratch
+            editor.custom_data.lsp_mut().did_change_buf(
+                path.to_str().unwrap(),
+                &buffer.scratch_space_to_flatten_tree_into, 1
+            ); // nocheckin
+        }
     });
 
     cx.editor.hooks.exiting = Some(|editor| editor.lsp_mut().shutdown_blocking());
@@ -3378,6 +3581,7 @@ pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
                         let row = ui.label(&format!("lister##item_{index}"))
                             .size(Size::fill(), Size::px(item_h))
                             .floating(0.0, iy)
+                            .clickable()
                             .padding_left(pad + sep * 5.0)
                             .text(&*item.label)
                             .font_size(font_size)
@@ -4316,7 +4520,7 @@ pub fn drain_commander_output(editor: &mut Editor) -> ShouldRequestFrameRedraw {
 
         let buf = &mut editor.buffers[commander_buffer];
         buf.is_dirty = true;
-        let end = buf.text.len_chars();
+        let end = buf.text.len_bytes();
         buf.text.insert(end, &chunk);
     }
 
@@ -4434,5 +4638,424 @@ mod lister {
 
         // Word boundary match
         2000 + label.len() as u32
+    }
+}
+
+pub fn draw_undo_tree(editor: &mut Editor, gpu: &mut Gpu) {
+    let screen = Rect::full(editor.win_w, editor.win_h);
+
+    let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
+
+    let (view, buf) = editor.active_view_and_buffer_mut();
+    let layout = buf.undo.get_or_build_layout();
+    let layout = &buf.undo.layout_cache;
+
+    gpu::push_clip(gpu, graph_rect.x, graph_rect.y, graph_rect.w, graph_rect.h);
+
+    let head_id = buf.undo.head;
+
+    let cam_x = view.graph_camera.x;
+    let cam_y = view.graph_camera.y;
+
+    //
+    //
+    // Draw the edges
+    //
+    //
+    for node in &layout.nodes {
+        let is_node_head = node.id == head_id;
+        let nx = graph_rect.x + node.x - cam_x;
+        let ny = graph_rect.y + node.y - cam_y;
+
+        let node_data = &buf.undo.nodes[node.id];
+
+        for &child_id in node_data.children.as_slice(&buf.undo.child_pool).iter() {
+            //
+            // Find the child in the layout to get its physical coordinates
+            //
+            if let Some(child) = layout.nodes.iter().find(|n| n.id == child_id) {   // @Speed
+                let cx = graph_rect.x + child.x - cam_x;
+                let cy = graph_rect.y + child.y - cam_y;
+
+                let edge_rect = Rect {
+                    x: nx.min(cx), y: ny.min(cy),
+                    w: (nx - cx).abs(), h: (ny - cy).abs(),
+                };
+                if !screen.intersects(edge_rect) {
+                    continue;
+                }
+
+                //
+                // Dim the line if it's not on the active timeline
+                //
+                let is_active_path = is_on_active_path(&buf.undo, node.id, head_id)
+                                  && is_on_active_path(&buf.undo, child_id, head_id);
+
+                let line_color = if is_active_path {
+                    Color::rgb(150, 150, 150) // Brighter active branch
+                } else {
+                    Color::rgb(60, 60, 60)    // Dimmed alternate timelines
+                };
+
+                gpu::draw_line(
+                    gpu,
+                    nx, ny,
+                    cx, cy,
+                    2.0, // thickness
+                    line_color,
+                );
+            }
+        }
+    }
+
+    //
+    //
+    // Draw the nodes
+    //
+    //
+    macro_rules! node_visual {
+        ($node:expr, $nx:expr, $ny:expr, |$radius:ident, $color:ident| $body:expr) => {{
+            let nx = $nx;
+            let ny = $ny;
+            let max_node_radius = 30.0;
+            let node_rect = Rect {
+                x: nx - max_node_radius,  y: ny - max_node_radius,
+                w: max_node_radius * 2.0, h: max_node_radius * 2.0
+            };
+
+            if screen.intersects(node_rect) {
+                let is_head   = $node.id == head_id;
+
+                let is_active = if view.graph_camera.last_nav_was_forward
+                    && Some($node.id) == buf.undo.nodes[view.graph_camera.prev_head].last_child.expand() {
+                        false
+                    } else {
+                        is_on_active_path(&buf.undo, $node.id, head_id)
+                    };
+
+                let ($color, $radius) = if is_head {
+                    (Color::rgba(255, 80, 70, 255), 27.0)   // Big bright active node         - hot red
+                } else if is_active {
+                    (Color::rgba(200, 40, 45, 220), 15.0)   // Standard active history        - mid red
+                } else {
+                    (Color::rgba(100, 20, 22, 180), 10.0)   // Small dimmed alternate history - dark red
+                };
+
+                $body
+            }
+        }};
+    }
+
+    for node in &layout.nodes {
+        if node.id == head_id { continue; }
+
+        let is_head = node.id == head_id;
+        let nx = if is_head {
+            graph_rect.x + view.graph_camera.head_x - cam_x
+        } else {
+            graph_rect.x + node.x - cam_x
+        };
+        let ny = if is_head {
+            graph_rect.y + view.graph_camera.head_y - cam_y
+        } else {
+            graph_rect.y + node.y - cam_y
+        };
+
+        node_visual!(node, nx, ny, |radius, color| {
+            if is_head { // @Cleanup
+                let real_nx = graph_rect.x + node.x - cam_x;
+                let real_ny = graph_rect.y + node.y - cam_y;
+                let is_active = if view.graph_camera.last_nav_was_forward
+                    && Some(node.id) == buf.undo.nodes[view.graph_camera.prev_head].last_child.expand() {
+                        false
+                    } else {
+                        is_on_active_path(&buf.undo, node.id, head_id)
+                    };
+                let (ghost_color, ghost_radius) = if is_active {
+                    (Color::rgba(200, 40, 45, 220), 15.0)   // Standard active history - mid red
+                } else {
+                    (Color::rgba(100, 20, 22, 180), 10.0)   // Dimmed alternate history - dark red
+                };
+                gpu::draw_star(gpu, real_nx, real_ny, ghost_radius, ghost_color, gpu.star);
+            }
+
+            gpu::draw_star(gpu, nx, ny, radius, color, gpu.star);
+        });
+    }
+
+    for node in &layout.nodes {
+        if node.id != head_id { continue; }
+
+        let is_head = node.id == head_id;
+        let nx = if is_head {
+            graph_rect.x + view.graph_camera.head_x - cam_x
+        } else {
+            graph_rect.x + node.x - cam_x
+        };
+        let ny = if is_head {
+            graph_rect.y + view.graph_camera.head_y - cam_y
+        } else {
+            graph_rect.y + node.y - cam_y
+        };
+
+        node_visual!(node, nx, ny, |radius, color| {
+            if is_head { // @Cleanup
+                let real_nx = graph_rect.x + node.x - cam_x;
+                let real_ny = graph_rect.y + node.y - cam_y;
+                let is_active = if view.graph_camera.last_nav_was_forward
+                    && Some(node.id) == buf.undo.nodes[view.graph_camera.prev_head].last_child.expand() {
+                        false
+                    } else {
+                        is_on_active_path(&buf.undo, node.id, head_id)
+                    };
+                let (ghost_color, ghost_radius) = if is_active {
+                    (Color::rgba(200, 40, 45, 220), 15.0)   // Standard active history - mid red
+                } else {
+                    (Color::rgba(100, 20, 22, 180), 10.0)   // Dimmed alternate history - dark red
+                };
+                gpu::draw_star(gpu, real_nx, real_ny, ghost_radius, ghost_color, gpu.star);
+            }
+
+            gpu::draw_star(gpu, nx, ny, radius, color, gpu.star);
+        });
+    }
+
+    for node in &layout.nodes {
+        let is_head = node.id == head_id;
+        let nx = if is_head {
+            graph_rect.x + view.graph_camera.head_x - cam_x
+        } else {
+            graph_rect.x + node.x - cam_x
+        };
+        let ny = if is_head {
+            graph_rect.y + view.graph_camera.head_y - cam_y
+        } else {
+            graph_rect.y + node.y - cam_y
+        };
+
+        node_visual!(node, nx, ny, |radius, color| {
+            //
+            // Draw the age label centered below the node
+            //
+            let seconds_ago = seconds_ago(buf.undo.nodes[node.id].timestamp);
+            let age       = format_age(seconds_ago);
+
+            let font_size = 15.0;  // :Scale? :Configuration?
+
+            let w         = gpu::measure_text(gpu, &age, font_size);
+
+            let tx        = nx - w / 2.0;
+            let ty        = ny + radius * 1.5;
+            gpu::draw_text(gpu, &age, tx, ty, font_size + 1.5, Color::rgb(0, 0, 0));   // outline
+            gpu::draw_text(gpu, &age, tx, ty, font_size,       Color::rgb(255, 255, 255));   // fill
+        });
+    }
+
+    gpu::pop_clip(gpu);
+}
+
+#[inline]
+fn is_on_active_path(history: &UndoTree, node_id: UndoNodeRef, head_id: UndoNodeRef) -> bool {
+    if node_id == head_id { return true }
+
+    let mut current = head_id;
+    while let Some(parent) = history.nodes[current].parent.expand() {
+        if parent == node_id {
+            return true;
+        }
+
+        current = parent;
+    }
+
+    false
+}
+
+pub enum UndoGraphKeyDispatch { Close, Navigated, None }
+
+pub fn editor_handle_undo_graph_key(editor: &mut Editor, event: &KeyInput) -> UndoGraphKeyDispatch {
+    match &event.logical {
+        LogicalKey::Named(NamedKey::Escape) => {
+            return UndoGraphKeyDispatch::Close;
+        }
+        _ => {}
+    }
+
+    let target_id = {
+        let (view, buf) = editor.active_view_and_buffer_mut();
+        let layout = buf.undo.get_or_build_layout();
+        let layout = &buf.undo.layout_cache;
+
+        let head = buf.undo.head;
+
+        let Some(current) = layout.nodes.iter().find(|n| n.id == head) else {
+            return UndoGraphKeyDispatch::None;
+        };
+
+        match &event.logical {
+            LogicalKey::Named(NamedKey::Left) => {
+                //
+                // Time Travel: Always go back to the parent
+                //
+
+                current.parent
+            }
+
+            LogicalKey::Named(NamedKey::Right) => {
+                //
+                // Time Travel: Pick the child that is visually straightest ahead
+                //
+
+                let node_data = &buf.undo.nodes[head];
+                let mut best_child = None;
+                let mut best_dist = f32::MAX;
+
+                for &child_id in node_data.children.as_slice(&buf.undo.child_pool).iter() {
+                    if let Some(child_layout) = layout.nodes.iter().find(|n| n.id == child_id) {
+                        let dist = (child_layout.y - current.y).abs();
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_child = Some(child_id);
+                        }
+                    }
+                }
+
+                best_child.into()
+            }
+
+            LogicalKey::Named(NamedKey::Up) => {
+                //
+                // Branch Hopping: Find ANY node above us
+                //
+
+                let mut best_node = None;
+                let mut best_score = f32::MAX;
+
+                for n in &layout.nodes {
+                    let dy = current.y - n.y;  // Positive if n is above current
+
+                    //
+                    // Must be definitively above us (> 15px ignores jitter in the same lane)
+                    //
+                    if dy > 15.0 {
+                        let dx = (n.x - current.x).abs();
+
+                        //
+                        // Penalize horizontal distance heavily
+                        //
+                        let score = (dx * 4.0) + dy;
+
+                        if score < best_score {
+                            best_score = score;
+                            best_node = Some(n.id);
+                        }
+                    }
+                }
+
+                best_node.into()
+            }
+
+            LogicalKey::Named(NamedKey::Down) => {
+                //
+                // Branch Hopping: Find ANY node below us
+                //
+
+                let mut best_node = None;
+                let mut best_score = f32::MAX;
+
+                for n in &layout.nodes {
+                    let dy = n.y - current.y; // Positive if n is below current
+
+                    if dy > 15.0 {
+                        let dx = (n.x - current.x).abs();
+
+                        //
+                        // Penalize horizontal distance heavily
+                        //
+                        let score = (dx * 4.0) + dy;
+
+                        if score < best_score {
+                            best_score = score;
+                            best_node = Some(n.id);
+                        }
+                    }
+                }
+
+                best_node.into()
+            }
+
+            _ => None.into()
+        }
+    };
+
+    if let Some(id) = target_id.expand() {
+        editor.reset_blink();
+
+        let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
+
+        let (view, buf) = editor.active_view_and_buffer_mut();
+        view.graph_camera.prev_head = buf.undo.head;
+        let is_forward = buf.jump_to(id, &mut view.cursor);
+        view.graph_camera.last_nav_was_forward = is_forward;
+
+        center_undo_graph_on_head(editor);
+
+        return UndoGraphKeyDispatch::Navigated;
+    }
+
+    UndoGraphKeyDispatch::None
+}
+
+pub fn center_screen_so_that_cursor_isnt_covered_by_undo_graph(editor: &mut Editor) {
+    let (view, _buf) = editor.active_view_and_buffer();
+    let rect = editor.panels[view.panel_id.unwrap()].rect;
+    let line_h = editor.line_h();
+
+    let (view, buf) = editor.active_view_and_buffer_mut();
+    let line = buf.text.char_to_line(view.cursor.char_index as _);
+    view.scroll_to_cursor_centered(line+3, line_h, rect);
+}
+
+pub fn get_graph_rect_and_do_scroll_if_necessary(editor: &mut Editor) -> Rect {
+    let win_w = editor.win_w;
+    let win_h = editor.win_h;
+
+    let   rect_pad = 20.0;
+    let cursor_pad = 20.0;
+
+    let cursor_y = editor.active_view().cursor_anim_y;
+
+    let middle = win_h / 2.0;
+    let cursor_height = editor.line_h() + editor.cursor_h();
+
+    let is_cursor_in_the_lower_side_of_the_screen =
+        (middle - cursor_height - rect_pad + cursor_pad) < cursor_y;
+
+    if is_cursor_in_the_lower_side_of_the_screen {
+        center_screen_so_that_cursor_isnt_covered_by_undo_graph(editor);
+    }
+
+    let w = win_w/1.22;
+    let h = win_h/2.2;
+
+    Rect {
+        x: (win_w - w) / 2.0,
+        y:  win_h - h - rect_pad,
+        w, h,
+    }
+}
+
+pub fn center_undo_graph_on_head(editor: &mut Editor) {
+    let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
+
+    let (view, buf) = editor.active_view_and_buffer_mut();
+    let head_id = buf.undo.head;
+    let layout = buf.undo.get_or_build_layout();
+
+    if let Some(head_node) = layout.nodes.iter().find(|n| n.id == head_id) {
+        view.graph_camera.target_x = head_node.x - (graph_rect.w / 2.0);
+        view.graph_camera.target_y = head_node.y - (graph_rect.h / 2.0);
+
+        view.graph_camera.target_head_x = head_node.x;
+        view.graph_camera.target_head_y = head_node.y;
     }
 }

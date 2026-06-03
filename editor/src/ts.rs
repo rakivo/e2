@@ -8,11 +8,12 @@ use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::thread;
+use std::fmt::Write;
 
 use cranelift_entity::PrimaryMap;
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
-use ropey::Rope;
+use piece_tree::PieceTree;
 use rustc_hash::FxHashMap;
 use smallstr::SmallString;
 use smallvec::SmallVec;
@@ -85,13 +86,14 @@ impl e2_InputEdit {
 pub enum ParserMessage {
     Initialize {
         buffer_id: BufferId,
-        rope: Rope,
+        tree: PieceTree,
+        force: bool,
         buffer_last_edit_generation: u64,
     },
 
     Reparse {
         buffer_id: BufferId,
-        rope: Rope,
+        tree: PieceTree,
         buffer_last_edit_generation: u64,
     },
 }
@@ -100,7 +102,7 @@ pub enum ParserQuery {
     FuncCallOverlay {
         buffer_id: BufferId,
         cursor_byte: usize,
-        rope: Rope,
+        tree: PieceTree,
     },
 }
 
@@ -178,36 +180,41 @@ pub struct TreeSitter {
 
 impl TreeSitter {
     #[inline]
-    pub fn query_cursor_overlay_without_sending(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<Overlay> {
+    pub fn query_cursor_overlay_without_sending(&self, buffer_id: BufferId, cursor_byte: usize, piece_tree: &PieceTree) -> Option<Overlay> {
         let tree = self.trees.get(&buffer_id)?;
         let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte)?;
-        find_call_overlay(node, cursor_byte, rope, &self.atom_table)
+        find_call_overlay(node, cursor_byte, piece_tree, &self.atom_table)
     }
 
     #[inline]
-    pub fn query_cursor_overlay(&self, buffer_id: BufferId, cursor_byte: usize, rope: &Rope) -> Option<Overlay> {
-        if let Some(o) = self.query_cursor_overlay_without_sending(buffer_id, cursor_byte, rope) {
+    pub fn query_cursor_overlay(&self, buffer_id: BufferId, cursor_byte: usize, tree: &PieceTree) -> Option<Overlay> {
+        if let Some(o) = self.query_cursor_overlay_without_sending(buffer_id, cursor_byte, tree) {
             return Some(o);
         }
 
-        self.send_cursor_query(buffer_id, cursor_byte, rope.clone());
+        self.send_cursor_query(buffer_id, cursor_byte, tree.clone());
 
         None
     }
 
     #[inline]
-    pub fn send_reparse(&self, buffer_id: BufferId, rope: Rope, buffer_last_edit_generation: u64) {
-        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, rope, buffer_last_edit_generation });
+    pub fn send_reparse(&self, buffer_id: BufferId, tree: PieceTree, buffer_last_edit_generation: u64) {
+        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, tree, buffer_last_edit_generation });
     }
 
     #[inline]
-    pub fn send_init(&self, buffer_id: BufferId, rope: Rope, buffer_last_edit_generation: u64) {
-        _ = self.message_tx.send(ParserMessage::Initialize { buffer_id, rope, buffer_last_edit_generation });
+    pub fn send_force_reparse(&self, buffer_id: BufferId, tree: PieceTree, buffer_last_edit_generation: u64) {
+        _ = self.message_tx.send(ParserMessage::Initialize { buffer_id, tree, buffer_last_edit_generation, force: true });
     }
 
     #[inline]
-    pub fn send_cursor_query(&self, buffer_id: BufferId, cursor_byte: usize, rope: Rope) {
-        _ = self.query_tx.send(ParserQuery::FuncCallOverlay { buffer_id, cursor_byte, rope });
+    pub fn send_init(&self, buffer_id: BufferId, tree: PieceTree, buffer_last_edit_generation: u64) {
+        _ = self.message_tx.send(ParserMessage::Initialize { buffer_id, tree, buffer_last_edit_generation, force: false });
+    }
+
+    #[inline]
+    pub fn send_cursor_query(&self, buffer_id: BufferId, cursor_byte: usize, tree: PieceTree) {
+        _ = self.query_tx.send(ParserQuery::FuncCallOverlay { buffer_id, cursor_byte, tree });
     }
 }
 
@@ -231,25 +238,20 @@ pub fn spawn() -> TreeSitter {
 }
 
 fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, result_tx: Sender<ParseResult>, atom_table: Arc<AtomTable>, trees: Arc<DashMap<BufferId, VersionedTree>>) {
-    let mut parser  = Parser::new();
-
-    parser.set_language(&tree_sitter_rust::LANGUAGE.into())
-        .expect("failed to load Rust grammar");
-
-    fn rope_chunk_callback<'a>(rope: &'a Rope, byte: usize) -> &'a [u8] {
-        if byte >= rope.len_bytes() { return &[]; }
-        let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
-        &chunk.as_bytes()[(byte - chunk_start)..]
+    fn chunk_callback<'a>(tree: &'a PieceTree, byte: usize) -> &'a [u8] {
+        if byte >= tree.len_bytes() as usize { return &[] }
+        let (chunk, _chunk_start) = tree.chunk_at_byte(byte as _);
+        chunk
     }
 
     loop {
         crossbeam_channel::select! {
             recv(query_rx) -> q => match q {
-                Ok(ParserQuery::FuncCallOverlay { buffer_id, cursor_byte, rope }) => {
+                Ok(ParserQuery::FuncCallOverlay { buffer_id, cursor_byte, tree: piece_tree }) => {
                     let Some(tree) = trees.get(&buffer_id) else { continue };
 
                     let node = tree.root_node().descendant_for_byte_range(cursor_byte, cursor_byte);
-                    let overlay = node.and_then(|n| find_call_overlay(n, cursor_byte, &rope, &atom_table));
+                    let overlay = node.and_then(|n| find_call_overlay(n, cursor_byte, &piece_tree, &atom_table));
 
                     _ = result_tx.send(ParseResult {
                         buffer_id,
@@ -261,17 +263,22 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
             },
 
             recv(edit_rx) -> msg => match msg {
-                Ok(ParserMessage::Reparse { buffer_id, rope, buffer_last_edit_generation }) => {
+                Ok(ParserMessage::Reparse { buffer_id, tree, buffer_last_edit_generation }) => {
                     //
                     // Snapshot the old tree for the incremental parse hint,
                     // clone it immediately so we hold the lock for the minimum time.
                     //
                     let old_tree = trees.get(&buffer_id).map(|e| e.tree.clone());
 
+                    let mut parser  = Parser::new();
+
+                    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).expect("failed to load Rust grammar");
+
+
                     //
-                    // Parse entirely outside any lock.
+                    // Parse entirely outside any lock
                     //
-                    let mut callback = |byte: usize, _point: Point| rope_chunk_callback(&rope, byte);
+                    let mut callback = |byte: usize, _point: Point| chunk_callback(&tree, byte);
                     let Some(new_tree) = parser.parse_with_options(
                         &mut callback,
                         old_tree.as_ref(),
@@ -284,8 +291,8 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     // Collect functions from the new tree before acquiring any lock
                     //
                     let root_node = new_tree.root_node();
-                    let functions = collect_functions(root_node, &rope, buffer_id, &atom_table);
-                    let symbols   = collect_symbols(root_node, &rope, buffer_id, &atom_table);
+                    let functions = collect_functions(root_node, &tree, buffer_id, &atom_table);
+                    let symbols   = collect_symbols(root_node, &tree, buffer_id, &atom_table);
 
                     //
                     // Atomically decide whether to commit,
@@ -327,10 +334,14 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     });
                 }
 
-                Ok(ParserMessage::Initialize { buffer_id, rope, buffer_last_edit_generation }) => {
-                    if trees.contains_key(&buffer_id) { continue; }
+                Ok(ParserMessage::Initialize { buffer_id, tree: piece_tree, buffer_last_edit_generation, force }) => {
+                    if !force && trees.contains_key(&buffer_id) { continue; }
 
-                    let mut callback = |byte: usize, _point: Point| rope_chunk_callback(&rope, byte);
+                    let mut callback = |byte: usize, _point: Point| chunk_callback(&piece_tree, byte);
+
+                    let mut parser = Parser::new();
+
+                    parser.set_language(&tree_sitter_rust::LANGUAGE.into()).expect("failed to load Rust grammar");
 
                     let Some(tree) = parser.parse_with_options(&mut callback, None, None) else { continue };
 
@@ -338,8 +349,8 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     let root_node = tree_copy.root_node();
                     trees.insert(buffer_id, VersionedTree { tree, buffer_last_edit_generation });
 
-                    let functions = collect_functions(root_node, &rope, buffer_id, &atom_table);
-                    let symbols   = collect_symbols(root_node, &rope, buffer_id, &atom_table);
+                    let functions = collect_functions(root_node, &piece_tree, buffer_id, &atom_table);
+                    let symbols   = collect_symbols(root_node, &piece_tree, buffer_id, &atom_table);
                     if functions.is_empty() && symbols.is_empty() { continue; }
 
                     _ = result_tx.send(ParseResult {
@@ -544,7 +555,7 @@ struct FuncContext {
     pub module:    Box<[Atom]>,
 }
 
-pub fn collect_functions(root: Node, source: &Rope, buffer_id: BufferId, table: &AtomTable) -> Vec<FunctionInfo> {
+pub fn collect_functions(root: Node, source: &PieceTree, buffer_id: BufferId, table: &AtomTable) -> Vec<FunctionInfo> {
     let mut out = Vec::new();
     visit_node(root, source, buffer_id, &FuncContext::default(), &mut out, table);
     out
@@ -552,7 +563,7 @@ pub fn collect_functions(root: Node, source: &Rope, buffer_id: BufferId, table: 
 
 fn visit_node(
     node:      Node,
-    source:    &Rope,
+    source:    &PieceTree,
     buffer_id: BufferId,
     ctx:       &FuncContext,
     out:       &mut Vec<FunctionInfo>,
@@ -560,7 +571,7 @@ fn visit_node(
 ) {
     match node.kind() {
         "function_item" => if let Some(name_node) = node.child_by_field_name("name") {
-            let name   = rope_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
+            let name   = tree_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
             let params = collect_params(node, source, table);
             out.push(FunctionInfo {
                 generation: u32::MAX,
@@ -574,7 +585,7 @@ fn visit_node(
 
         "impl_item" => {
             let impl_name = node.child_by_field_name("type")
-                .map(|n| rope_slice_to_atom(source, n.start_byte(), n.end_byte(), table));
+                .map(|n| tree_slice_to_atom(source, n.start_byte(), n.end_byte(), table));
 
             let new_ctx = FuncContext { impl_name, module: ctx.module.clone() };
             let mut cursor = node.walk();
@@ -586,7 +597,7 @@ fn visit_node(
         }
 
         "mod_item" => if let Some(name_node) = node.child_by_field_name("name") {
-            let mod_atom = rope_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
+            let mod_atom = tree_slice_to_atom(source, name_node.start_byte(), name_node.end_byte(), table);
             let mut new_module = Vec::from(ctx.module.clone());
             new_module.push(mod_atom);
 
@@ -608,7 +619,7 @@ fn visit_node(
     }
 }
 
-fn collect_params(fn_node: Node, source: &Rope, table: &AtomTable) -> Vec<ParamInfo> {
+fn collect_params(fn_node: Node, source: &PieceTree, table: &AtomTable) -> Vec<ParamInfo> {
     let mut params = Vec::new();
     let Some(param_list) = fn_node.child_by_field_name("parameters") else { return params; };
 
@@ -618,8 +629,8 @@ fn collect_params(fn_node: Node, source: &Rope, table: &AtomTable) -> Vec<ParamI
 
         let (name, type_str) = match (child.child_by_field_name("pattern"), child.child_by_field_name("type")) {
             (Some(n), Some(t)) => (
-                rope_slice_to_atom(source, n.start_byte(), n.end_byte(), table),
-                rope_slice_to_atom(source, t.start_byte(), t.end_byte(), table),
+                tree_slice_to_atom(source, n.start_byte(), n.end_byte(), table),
+                tree_slice_to_atom(source, t.start_byte(), t.end_byte(), table),
             ),
             _ => continue,
         };
@@ -629,36 +640,18 @@ fn collect_params(fn_node: Node, source: &Rope, table: &AtomTable) -> Vec<ParamI
     params
 }
 
-/// Helper that slices the rope and interns the resulting string immediately.
-fn rope_slice_to_atom(source: &Rope, start_byte: usize, end_byte: usize, table: &AtomTable) -> Atom {
-    let start = source.byte_to_char(start_byte);
-    let end   = source.byte_to_char(end_byte);
-
-    source.get_slice(start..end)
-        .map(|s| if let Some(in_memory) = s.as_str() {
-            table.intern(in_memory)
-        } else {
-            let mut flat = SmallString::<[_; 128]>::with_capacity(s.len_bytes());
-            for c in s.chunks() { flat.push_str(c); }
-            table.intern(&flat)
-        }).unwrap_or_default()
+/// Helper that slices the tree and interns the resulting string immediately.
+fn tree_slice_to_atom(source: &PieceTree, start_byte: usize, end_byte: usize, table: &AtomTable) -> Atom {
+    let slice = source.slice(start_byte as u32..end_byte as u32);
+    let mut flat = SmallString::<[_; 128]>::with_capacity(slice.len_bytes() as usize);
+    _ = write!(&mut flat, "{slice}");
+    table.intern(&flat)
 }
 
-/// Helper that slices the rope and interns the resulting string immediately.
-fn rope_slice_to_string<'a>(source: &'a Rope, start_byte: usize, end_byte: usize) -> Cow<'a, str> {
-    let start = source.byte_to_char(start_byte);
-    let end   = source.byte_to_char(end_byte);
-
-    source.get_slice(start..end)
-        .map(|s| if let Some(in_memory) = s.as_str() {
-            Cow::Borrowed(in_memory)
-        } else {
-            let mut flat = String::with_capacity(s.len_bytes());
-            for c in s.chunks() { flat.push_str(c); }
-            Cow::Owned(flat)
-        }).unwrap_or_default()
+/// Helper that slices the tree and interns the resulting string immediately.
+fn tree_slice_to_string<'a>(source: &'a PieceTree, start_byte: usize, end_byte: usize) -> Cow<'a, str> {
+    source.slice(start_byte as u32..end_byte as u32).to_string().into()
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -804,18 +797,18 @@ pub struct RawSymbol {
     pub range_end:   u32,
 }
 
-pub fn collect_symbols(root: Node, source: &Rope, _buffer_id: BufferId, atom_table: &AtomTable) -> Vec<RawSymbol> {
+pub fn collect_symbols(root: Node, source: &PieceTree, _buffer_id: BufferId, atom_table: &AtomTable) -> Vec<RawSymbol> {
     let mut out = Vec::new();
     collect_symbols_inner(root, source, &mut out, None, atom_table);
     out
 }
 
-fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, parent_enum: Option<Atom>, atom_table: &AtomTable) {
+fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol>, parent_enum: Option<Atom>, atom_table: &AtomTable) {
     match node.kind() {
         "struct_item" => {
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
-                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
                     detail:      "struct".into(),
                     kind:        SymbolKind::Struct,
                     range_start: node.start_byte() as u32,
@@ -826,7 +819,7 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
 
         "enum_item" => {
             if let Some(name) = node.child_by_field_name("name") {
-                let enum_name = rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
+                let enum_name = tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
                 out.push(RawSymbol {
                     name:        enum_name,
                     detail:      "enum".into(),
@@ -847,7 +840,7 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
 
         "enum_variant" => {
             if let Some(name) = node.child_by_field_name("name") {
-                let variant_name = rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
+                let variant_name = tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
                 let detail = parent_enum.map_or("variant".into(), |e| format!("{}::", atom_table.lookup_ref(e).as_ref()));
                 out.push(RawSymbol {
                     name:        variant_name,
@@ -862,7 +855,7 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
         "trait_item" => {
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
-                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
                     detail:      "trait".into(),
                     kind:        SymbolKind::Trait,
                     range_start: node.start_byte() as u32,
@@ -874,7 +867,7 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
         "type_item" => {
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
-                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
                     detail:      "type".into(),
                     kind:        SymbolKind::TypeAlias,
                     range_start: node.start_byte() as u32,
@@ -886,10 +879,10 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
         "const_item" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let detail = node.child_by_field_name("type")
-                    .map(|t| rope_slice_to_string(source, t.start_byte(), t.end_byte()))
+                    .map(|t| tree_slice_to_string(source, t.start_byte(), t.end_byte()))
                     .unwrap_or_else(|| "const".into());
                 out.push(RawSymbol {
-                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
                     detail: detail.into(),
                     kind:        SymbolKind::Const,
                     range_start: node.start_byte() as u32,
@@ -901,11 +894,11 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
         "static_item" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let detail = node.child_by_field_name("type")
-                    .map(|t| rope_slice_to_string(source, t.start_byte(), t.end_byte()))
+                    .map(|t| tree_slice_to_string(source, t.start_byte(), t.end_byte()))
                     .unwrap_or_else(|| "static".into());
 
                 out.push(RawSymbol {
-                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
                     detail: detail.into(),
                     kind:        SymbolKind::Static,
                     range_start: node.start_byte() as u32,
@@ -917,7 +910,7 @@ fn collect_symbols_inner(node: Node, source: &Rope, out: &mut Vec<RawSymbol>, pa
         "mod_item" => {
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
-                    name:        rope_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
+                    name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
                     detail:      "mod".into(),
                     kind:        SymbolKind::Mod,
                     range_start: node.start_byte() as u32,
@@ -968,7 +961,7 @@ impl OverlayState {
     }
 }
 
-fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &Rope, table: &AtomTable) -> Option<Overlay> {
+fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &PieceTree, table: &AtomTable) -> Option<Overlay> {
     loop {
         if node.kind() == "call_expression" {
             let fn_node = node.child_by_field_name("function")?;
@@ -1005,18 +998,18 @@ fn find_call_overlay(mut node: Node, cursor_byte: usize, source: &Rope, table: &
     find_incomplete_call_overlay(cursor_byte, source, table)
 }
 
-fn parse_call_kind(fn_node: Node, source: &Rope, table: &AtomTable) -> CallKind {
+fn parse_call_kind(fn_node: Node, source: &PieceTree, table: &AtomTable) -> CallKind {
     match fn_node.kind() {
         // bar()
         "identifier" => {
-            let name = rope_slice_to_atom(source, fn_node.start_byte(), fn_node.end_byte(), table);
+            let name = tree_slice_to_atom(source, fn_node.start_byte(), fn_node.end_byte(), table);
             CallKind::Bare(name)
         }
 
         // foo.bar() - field_expression
         "field_expression" => {
             let field = fn_node.child_by_field_name("field");
-            let name  = field.map(|n| rope_slice_to_atom(source, n.start_byte(), n.end_byte(), table))
+            let name  = field.map(|n| tree_slice_to_atom(source, n.start_byte(), n.end_byte(), table))
                 .unwrap_or_default();
             CallKind::Method(name)
         }
@@ -1027,13 +1020,13 @@ fn parse_call_kind(fn_node: Node, source: &Rope, table: &AtomTable) -> CallKind 
             let path_node = fn_node.child_by_field_name("path");
 
             let name = name_node
-                .map(|n| rope_slice_to_atom(source, n.start_byte(), n.end_byte(), table))
+                .map(|n| tree_slice_to_atom(source, n.start_byte(), n.end_byte(), table))
                 .unwrap_or_default();
 
             match path_node {
                 None => CallKind::Bare(name),
                 Some(path) if path.kind() == "identifier" => {
-                    let prefix = rope_slice_to_atom(source, path.start_byte(), path.end_byte(), table);
+                    let prefix = tree_slice_to_atom(source, path.start_byte(), path.end_byte(), table);
                     CallKind::AssocOrPath(prefix, name)
                 }
                 Some(path) => {
@@ -1053,31 +1046,31 @@ fn parse_call_kind(fn_node: Node, source: &Rope, table: &AtomTable) -> CallKind 
 
         _ => {
             // fallback: grab the last identifier in whatever expression this is
-            let name = rope_slice_to_atom(source, fn_node.start_byte(), fn_node.end_byte(), table);
+            let name = tree_slice_to_atom(source, fn_node.start_byte(), fn_node.end_byte(), table);
             CallKind::Method(name)
         }
     }
 }
 
-fn collect_path_segments(node: Node, source: &Rope, table: &AtomTable) -> Vec<Atom> {
+fn collect_path_segments(node: Node, source: &PieceTree, table: &AtomTable) -> Vec<Atom> {
     let mut segments = Vec::new();
     collect_path_segments_inner(node, source, table, &mut segments);
     segments
 }
 
-fn collect_path_segments_inner(node: Node, source: &Rope, table: &AtomTable, out: &mut Vec<Atom>) {
+fn collect_path_segments_inner(node: Node, source: &PieceTree, table: &AtomTable, out: &mut Vec<Atom>) {
     match node.kind() {
         "scoped_identifier" => {
             if let Some(path) = node.child_by_field_name("path") {
                 collect_path_segments_inner(path, source, table, out);
             }
             if let Some(name) = node.child_by_field_name("name") {
-                out.push(rope_slice_to_atom(source, name.start_byte(), name.end_byte(), table));
+                out.push(tree_slice_to_atom(source, name.start_byte(), name.end_byte(), table));
             }
         }
 
         "identifier" => {
-            out.push(rope_slice_to_atom(source, node.start_byte(), node.end_byte(), table));
+            out.push(tree_slice_to_atom(source, node.start_byte(), node.end_byte(), table));
         }
 
         _ => {}
@@ -1134,10 +1127,10 @@ pub fn overlay_needs_reset_cursor_byte(o: &Overlay, cursor_byte: u32) -> bool {
 
 fn find_incomplete_call_overlay(
     cursor_byte: usize,
-    source: &Rope,
+    source: &PieceTree,
     table: &AtomTable,
 ) -> Option<Overlay> {
-    let cursor_byte = cursor_byte.min(source.len_bytes());
+    let cursor_byte = cursor_byte.min(source.len_bytes() as _);
 
     let open_paren_byte = find_opening_paren_before_cursor(source, cursor_byte)?;
     let callee = extract_callee_before_paren(source, open_paren_byte)?;
@@ -1157,9 +1150,9 @@ fn find_incomplete_call_overlay(
     })
 }
 
-fn is_definition_context(source: &Rope, callee_start_byte: usize) -> bool {
+fn is_definition_context(source: &PieceTree, callee_start_byte: usize) -> bool {
     let start = callee_start_byte.saturating_sub(32);
-    let window = source.byte_slice(start..callee_start_byte).to_string();
+    let window = source.slice(start as u32..callee_start_byte as u32).to_string();
 
     let trimmed = window.trim_end();
 
@@ -1207,7 +1200,7 @@ macro_rules! with_scratch_bytes {
 }
 
 fn find_opening_paren_before_cursor( // @Memory
-    source: &Rope,
+    source: &PieceTree,
     cursor_byte: usize,
 ) -> Option<usize> {
     with_scratch_bytes! {
@@ -1217,14 +1210,14 @@ fn find_opening_paren_before_cursor( // @Memory
 }
 
 fn find_opening_paren_before_cursor_impl(
-    source: &Rope,
+    source: &PieceTree,
     cursor_byte: usize,
     scratch_bytes: &mut SmallVec<[u8; LOOKBACK_CHARS]>,
 ) -> Option<usize> {
     let start = cursor_byte.saturating_sub(LOOKBACK_CHARS);
 
     scratch_bytes.clear();
-    scratch_bytes.extend(source.byte_slice(start..cursor_byte).bytes());
+    scratch_bytes.extend(source.slice(start as u32..cursor_byte as u32).bytes());
 
     let mut depth = 0isize;
 
@@ -1291,7 +1284,7 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
 
         let name = parts.last().copied()?;
         let name_start = expr.rfind(name)?;
-        let name_atom = rope_slice_to_atom_from_str(
+        let name_atom = tree_slice_to_atom_from_str(
             expr, name_start, name_start + name.len(),
             expr_start_byte,
             table
@@ -1303,7 +1296,7 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
             2 => {
                 let prefix = parts[0];
                 let prefix_start = expr.find(prefix)?;
-                let prefix_atom = rope_slice_to_atom_from_str(
+                let prefix_atom = tree_slice_to_atom_from_str(
                     expr, prefix_start, prefix_start + prefix.len(), expr_start_byte,
                     table
                 );
@@ -1317,7 +1310,7 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
                     let rel = expr[pos..].find(part)?;
                     let s = pos + rel;
                     let e = s + part.len();
-                    segs.push(rope_slice_to_atom_from_str(expr, s, e, expr_start_byte, table));
+                    segs.push(tree_slice_to_atom_from_str(expr, s, e, expr_start_byte, table));
                     pos = e + 2;
                 }
 
@@ -1337,7 +1330,7 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
         }
 
         let name_start = expr.rfind(name)?;
-        let atom = rope_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
+        let atom = tree_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
         Some(CallKind::Method(atom))
 
     } else {
@@ -1347,12 +1340,12 @@ fn parse_incomplete_call_kind(expr: &str, expr_start_byte: usize, table: &AtomTa
         }
 
         let name_start = expr.rfind(name)?;
-        let atom = rope_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
+        let atom = tree_slice_to_atom_from_str(expr, name_start, name_start + name.len(), expr_start_byte, table);
         Some(CallKind::Bare(atom))
     }
 }
 
-fn rope_slice_to_atom_from_str(
+fn tree_slice_to_atom_from_str(
     expr: &str,
     start: usize,
     end: usize,
@@ -1364,7 +1357,7 @@ fn rope_slice_to_atom_from_str(
 }
 
 fn extract_callee_before_paren(
-    source: &Rope,
+    source: &PieceTree,
     open_paren_byte: usize,
 ) -> Option<CalleeSpan> {
     with_scratch_chars! {
@@ -1374,16 +1367,16 @@ fn extract_callee_before_paren(
 }
 
 fn extract_callee_before_paren_impl(
-    source: &Rope,
+    source: &PieceTree,
     open_paren_byte: usize,
     scratch_chars: &mut SmallVec<[char; LOOKBACK_CHARS]>
 ) -> Option<CalleeSpan> {
     let start = open_paren_byte.saturating_sub(LOOKBACK_CHARS);
-    let rope_slice = source.byte_slice(start..open_paren_byte);
+    let tree_slice = source.slice(start as u32..open_paren_byte as u32);
 
     let chars = scratch_chars;
     chars.clear();
-    chars.extend(rope_slice.chars());
+    chars.extend(tree_slice.chars());
     if chars.is_empty() {
         return None;
     }
@@ -1493,8 +1486,9 @@ fn extract_callee_before_paren_impl(
     }
 
     let start_byte_rel = i;
+    let end_byte = tree_slice.char_to_byte(end as u32);
 
-    let text: Box<str> = rope_slice.byte_slice(start_byte_rel..end).to_string().trim().into();
+    let text: Box<str> = tree_slice.slice(start_byte_rel as u32..end_byte).to_string().trim().into();
     if text.is_empty() {
         return None;
     }
@@ -1506,7 +1500,7 @@ fn extract_callee_before_paren_impl(
 }
 
 fn count_incomplete_arg_index(
-    source: &Rope,
+    source: &PieceTree,
     open_paren_byte: usize,
     cursor_byte: usize,
 ) -> Option<usize> {
@@ -1517,21 +1511,21 @@ fn count_incomplete_arg_index(
 }
 
 fn count_incomplete_arg_index_impl(
-    source: &Rope,
+    source: &PieceTree,
     open_paren_byte: usize,
     cursor_byte: usize,
     scratch_chars: &mut SmallVec<[char; LOOKBACK_CHARS]>
 ) -> Option<usize> {
-    let cursor_byte = cursor_byte.min(source.len_bytes());
+    let cursor_byte = cursor_byte.min(source.len_bytes() as usize);
     if cursor_byte <= open_paren_byte {
         return Some(0);
     }
 
-    let rope_slice = source.byte_slice(open_paren_byte + 1..cursor_byte);
+    let tree_slice = source.slice(open_paren_byte as u32 + 1..cursor_byte as u32);
     let chars = scratch_chars;
 
     chars.clear();
-    chars.extend(rope_slice.chars());
+    chars.extend(tree_slice.chars());
 
     let mut paren_depth   = 0i32;
     let mut bracket_depth = 0i32;
@@ -2164,7 +2158,7 @@ fn last_close_child(node: Node) -> Option<usize> {
 pub fn collect_locals_at_cursor(
     root:        Node,
     cursor_byte: usize,
-    source:      &Rope,
+    source:      &PieceTree,
     atom_table:  &AtomTable
 ) -> Vec<CompletionItem> {
     let mut out = Vec::new();
@@ -2259,10 +2253,10 @@ pub fn collect_locals_at_cursor(
     out
 }
 
-fn collect_pattern_bindings(pat: Node, source: &Rope, out: &mut Vec<CompletionItem>, atom_table: &AtomTable) {
+fn collect_pattern_bindings(pat: Node, source: &PieceTree, out: &mut Vec<CompletionItem>, atom_table: &AtomTable) {
     match pat.kind() {
         "identifier" => {
-            let name = rope_slice_to_atom(source, pat.start_byte(), pat.end_byte(), atom_table);
+            let name = tree_slice_to_atom(source, pat.start_byte(), pat.end_byte(), atom_table);
             if atom_table.lookup_ref(name).as_ref() == "_" { return; }
             out.push(CompletionItem {
                 name: name,
@@ -2292,14 +2286,14 @@ fn collect_pattern_bindings(pat: Node, source: &Rope, out: &mut Vec<CompletionIt
 pub fn extract_prefix_at_cursor(buf: &Buffer, cursor_char: usize) -> (usize, String) {
     let mut start = cursor_char;
     while start > 0 {
-        let c = buf.text.char(start - 1);
+        let c = buf.text.char(start as u32 - 1);
         if c.is_alphanumeric() || c == '_' {
             start -= 1;
         } else {
             break;
         }
     }
-    let prefix: String = buf.text.slice(start..cursor_char).to_string();
+    let prefix: String = buf.text.slice_chars(start as _, cursor_char as _).to_string();
     (start, prefix)
 }
 
@@ -2311,7 +2305,7 @@ pub fn query_completions(
     _buffer_id:    BufferId,
     cursor_byte: usize,
     tree:        Option<&Tree>,
-    source:      &Rope,
+    source:      &PieceTree,
     limit:        usize,
 ) -> Vec<CompletionItem> {
     if prefix.is_empty() { return vec![]; }

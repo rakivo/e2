@@ -544,61 +544,81 @@ pub fn lex_from(
             }
 
             C_TICK => {
-                //
-                // Scan forward to find a closing ' OR a newline
-                //
+                let has_lifetimes = true;  // nocheckin
+
+                let mut is_lifetime = false;
+                let mut found_closing_quote = false;
+                let mut closing_quote_idx = 0;
+                let mut contains_invalid_char = false;
 
                 let mut j = i + 1;
-                let mut found_closing_quote = false;
-
                 while j < len {
                     let c = bytes[j];
 
-                    if c == b'\'' {
-                        found_closing_quote = true;
-                        j += 1;
-                        break;
-                    }
-
                     if c == b'\n' {
-                        break;
+                        break;  // Stop at end of line
                     }
 
                     if c == b'\\' {
-                        j += 1;  // Consume backslash
+                        j += 1;
+                        if j < len { j += 1; }
+                        continue;  // Skip escaped characters
+                    }
 
-                        if j < len {
-                            j += 1;
-                        }
+                    if c == b'\'' {
+                        found_closing_quote = true;
+                        closing_quote_idx = j;
+                        break;
+                    }
 
-                        continue;
+                    //
+                    // If we see structural code punctuation BEFORE a closing quote,
+                    // it means these are disconnected lifetimes (e.g., `<'a, 'b>`)
+                    // rather than a single string you are actively typing.
+                    //
+                    if [b']', b'[', b'}', b'{', b')', b'(', b'=', b';', b':', b'>', b'<', b','].contains(&(c as u8)) {
+                        contains_invalid_char = true;
                     }
 
                     j += 1;
                 }
 
-                if found_closing_quote {
+                //
+                // Decide if this is a lifetime
+                //
+                if has_lifetimes {
                     //
-                    // It's a character literal (e.g., 'a' or 'multi char')
-                    //
-                    i = j;
-                    push!(TokenKind::String, start, i);
-                } else {
-                    //
-                    // No closing quote found on this line,
-                    // check if the start looks like a lifetime identifier
+                    // It must start with a valid identifier character
                     //
                     if i + 1 < len && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
-                        i += 1;  // Skip the '
-                        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                            i += 1;
+                        // It is a lifetime if:
+                        //   1. There is no closing quote on this line (e.g., `let x = &'a mut`)
+                        //   2. There IS  a closing quote, but separated by structural punctuation (e.g., `<'a, 'b>`)
+                        if !found_closing_quote || contains_invalid_char {
+                            is_lifetime = true;
                         }
-                        push!(TokenKind::Default, start, i);
-                    } else {
-                        // Just a stray quote mark,
-                        // consume only the ' to prevent "spreading" to the end of the file
+                    }
+                }
+
+                if is_lifetime {
+                    i += 1; // '
+                    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                         i += 1;
-                        push!(TokenKind::Punct, start, i);
+                    }
+
+                    push!(TokenKind::Default, start, i);
+
+                } else {
+                    if found_closing_quote {
+                        i = closing_quote_idx + 1;
+                        push!(TokenKind::String, start, i);
+                    } else {
+                        //
+                        // Unclosed string / typing state
+                        // We highlight the rest of the line as a string
+                        //
+                        i = j;
+                        push!(TokenKind::String, start, i);
                     }
                 }
             }

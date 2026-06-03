@@ -13,6 +13,9 @@ audioer = ["editor/audioer"]
 
 wayland = ["editor/wayland-data-control"]
 
+# profiling
+tracy = ["tracy/enable", "editor/tracy"]
+
 # allocators
 mimalloc = ["dep:mimalloc"]
 dhat = ["dep:dhat"]
@@ -20,10 +23,12 @@ dhat = ["dep:dhat"]
 [dependencies]
 editor = { path = "../editor" }
 editor-macros = { path = "../editor-macros" }
+tracy  = { path = "../tracy" }
 
 mimalloc = { version = "=0.1.47", optional = true }
 dhat = { version = "0.3.3", default-features = false, optional = true }
 
+piece-tree         .workspace = true
 rustc-edit-distance.workspace = true
 memchr             .workspace = true
 smallstr           .workspace = true

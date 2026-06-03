@@ -404,7 +404,7 @@ impl UiState {
         // Iterate in reverse so last-rendered (topmost) boxes win,
         // and break on first hit.
         for b in self.boxes.values().rev() {
-            if !b.flags.contains(BoxFlags::HOVERABLE) { continue }
+            if !b.flags.contains(BoxFlags::CLICKABLE) { continue }
 
             let [x0, y0, x1, y1] = b.rect;
 
@@ -414,8 +414,8 @@ impl UiState {
             let mx = mouse[0];
             let my = mouse[1];
 
-            if mx >= x0 && mx <= x1
-            && my >= y0 && my <= y1
+            if mx >= x0  && mx <= x1
+            && my >= y0  && my <= y1
             && mx >= cx0 && mx <= cx1
             && my >= cy0 && my <= cy1 {
                 self.hot_key = b.key;
@@ -822,6 +822,8 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
 pub struct BoxBuilder<'a> {
     ui:           &'a mut UiState,
 
+    force_clickable:     bool,
+
     label_hash:    LabelHash,
 
     flags:         BoxFlags,
@@ -848,6 +850,7 @@ impl<'a> BoxBuilder<'a> {
             padding: None,
             size_x: None, size_y: None,
             font_size: None,
+            force_clickable: false,
             bg: None, color: None, hover_color: None, border_color: None, axis: None,
             text: None,
             floating_pos: None,
@@ -913,6 +916,12 @@ impl<'a> BoxBuilder<'a> {
     }
 
     #[inline]
+    pub fn clickable(mut self) -> Self {
+        self.force_clickable = true;
+        self
+    }
+
+    #[inline]
     pub fn padding(mut self, p: f32) -> Self {
         self.padding = Some(p); // @Cleanup
         self
@@ -974,6 +983,9 @@ impl<'a> BoxBuilder<'a> {
         if let Some(c) = self.hover_color {
             ui.boxes[id].hover_color = c;
             ui.boxes[id].flags |= BoxFlags::HOVERABLE;
+        }
+        if self.force_clickable {
+            ui.boxes[id].flags |= BoxFlags::CLICKABLE;
         }
         if let Some(s) = self.font_size {
             ui.boxes[id].font_size = s;

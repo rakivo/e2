@@ -1,6 +1,6 @@
 #![allow(unused, unused_imports, dead_code, clippy::inline_always)]
 
-pub use tracy_client::{span, plot, Client};
+pub use tracy_client::{span, plot, Client, frame_image, frame_name, frame_mark};
 
 /// # Safety
 /// The string must be static or otherwise live for the entire program,
@@ -10,7 +10,7 @@ pub use tracy_client::{span, plot, Client};
 /// If no Tracy client is currently running.
 #[inline(always)]
 pub unsafe fn set_thread_name(s: &str) {
-    #[cfg(feature = "tracy")] {
+    #[cfg(feature = "enable")] {
         let c = Client::running().expect("set_thread_name without a running Client");
         c.set_thread_name(s);
     }
@@ -20,7 +20,7 @@ pub unsafe fn set_thread_name(s: &str) {
 /// If no Tracy client is currently running.
 #[inline(always)]
 pub fn message(s: &str) {
-    #[cfg(feature = "tracy")] {
+    #[cfg(feature = "enable")] {
         let c = Client::running().expect("message without a running Client");
         c.message(s, 0);
     }
@@ -30,7 +30,7 @@ pub fn message(s: &str) {
 /// If no Tracy client is currently running.
 #[inline(always)]
 pub fn message_color(s: &str, rgba: u32) {
-    #[cfg(feature = "tracy")] {
+    #[cfg(feature = "enable")] {
         let c = Client::running().expect("message_collor without a running Client");
         c.color_message(s, rgba, 0);
     }
@@ -55,7 +55,7 @@ pub fn create_plot(name: &str) -> tracy_client::PlotName {
 /// If no Tracy client is currently running.
 #[inline(always)]
 pub fn plot_value(plot: tracy_client::PlotName, value: f64) {
-    #[cfg(feature = "tracy")] {
+    #[cfg(feature = "enable")] {
         Client::running()
             .expect("plot_value called without a running Client")
             .plot(plot, value);
@@ -68,7 +68,7 @@ pub fn plot_value(plot: tracy_client::PlotName, value: f64) {
 /// If no Tracy client is currently running.
 #[inline(always)]
 pub fn plot_named(name: &str, value: f64) {
-    #[cfg(feature = "tracy")] {
+    #[cfg(feature = "enable")] {
         let client = Client::running().expect("plot_named called without a running Client");
         let plot_name = tracy_client::PlotName::new_leak(name.into());
         client.plot(plot_name, value);

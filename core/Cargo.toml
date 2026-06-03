@@ -14,7 +14,7 @@ audioer = ["editor/audioer", "custom/audioer"]
 wayland = ["editor/wayland-data-control"]
 
 # profiling
-tracy = ["tracy-client/enable"]
+tracy = ["tracy/enable", "custom/tracy", "editor/tracy"]
 
 # allocators
 mimalloc = ["dep:mimalloc", "custom/mimalloc"]
@@ -23,13 +23,13 @@ dhat = ["dep:dhat", "custom/dhat"]
 [dependencies]
 editor = { path = "../editor" }
 custom = { path = "../custom" }
+tracy  = { path = "../tracy" }
 
 mimalloc = { version = "=0.1.47", optional = true }
 dhat = { version = "0.3.3", default-features = false, optional = true }
 
 crossbeam-channel  .workspace = true
 libloading         .workspace = true
-tracy-client       .workspace = true
 raw-window-handle  .workspace = true
 
 ctrlc = "3.5.2"

@@ -147,6 +147,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
+
+[[package]]
 name = "bytemuck"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -272,7 +278,7 @@ dependencies = [
  "notify",
  "raw-window-handle",
  "sdl2",
- "tracy-client",
+ "tracy",
 ]
 
 [[package]]
@@ -417,10 +423,12 @@ dependencies = [
  "memmap2",
  "mimalloc",
  "paste",
+ "piece-tree",
  "rustc-edit-distance",
  "serde_json",
  "smallstr",
  "smallvec",
+ "tracy",
 ]
 
 [[package]]
@@ -525,15 +533,15 @@ dependencies = [
  "nohash-hasher",
  "papaya",
  "paste",
+ "piece-tree",
  "raw-window-handle",
  "rodio",
- "ropey",
  "rustc-hash 2.1.2",
  "smallstr",
  "smallvec",
  "swash",
  "tempfile",
- "tracy-client",
+ "tracy",
  "tree-sitter",
  "tree-sitter-rust",
 ]
@@ -1433,6 +1441,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "piece-tree"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c976d28ac0d0658350cde05a029a82132e87d0382abfb8d3f2edf2325b4d246"
+dependencies = [
+ "bytecount",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1574,16 +1591,6 @@ dependencies = [
  "num-rational",
  "symphonia",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ropey"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
-dependencies = [
- "smallvec",
- "str_indices",
 ]
 
 [[package]]
@@ -1774,12 +1781,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "str_indices"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
 
 [[package]]
 name = "streaming-iterator"
@@ -2013,6 +2014,13 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracy"
+version = "0.1.0"
+dependencies = [
+ "tracy-client",
 ]
 
 [[package]]

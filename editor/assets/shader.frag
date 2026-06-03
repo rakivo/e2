@@ -1,7 +1,8 @@
 #version 450
 
 layout(location=0) in vec2 f_uv;
-layout(location=1) in vec4 f_color;
+layout(location=1) in vec3 f_uv2;
+layout(location=2) in vec4 f_color;
 layout(location=0) out vec4 out_color;
 
 layout(set=0, binding=0) uniform texture2D tex;       // Atlas
@@ -29,6 +30,82 @@ void main() {
 
     if (f_uv.x == 0.0 && f_uv.y == 0.0) {
         out_color = f_color;
+        return;
+    }
+
+    // ROUNDED RECT OUTLINE
+    if (f_uv.x > 39000.0) {
+        float rx        = f_uv.x - 39000.0;
+        float ry        = f_uv.y;
+        float hw        = (f_uv2.x - rx) * 0.5;
+        float hh        = (f_uv2.y - ry) * 0.5;
+        float radius    = f_color.a * min(hw, hh);
+        float thickness = f_uv2.z   * min(hw, hh);
+
+        vec2  center = vec2(rx + hw, ry + hh);
+        vec2  p      = vec2(gl_FragCoord.x, gl_FragCoord.y) - center;
+        vec2  q      = abs(p) - vec2(hw - radius, hh - radius);
+        float dist   = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+
+        float aa    = fwidth(dist);
+        float outer = smoothstep(aa, -aa, dist);
+        float inner = smoothstep(-thickness + aa, -thickness - aa, dist);
+        float alpha = outer - inner;
+        if (alpha <= 0.01) discard;
+        out_color = vec4(f_color.rgb * alpha, alpha);
+        return;
+    }
+
+    // ROUNDED RECT FILLED
+    if (f_uv.x > 29000.0) {
+        float rx     = f_uv.x - 29000.0;
+        float ry     = f_uv.y;
+        float hw     = (f_uv2.x - rx) * 0.5;
+        float hh     = (f_uv2.y - ry) * 0.5;
+        float radius = f_uv2.z * min(hw, hh);
+
+        vec2  center = vec2(rx + hw, ry + hh);
+        vec2  p      = vec2(gl_FragCoord.x, gl_FragCoord.y) - center;
+        vec2  q      = abs(p) - vec2(hw - radius, hh - radius);
+        float dist   = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+
+        float aa    = fwidth(dist);
+        float alpha = smoothstep(aa, -aa, dist) * f_color.a;
+        if (alpha <= 0.01) discard;
+        out_color = vec4(f_color.rgb * alpha, alpha);
+        return;
+    }
+
+    // SDF LINES
+    if (f_uv.x > 19000.0) {
+        float dist = abs(f_uv.y);
+
+        // fwidth gets the change in UV space per pixel. Since we normalized our UVs
+        // to visual radius, this represents exactly 1 screen pixel in UV space.
+        float aa = fwidth(f_uv.y);
+
+        float alpha = smoothstep(1.0 + aa, 1.0 - aa, dist);
+        if (alpha <= 0.01) discard;
+
+        float a = f_color.a * alpha;
+        out_color = vec4(f_color.rgb * a, a);
+        return;
+    }
+
+    // SDF CIRCLES
+    if (f_uv.x > 9000.0) {
+        vec2 sdf_uv = f_uv - vec2(10000.0);
+        float dist = length(sdf_uv);
+
+        // Convert dist to pixels: radius maps UV 0..1 to 0..radius_px
+        // fwidth gives UV change per pixel, so 1/fwidth = pixels per UV unit
+        float px_size = 1.0 / fwidth(dist);  // pixels per UV unit = radius in pixels
+        float aa = 1.0 / px_size;            // 1 pixel in UV space
+
+        float alpha = smoothstep(1.0 + aa, 1.0 - aa, dist);
+        if (alpha <= 0.01) discard;
+        float a = f_color.a * alpha;
+        out_color = vec4(f_color.rgb * a, a);
         return;
     }
 

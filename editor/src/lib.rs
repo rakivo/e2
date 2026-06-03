@@ -26,7 +26,6 @@ pub mod util;
 pub mod color;
 pub mod buffer;
 pub mod command;
-pub mod tracy;
 pub mod director;
 pub mod lexer;
 pub mod session;
@@ -48,9 +47,9 @@ use audioer::Audioer;
 use lexer::token_color;
 use messager::{MAX_MESSAGE_COUNT, MESSAGE_DURATION_IN_MILLISECONDS, MESSAGER_FONT_SIZE, Messager};
 use session::CustomChunkId;
-use buffer::{AnimatedRegion, Buffer, Cursor};
+use buffer::{AnimatedRegion, Buffer, Cursor, EditKind, UndoNodeRef};
 use color::{Color, GpuColor};
-use command::{CommandContext, CommandAtom};
+use command::{CommandAtom, CommandContext, Mods};
 use director::Director;
 use tree_sitter::Tree;
 use ts::{FunctionTable, ParseResultKind, SymbolKind, SymbolTable, TreeSitter, extract_prefix_at_cursor, query_completions};
@@ -68,7 +67,7 @@ use std::fmt::Write as _;
 use std::collections::VecDeque;
 use std::ops::{BitOr, BitAnd, BitOrAssign, BitAndAssign};
 
-use cranelift_entity::packed_option::ReservedValue;
+use cranelift_entity::packed_option::{PackedOption};
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use smallstr::SmallString;
 use smallvec::SmallVec;
@@ -517,14 +516,15 @@ macro_rules! define_base_and_scale {
     };
 }
 
-pub const ADDITIONAL_BOTTOM_SCROLL_SPACE: f32 = 50.0;
+pub const ADDITIONAL_BOTTOM_SCROLL_SPACE: f32 = 20.0;
+pub const ADDITIONAL_BOTTOM_SCROLL_SPACE_FOR_MAX_SCROLL: f32 = 900.0;
 
 define_base_and_scale! {
-    const BASE_LINE_HEIGHT:   f32 = 16.35;
-    const BASE_FONT_SIZE:     f32 = 15.0;
-    const BASE_CURSOR_HEIGHT: f32 = 2.0;
-    const BASE_CURSOR_WIDTH:  f32 = 2.0;
-    const BASE_CURSOR_OUTLINE_THICKNESS: f32 = 1.2;
+    const BASE_LINE_HEIGHT:                f32 = 16.35;
+    const BASE_FONT_SIZE:                  f32 = 15.0;
+    const BASE_CURSOR_HEIGHT:              f32 = 2.0;
+    const BASE_CURSOR_WIDTH:               f32 = 2.0;
+    const BASE_CURSOR_OUTLINE_THICKNESS:   f32 = 1.2;
     const BASE_PANEL_BAR_BORDER_THICKNESS: f32 = 1.0;
 }
 
@@ -542,6 +542,14 @@ impl Rect {
 
     #[inline] pub fn x1(&self) -> f32 { self.x + self.w }
     #[inline] pub fn y1(&self) -> f32 { self.y + self.h }
+
+    #[inline]
+    pub fn intersects(&self, other: Rect) -> bool {
+        self.x < other.x + other.w &&
+        self.x + self.w  > other.x &&
+        self.y < other.y + other.h &&
+        self.y + self.h  > other.y
+    }
 
     #[inline]
     pub fn contains(&self, px: f32, py: f32) -> bool {
@@ -708,7 +716,6 @@ pub struct TextLayout {
     //
     pub lines:        Vec<LineLayout>,
     pub glyphs:       Vec<Glyph>,
-    pub line_offsets: Vec<(usize, usize)>,
 
     // 4 bits per glyph, packed: 0 = not animated, 1–15 = insertion index
     // fits 16 glyphs per u64, ~63 bytes per 1000 visible glyphs
@@ -975,11 +982,10 @@ pub fn build_text_layout(
 
     let buffer = &editor.buffers[buffer_id];
 
-    let (mut lines, mut glyphs, mut line_offsets) = if let Some(mut old) = old_layout {
+    let (mut lines, mut glyphs) = if let Some(mut old) = old_layout {
         old.lines.clear();
         old.glyphs.clear();
-        old.line_offsets.clear();
-        (old.lines, old.glyphs, old.line_offsets)
+        (old.lines, old.glyphs)
     } else {
         Default::default()
     };
@@ -992,50 +998,13 @@ pub fn build_text_layout(
     //
     //
 
-    let scratch     = buffer.scratch_space_to_flatten_rope_into.as_bytes(); // :BufferScratch
-    let scratch_str = &buffer.scratch_space_to_flatten_rope_into;
+    let start_byte = buffer.text.try_line_to_byte(first_line as _).unwrap_or(0) as usize;
+    let end_byte   = buffer.text.try_line_to_byte(last_line as _).unwrap_or(buffer.text.len_bytes()) as usize;
 
-    let approximate_glyph_count = scratch_str.len();
+    let visible_slice = buffer.text.slice(start_byte as u32..end_byte as u32);
+
+    let approximate_glyph_count = visible_slice.len_chars() as usize;
     checked_reserve!(glyphs, approximate_glyph_count, cfg=editor.logger_config);  // @Tune
-
-    //
-    // line_offsets[i] = (scratch_relative_start, scratch_relative_end_excl_nl)
-    //
-    checked_reserve!(line_offsets, line_count as usize + 1, cfg=editor.logger_config);
-    {
-        let mut pos = 0usize;
-        let mut collected = 0u32;
-
-        while collected < line_count && pos <= scratch.len() {
-            let remaining = &scratch[pos..];
-            let (line_end_excl_nl, next_pos) = match memchr::memchr(b'\n', remaining) {
-                Some(nl_rel) => (pos + nl_rel, pos + nl_rel + 1),
-                None         => (scratch.len(), scratch.len()),
-            };
-
-            checked_push!(
-                line_offsets,
-                (pos, line_end_excl_nl),
-                cfg=editor.logger_config
-            );
-            pos = next_pos;
-            collected += 1;
-
-            if pos >= scratch.len() { break; }
-        }
-
-        //
-        // Pad with sentinel (empty) entries for lines beyond scratch content
-        // (e.g. requesting past EOF). The loop below handles them gracefully.
-        //
-        while line_offsets.len() < line_count as usize {
-            checked_push!(
-                line_offsets,
-                (scratch.len(), scratch.len()),
-                cfg=editor.logger_config
-            );
-        }
-    }
 
     //
     // @Speed:
@@ -1051,19 +1020,45 @@ pub fn build_text_layout(
     // Clamp first_line to actual buffer line count before computing first_visible_byte
     let total_lines = buffer.text.len_lines() as u32;
     let first_line_clamped = first_line.min(total_lines.saturating_sub(1));
-    let first_visible_byte = buffer.text.line_to_byte(first_line_clamped as usize);
+    let first_visible_byte = buffer.text.line_to_byte(first_line_clamped) as usize;
 
     let mut visible_glyph_count = 0u32;
 
     let mut token_cursor = tokens.partition_point(|t| (t.start + t.len()) as usize <= first_visible_byte);
 
+    let mut lines_iter = buffer.text.lines_at(first_line as u32);
+
     for vis_i in 0..line_count {
         let line_index = first_line + vis_i;
 
-        let (s_start, s_end) = line_offsets[vis_i as usize];
+        // Calculate the offsets inline instead of pulling from the old line_offsets vector
+        let (s_start, s_end) = if let Some(line_slice) = lines_iter.next() {
+            let line_start = line_slice.start as usize;
+            let line_end   = line_slice.end as usize;
+
+            // Strip trailing \n (and \r\n) to match old behavior
+            let end_excl_nl = if line_end > line_start
+                && buffer.text.try_byte(line_slice.end - 1) == Some(b'\n')
+            {
+                let end = line_end - 1;
+                if end > line_start && buffer.text.try_byte(end as u32 - 1) == Some(b'\r') {
+                    end - 1
+                } else {
+                    end
+                }
+            } else {
+                line_end
+            };
+
+            (line_start, end_excl_nl)
+        } else {
+            // Past EOF - sentinel behavior matches your old loop
+            let eof = buffer.text.len_bytes() as usize;
+            (eof, eof)
+        };
 
         // Absolute byte offset of this line's start
-        let line_byte_start = first_visible_byte + s_start;
+        let line_byte_start = s_start;
 
         let mut ll = LineLayout {
             buffer_line:     line_index,
@@ -1081,7 +1076,8 @@ pub fn build_text_layout(
 
         // @Note: This is fine because lex_scratch is valid UTF-8 and s_start/s_end are on char boundaries
         // because memchr splits on b'\n' which is single-byte.
-        let line_str = &scratch_str[s_start..s_end];
+        // let line_str = &scratch_str[s_start..s_end];
+        let line_str = buffer.text.slice(s_start as u32..s_end as u32);
 
         let glyph_start = glyphs.len() as u32;
 
@@ -1151,7 +1147,6 @@ pub fn build_text_layout(
         glyphs,
         lines,
         visible_glyph_count,
-        line_offsets,
         render_settings,
         glyph_insertion_ids: Default::default(),
         first_buffer_line_including_prelex: first_line,
@@ -1265,6 +1260,8 @@ pub fn render_text_layout(
     let cursor_outline_thickness = scale_base_cursor_outline_thickness(scale);
     let padding_left = padding_left(layout.should_pad_left_when_rendering);
     let origin_x     = rect.x + padding_left - view.scroll_anim_x;
+
+    let cursor_radius = editor.cursor_radius();
 
     let (cursor_line, cursor_col) = buffer.cursor_line_col(&view.cursor);
 
@@ -1465,7 +1462,6 @@ pub fn render_text_layout(
         let ghost_y = view.cursor_ghost_y;
 
         let dist = ((crect.x - view.cursor_ghost_x).powi(2) + (crect.y - view.cursor_ghost_y).powi(2)).sqrt();
-
         if dist > 2.0 {
             for i in 0..TRAIL_STEPS {
                 let t = i as f32 / TRAIL_STEPS as f32; // 0 = ghost, 1 = cursor
@@ -1483,7 +1479,7 @@ pub fn render_text_layout(
             }
         }
 
-        gpu::draw_rect(gpu, crect.x, crect.y, crect.w, crect.h, palette().cursor.with_alpha(view.cursor_opacity));
+        gpu::draw_rect_rounded(gpu, crect.x, crect.y, crect.w, crect.h, cursor_radius, palette().cursor.with_alpha(view.cursor_opacity));
     }
 
     if let Some(hook) = editor.hooks.drew_cursor_about_to_draw_text {
@@ -1558,8 +1554,7 @@ pub fn render_text_layout(
                     if !ghost.is_empty() {
                         let ghost_x = ll.x_for_col(origin_x, cursor_col, &layout.glyphs);
                         let ghost_y = context.line_y(ll.buffer_line) + line_h;
-                        gpu::draw_text(gpu, ghost, ghost_x, ghost_y, font_size,
-                                       Color::rgba(120, 110, 90, 120));
+                        gpu::draw_text(gpu, ghost, ghost_x, ghost_y, font_size, Color::rgba(120, 110, 90, 120));
                     }
                 }
             }
@@ -1690,7 +1685,7 @@ pub fn render_text_layout(
     {
         let cursor_glyph_w = layout.glyph_width_at_col(cursor_col, min_cursor_w, ll).max(min_cursor_w);
         let rect = context.cursor_rect(cursor_glyph_w);
-        gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
+        gpu::draw_rect_rounded_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_radius, cursor_outline_thickness, palette().cursor);
     }
 
     if layout.cursor_style == CursorStyle::Block
@@ -1698,7 +1693,7 @@ pub fn render_text_layout(
     {
         let cursor_glyph_w = layout.glyph_width_at_col(ghost_cursor_col, min_cursor_w, ll).max(min_cursor_w);
         let rect = context.ghost_cursor_rect(cursor_glyph_w);
-        gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_outline_thickness, palette().cursor);
+        gpu::draw_rect_rounded_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_radius, cursor_outline_thickness, palette().cursor);
     }
 }
 
@@ -2043,6 +2038,48 @@ pub struct Panel {
     pub kind: PanelKind,
 }
 
+#[derive(Default, Clone)]
+pub struct UndoGraphCamera {
+    // Where the camera currently is visually
+    pub x: f32,
+    pub y: f32,
+
+    // Where the camera wants to be
+    pub target_x: f32,
+    pub target_y: f32,
+
+    pub head_x: f32,
+    pub head_y: f32,
+
+    pub target_head_x: f32,
+    pub target_head_y: f32,
+
+    pub prev_head: UndoNodeRef,
+    pub last_nav_was_forward: bool,
+}
+
+impl UndoGraphCamera {
+    pub fn animate(&mut self, dt: f32) {
+        let camera_stiffness = 2.0;
+        let head_stiffness   = 8.0;
+
+        let camera_blend = 1.0 - (-camera_stiffness * dt).exp();
+        let head_blend   = 1.0 - (-head_stiffness   * dt).exp();
+
+        self.x      += (self.target_x      - self.x)      * camera_blend;
+        self.y      += (self.target_y      - self.y)      * camera_blend;
+
+        self.head_x += (self.target_head_x - self.head_x) * head_blend;
+        self.head_y += (self.target_head_y - self.head_y) * head_blend;
+
+        if (self.target_x - self.x).abs() < 0.1 { self.x = self.target_x; }
+        if (self.target_y - self.y).abs() < 0.1 { self.y = self.target_y; }
+
+        if (self.target_head_x - self.head_x).abs() < 0.1 { self.head_x = self.target_head_x; }
+        if (self.target_head_y - self.head_y).abs() < 0.1 { self.head_y = self.target_head_y; }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ViewState {
     pub cursor: Cursor,
@@ -2224,7 +2261,7 @@ impl Not for CurrentCursor {
 pub struct View {
     pub        id: ViewId,
     pub buffer_id: BufferId,
-    pub  panel_id: PanelId,
+    pub  panel_id: PackedOption<PanelId>,
 
     pub current_cursor: CurrentCursor,
 
@@ -2245,6 +2282,8 @@ pub struct View {
 
     pub overlay: crate::ts::OverlayState,
     pub persistent_state_per_buffer: FxHashMap<BufferId, ViewState>,
+
+    pub graph_camera: UndoGraphCamera,
 }
 
 impl Deref for View {
@@ -2276,7 +2315,8 @@ impl View {
             completion: Default::default(),
             persistent_state_per_buffer: Default::default(),
             overlay: Default::default(),
-            panel_id: PanelId::reserved_value()  // Set on first layout
+            graph_camera: Default::default(),
+            panel_id: None.into()  // Set on first layout
         }
     }
 
@@ -2298,6 +2338,16 @@ impl View {
             CurrentCursor::Normal => &mut self.normal_cursor,
             CurrentCursor::Ghost  => &mut self.ghost_cursor,
         }
+    }
+
+    #[inline]
+    pub fn active_cursor_and_graph_camera_mut(&mut self) -> (&mut Cursor, &mut UndoGraphCamera) {
+        let cur = match self.current_cursor {
+            CurrentCursor::Normal => &mut self.normal_cursor,
+            CurrentCursor::Ghost  => &mut self.ghost_cursor,
+        };
+
+        (&mut cur.cursor, &mut self.graph_camera)
     }
 
     #[inline]
@@ -2338,11 +2388,7 @@ impl View {
 
     #[inline]
     pub fn panel_id(&self) -> Option<PanelId> {
-        if self.panel_id.is_reserved_value() {
-            return None;
-        }
-
-        Some(self.panel_id)
+        self.panel_id.expand()
     }
 
     #[inline]
@@ -2430,6 +2476,18 @@ impl View {
     pub fn scroll_to_cursor_centered(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top = line as f32 * line_h;
         self.scroll = (cursor_top - rect.h / 2.0 + line_h / 2.0).max(0.0);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_top(&mut self, line: u32, line_h: f32, _rect: Rect) {
+        let cursor_top = line as f32 * line_h;
+        self.scroll = cursor_top;
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_bottom(&mut self, line: u32, line_h: f32, rect: Rect) {
+        let cursor_top = line as f32 * line_h;
+        self.scroll = (cursor_top - rect.h + line_h).max(0.0);
     }
 
     #[inline]
@@ -2648,6 +2706,8 @@ pub struct Editor {
     pub config:        EditorConfig,
     pub logger_config: EditorLoggerConfig,
 
+    pub modifiers: Mods, // @Cleanup
+
     pub tree_sitter: TreeSitter,
 
     // Scale for font/line-height
@@ -2734,7 +2794,7 @@ impl Editor {
             rect_including_panel_bar: Rect::default(),
             kind: PanelKind::Leaf { view_id: root_view },
         });
-        views[root_view].panel_id = root_panel;
+        views[root_view].panel_id = root_panel.into();
 
         let canonicalized_current_working_directory: SmallString<[_; _]> = std::env::args().nth(1)
             .and_then(|p| Path::new(&p).parent().map(|p| p.to_path_buf()))
@@ -2758,6 +2818,7 @@ impl Editor {
             ui: UiState::new(0.0, 0.0),
             logger_config,
             hooks: Default::default(),
+            modifiers: Default::default(),
             last_input_time: Instant::now(),
             refresh_rate_millihertz: u32::MAX,
             win_h: 0.0,
@@ -2840,7 +2901,7 @@ impl Editor {
 
     #[inline]
     pub fn max_scroll_of_impl(&self, line_count: u32, rect: Rect) -> f32 {
-        ((line_count as f32 * self.line_h()) - rect.h).max(0.0) + ADDITIONAL_BOTTOM_SCROLL_SPACE
+        ((line_count as f32 * self.line_h()) - rect.h).max(0.0) + self.scale*ADDITIONAL_BOTTOM_SCROLL_SPACE_FOR_MAX_SCROLL
     }
 
     #[inline]
@@ -2865,6 +2926,17 @@ impl Editor {
 
         if !dont_reset_blink {
             self.reset_blink();
+        }
+
+        let (view, buf) = self.active_view_and_buffer_mut();
+
+        // Consume the intent set by the low-level edit functions.
+        // If an edit forgot to set it (or it's a generic command), default to Boundary.
+        let kind = buf.pending_edit_kind.take().unwrap_or(EditKind::Boundary);
+
+        // Commit the transaction using the final cursor position and the edit kind
+        if let Some(prev_head) = buf.commit_transaction(view.cursor.char_index as _, kind) {
+            view.graph_camera.prev_head = prev_head;
         }
     }
 
@@ -2898,8 +2970,10 @@ impl Editor {
             let view_id     = view.id;
             let buffer_id   = view.buffer_id;
             let char_index  = view.cursor.char_index;
-            let cursor_byte = buf.text.char_to_byte(char_index);
-            let rope        = buf.text.clone();
+            let buf_gen = buf.last_edit_generation;
+
+            let cursor_byte = buf.text.char_to_byte(char_index as _);
+            let tree        = buf.text.clone();
             let last_pos    = self.last_cursor_char_indexes[view_id];
 
             //
@@ -2909,15 +2983,22 @@ impl Editor {
             // @Note @Robustness: We should do tree versioning to avoid background thread
             // mutating tree with an older version after this write from the main thread?
             //
-            {
+            if std::mem::take(&mut self.buffers[buffer_id].did_snap_state_tree_sitter) {
+                //
+                // User undo'ed/redo'ed/snapped to some version of the document using the Undo Graph
+                //
+                // We have to reparse the whole thing!
+                //
+
+                self.tree_sitter.send_force_reparse(buffer_id, tree.clone(), buf_gen);
+            } else {
                 let buf = self.active_buffer();
-                let buf_gen = buf.last_edit_generation;
                 let edits = &buf.ts_edits_in_this_frame;
 
                 if !edits.is_empty() {
                     if let Some(mut tree_mut) = self.tree_sitter.trees.get_mut(&buffer_id) {
                         //
-                        // Only apply edits that are newer than what the tree was parsed at.
+                        // Only apply edits that are newer than what the tree was parsed at
                         //
                         let tree_gen  = tree_mut.buffer_last_edit_generation;
                         let edit_base = buf_gen.saturating_sub(edits.len() as u64);
@@ -2934,7 +3015,7 @@ impl Editor {
                         tree_mut.buffer_last_edit_generation = buf_gen;
                     }
 
-                    self.tree_sitter.send_reparse(buffer_id, rope.clone(), buf_gen);
+                    self.tree_sitter.send_reparse(buffer_id, tree.clone(), buf_gen);
                 }
             }
 
@@ -2957,9 +3038,10 @@ impl Editor {
             // Query only after local invalidation
             //
             if needs_cursor_query {
-                let overlay = self.tree_sitter.query_cursor_overlay(buffer_id, cursor_byte, &rope);
+                let buf = self.active_buffer();
+                let overlay = self.tree_sitter.query_cursor_overlay(buffer_id, cursor_byte as _, &buf.text);
 
-                let (view, _buf) = self.active_view_and_buffer_mut();
+                let view = self.active_view_mut();
                 view.overlay.current = overlay;
 
                 if view.overlay.current.is_none() {
@@ -3009,6 +3091,7 @@ impl Editor {
             // Reset inside adjust_cursors_after_buffer_mutation
             // buffer.last_insert = None;
             // buffer.last_delete = None;
+            buffer.apply_edits_to_lex_cache();
             buffer.ts_edits_in_this_frame.clear();
         }
 
@@ -3016,6 +3099,8 @@ impl Editor {
     }
 
     pub fn always_on_update(&mut self) -> ShouldRequestFrameRedraw {
+        let _tracy = tracy::span!("always_on_update");
+
         let mut redraw = ShouldRequestFrameRedraw::No;
 
         // @Cleanup :TreeSitter
@@ -3149,7 +3234,7 @@ impl Editor {
     pub fn active_view_mut(&mut self) -> &mut View { let id = self.active_view_id(); &mut self.views[id] }
 
     pub fn panel_of_view(&self, view_id: ViewId) -> PanelId {
-        self.views[view_id].panel_id
+        self.views[view_id].panel_id.unwrap()
     }
 
     pub fn active_buffer(&self) -> &Buffer {
@@ -3258,8 +3343,8 @@ impl Editor {
         self.views[new_view_id].layout = None;
         self.views[old_view_id].layout = None;
 
-        self.views[new_view_id].panel_id = right_id;
-        self.views[old_view_id].panel_id = left_id;
+        self.views[new_view_id].panel_id = right_id.into();
+        self.views[old_view_id].panel_id = left_id.into();
 
         // Active panel becomes the left child
         self.set_active_panel(left_id);
@@ -3291,7 +3376,7 @@ impl Editor {
         let PanelKind::Split(_split) = self.panels[parent].kind else { return };
 
         if let PanelKind::Leaf { view_id } = self.panels[active_id].kind {
-            self.views[view_id].panel_id = PanelId::reserved_value();
+            self.views[view_id].panel_id = None.into();
         }
 
         let to_keep_kind = self.panels[to_keep].kind;
@@ -3405,7 +3490,7 @@ impl Editor {
         }
 
         self.active_panel = panel_id;
-        self.active_view_mut().panel_id = panel_id;
+        self.active_view_mut().panel_id = panel_id.into();
     }
 
     pub fn snap_cursor_to_target(&mut self, view_id: ViewId, target_line: u32, target_col: u32, panel_rect: Rect) {
@@ -3420,6 +3505,7 @@ impl Editor {
     }
 
     #[inline] pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
+    #[inline] pub fn cursor_radius(&self) -> f32 { self.scale*5.0 }
     #[inline] pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
     #[inline] pub fn panel_bar_border_thickness(&self) -> f32 { scale_base_panel_bar_border_thickness(self.scale) }
     #[inline] pub fn panel_bar_h(&self) -> f32 { self.line_h() + self.cursor_h() + self.scale * 3.5 }
@@ -3818,8 +3904,8 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
             let delta  = target - view.scroll_anim;
 
             if delta.abs() > epsilon {
-                let speed = 20.0 + (delta.abs() / line_h).sqrt() * 4.0; // @Tune
-                // let speed = (20.0 + delta.abs() / line_h * 0.5).min(35.0); // @Tune
+                // let speed = 1.0 + (delta.abs() / line_h).sqrt() * 1.0; // @Tune
+                let speed = 20.0 + (delta.abs() / line_h).sqrt() * 2.0; // @Tune
                 view.scroll_anim += delta * (1.0 - (-speed * dt).exp());
                 should_redraw = should_redraw.or(ShouldRequestFrameRedraw::yes(
                     "View scroll animation", &mut editor.redraw_reasons
@@ -3971,7 +4057,7 @@ pub fn animate(editor: &mut Editor, dt: f32) -> ShouldRequestFrameRedraw {
 }
 
 pub fn char_at_line_col(buffer: &Buffer, line: u32, col: u32) -> Option<char> {
-    let line_text = buffer.text.line(line as usize);
+    let line_text = buffer.text.line(line);
     line_text.chars().nth(col as usize)
 }
 
@@ -4045,7 +4131,7 @@ pub fn scroll_page(editor: &mut Editor, direction: i32) {
     let rect     = editor.panels[panel_id].rect;
     let buf_id   = editor.views[view_id].buffer_id;
 
-    let page_lines = ((rect.h / line_h) as isize - 2).max(1);
+    let page_lines = ((rect.h / line_h) as isize / 2).max(1);
     let delta      = direction as isize * page_lines;
     let total      = editor.buffers[buf_id].text.len_lines();
 
@@ -4054,7 +4140,7 @@ pub fn scroll_page(editor: &mut Editor, direction: i32) {
 
     // Move cursor by a full page
     let new_line = ((cur_line as isize + delta).max(0) as usize)
-        .min(total.saturating_sub(1)) as u32;
+        .min(total.saturating_sub(1) as usize) as u32;
 
     editor.buffers[buf_id].set_cursor_line_col(
         new_line, cur_col, &mut editor.views[view_id].cursor
@@ -4062,22 +4148,7 @@ pub fn scroll_page(editor: &mut Editor, direction: i32) {
     editor.views[view_id].cursor_target_line = new_line;
     editor.views[view_id].cursor_target_col  = cur_col;
 
-    // Only scroll if cursor is now outside the visible region
-    let scroll     = editor.views[view_id].scroll;
-    let cursor_y   = new_line as f32 * line_h;
-    let max_scroll = editor.max_scroll_of(view_id);
-
-    let new_scroll = if cursor_y < scroll {
-        // Cursor above viewport, scroll up to show it
-        cursor_y
-    } else if cursor_y + line_h > scroll + rect.h {
-        // Cursor below viewport, scroll down to show it
-        cursor_y + line_h - rect.h
-    } else {
-        scroll
-    };
-
-    editor.views[view_id].scroll = new_scroll.clamp(0.0, max_scroll);
+    scroll_to_cursor(editor);
 }
 
 pub fn editor_write_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) -> std::io::Result<()> {
@@ -4123,7 +4194,7 @@ pub fn editor_handle_left_mouse_click(cx: &mut CommandContext) -> bool {
     } else {  // @Robustness
         let line_h = cx.editor.line_h();
         let line = ((my - rect.y + cx.editor.views[view_id].scroll) / line_h) as usize;
-        let line = line.min(cx.editor.buffers[buf_id].text.len_lines().saturating_sub(1));
+        let line = line.min(cx.editor.buffers[buf_id].text.len_lines().saturating_sub(1) as usize);
         (line as u32, 0)  // col 0 - no glyph metrics without layout
     };
 
@@ -4163,6 +4234,40 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
     let mut adjusted_views: SmallVec<[ViewId; 24]> = SmallVec::new();
 
     for (buffer_id, buffer) in editor.buffers.iter_mut() {
+        let max_len = buffer.text.len_chars() as usize;
+
+        if std::mem::take(&mut buffer.did_snap_state) {
+            for (vid, view) in editor.views.iter_mut() {
+                if view.buffer_id != buffer_id { continue }
+
+                let mut adjusted = false;
+
+                // Clamp the primary cursor index
+                if view.cursor.char_index > max_len {
+                    view.cursor.char_index = max_len;
+                    adjusted = true;
+                }
+
+                // Clamp the anchor index if it exists
+                if let Some(a) = view.cursor.anchor_char_index {
+                    if a > max_len {
+                        view.cursor.anchor_char_index = Some(max_len);
+                        adjusted = true;
+                    }
+                }
+
+                if adjusted && !adjusted_views.contains(&vid) {
+                    adjusted_views.push(vid);
+                }
+            }
+
+            // A snapshot jump invalidates any granular insert/delete offsets
+            // that might have happened in the same frame. Clear them out.
+            buffer.last_insert = None;
+            buffer.last_delete = None;
+            continue;
+        }
+
         if let Some((at, len)) = buffer.last_insert.take() {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
@@ -4394,14 +4499,14 @@ pub fn update_ghost_text_from_keystroke(
     let (start, prefix) = extract_prefix_at_cursor(buf, view.cursor.char_index);
     if prefix.len() < 2 { view.completion.ghost_text = None; return; }
 
-    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index);
+    let cursor_byte = buf.text.char_to_byte(view.cursor.char_index as _);
     let items = query_completions(
         &prefix,
         symbol_table,
         func_table,
         atom_table,
         view.buffer_id,
-        cursor_byte,
+        cursor_byte as _,
         tree,
         &buf.text,
         24,
