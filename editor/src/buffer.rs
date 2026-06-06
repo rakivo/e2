@@ -864,7 +864,7 @@ impl Buffer {
         self.is_dirty = true;
         self.last_edit_generation = Default::default();
         self.last_save_generation = Default::default();
-        self.text = PieceTree::new(); // nocheckin
+        self.text.remove(..);
         self.comment_cache.clear();
         self.ts_edits_in_this_frame.clear();
         self.last_delete = None;

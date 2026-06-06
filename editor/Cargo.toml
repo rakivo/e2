@@ -24,7 +24,9 @@ crossbeam-channel  .workspace = true
 libloading         .workspace = true
 raw-window-handle  .workspace = true
 
+editor-helpers = { path = "../editor-helpers" }
 tracy = { path = "../tracy" }
+
 bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2.11.0"
 tempfile = { version = "3.27.0", default-features = false }

@@ -23,6 +23,7 @@ dhat = ["dep:dhat"]
 [dependencies]
 editor = { path = "../editor" }
 editor-macros = { path = "../editor-macros" }
+editor-helpers = { path = "../editor-helpers" }
 tracy  = { path = "../tracy" }
 
 mimalloc = { version = "=0.1.47", optional = true }

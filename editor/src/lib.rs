@@ -490,7 +490,7 @@ pub const fn palette() -> Palette {
         lister_sublabel_selected: Color::rgba(200, 80, 85, 200),  // red-tinted sublabel
         lister_count:            Color::rgba(150, 30, 35, 150),
         lister_glow:             Color::rgba(200, 15, 25, 25),    // full-width glow
-        lister_scrollbar:        Color::rgba(180, 20, 30, 130),
+        lister_scrollbar:        Color::rgba(117, 11, 18, 130),
         lister_scrollbar_track:  Color::rgba(200, 20, 30, 12),
     }
 }

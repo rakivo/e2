@@ -33,6 +33,22 @@ void main() {
         return;
     }
 
+    // SOFT FLASHLIGHT
+    if (f_uv.x > 49000.0) {
+        vec2  center    = vec2(f_uv.x - 49000.0, f_uv.y);
+        float radius    = f_uv2.x;
+        float dist      = length(vec2(gl_FragCoord.x, gl_FragCoord.y) - center);
+
+        float intensity = exp(-pow(dist / (radius * 0.7), 2.0));
+        intensity      *= smoothstep(radius, radius * 0.8, dist);
+
+        float alpha     = intensity * f_color.a;
+        if (alpha <= 0.01) discard;
+
+        out_color = vec4(f_color.rgb * alpha, alpha);
+        return;
+    }
+
     // ROUNDED RECT OUTLINE
     if (f_uv.x > 39000.0) {
         float rx        = f_uv.x - 39000.0;

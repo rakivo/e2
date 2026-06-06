@@ -145,7 +145,7 @@ pub struct Gpu {
     //
     pub batch_pool:  Vec<Batch>,
     pub batch_count: usize,
-    pub clip_depth:  i32,
+    pub clip_stack:  Vec<[f32; 4]>,
 
     pub glyph_scratch: Vec<(GpuGlyph, f32)>,
     pub regions_scratch: Vec<vk::BufferImageCopy>,
@@ -598,7 +598,8 @@ pub fn pop_overlay_mode(gpu: &mut Gpu) {
 
 #[inline]
 pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
-    gpu.clip_depth += 1;
+    let current = gpu.current_clip();
+    gpu.clip_stack.push(current);
 
     let (pool, count) = if gpu.overlay_mode {
         (&mut gpu.blur_batch_pool, &mut gpu.blur_batch_count)
@@ -613,13 +614,13 @@ pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
         pool[i].clip = [x, y, w, h];
         pool[i].verts.clear();
     }
+
     *count += 1;
 }
 
 #[inline]
 pub fn pop_clip(gpu: &mut Gpu) {
-    gpu.clip_depth -= 1;
-    debug_assert!(gpu.clip_depth >= 0, "unbalanced pop_clip");
+    let parent_clip = gpu.clip_stack.pop().expect("unbalanced pop_clip");
 
     let (pool, count) = if gpu.overlay_mode {
         (&mut gpu.blur_batch_pool, &mut gpu.blur_batch_count)
@@ -627,19 +628,14 @@ pub fn pop_clip(gpu: &mut Gpu) {
         (&mut gpu.batch_pool, &mut gpu.batch_count)
     };
 
-    let clip = if *count >= 2 {
-        pool[*count - 2].clip
-    } else {
-        [0.0, 0.0, gpu.win_w, gpu.win_h]
-    };
-
     let i = *count;
     if i >= pool.len() {
-        pool.push(Batch::new(clip));
+        pool.push(Batch::new(parent_clip));
     } else {
-        pool[i].clip = clip;
+        pool[i].clip = parent_clip;
         pool[i].verts.clear();
     }
+
     *count += 1;
 }
 
@@ -1167,6 +1163,45 @@ pub fn draw_line(
     push(dx_vert, dy_vert, -v_edge);
 }
 
+pub fn draw_flashlight(gpu: &mut Gpu, center_x: f32, center_y: f32, radius: f32, color: Color) {
+    let x0 = center_x - radius;
+    let y0 = center_y - radius;
+    let x1 = center_x + radius;
+    let y1 = center_y + radius;
+
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let c: GpuColor = color.into();
+
+    let sentinel = 49000.0;
+
+    let uv_x  = sentinel + center_x;
+    let uv_y  = center_y;
+    let uv2_x = radius;
+    let uv2_y = 0.0;
+    let uv2_z = 0.0;
+
+    gpu.verts_mut().reserve(6);
+
+    let mut push = |x: f32, y: f32| {
+        let px = x * inv_sw * 2.0 - 1.0;
+        let py = 1.0 - y * inv_sh * 2.0;
+        gpu.verts_mut().push(Vert {
+            pos:   [px, py],
+            uv:    [uv_x, uv_y],
+            uv2:   [uv2_x, uv2_y, uv2_z],
+            color: c,
+        });
+    };
+
+    push(x0, y0);
+    push(x1, y0);
+    push(x1, y1);
+    push(x0, y0);
+    push(x1, y1);
+    push(x0, y1);
+}
+
 pub fn draw_circle(
     gpu: &mut Gpu,
     cx: f32,
@@ -1220,9 +1255,9 @@ pub fn draw_circle_with_border(
     fill_color: Color,
     border_color: Color,
 ) {
-    // 1. Draw the border circle (slightly larger)
+    // Draw the border circle (slightly larger)
     draw_circle(gpu, cx, cy, radius + thickness, border_color);
-    // 2. Draw the inner circle (the core)
+    // Draw the inner circle (the core)
     draw_circle(gpu, cx, cy, radius, fill_color);
 }
 
@@ -1695,7 +1730,7 @@ impl Gpu {
             batch_count: 1,
             blur_batch_pool:  vec![Batch::full_window(win_w as _, win_h as _)],
             blur_batch_count: 1,
-            clip_depth:  0,
+            clip_stack:    Vec::with_capacity(32),
             glyph_scratch: Vec::with_capacity(256),
 
             win_w: win_w as f32,

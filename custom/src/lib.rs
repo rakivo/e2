@@ -1,5 +1,3 @@
-#![allow(unused, dead_code)]
-
 // @Important @Note: Must match the allocator `core` uses
 
 #[cfg(feature = "dhat")]
@@ -13,16 +11,16 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod lsp;
 
 use editor::ts::{TreeSitter, extract_prefix_at_cursor, query_completions};
-use editor::ui::{Axis, BoxCustom, BoxRef, ListerItemInfo, Size};
-use editor::util::format_bytes;
+use editor::ui::{BoxRef, Size};
+use editor_helpers::tprint;
 use lsp::*;
 
 use crossbeam_channel::{Receiver, Sender};
-use editor::buffer::{Buffer, EditKind, UndoGraphLayout, UndoNodeRef, UndoTree, format_age, seconds_ago, undo_graph_hit_test};
+use editor::buffer::{Buffer, UndoNodeRef, UndoTree, format_age, seconds_ago, undo_graph_hit_test};
 use editor::color::Color;
 use editor::director::{EntryKind, ScanState};
 use editor::gpu::Gpu;
-use editor::session::{CustomChunkId, apply_session, default_session_path, load_session, pretty_path};
+use editor::session::{CustomChunkId, default_session_path, pretty_path};
 use editor::command::{CommandContext, CommandEntry, CommandTable, KeyCombo, KeyInput, Keymap, LoadedLib, LogicalKey, Mods};
 use editor::*;
 
@@ -30,7 +28,6 @@ use editor_macros::{collect_commands, command, export};
 use editor::command::{NamedKey};
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
@@ -39,7 +36,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::fmt::Write;
 
-use memmap2::MmapOptions;
 use smallvec::{SmallVec, smallvec};
 use smallstr::SmallString;
 use cranelift_entity::EntityRef;
@@ -139,7 +135,7 @@ custom_data! {
             //
 
             recenter_stage: u8,                    // 0 = center, 1 = top, 2 = bottom
-            recenter_last_cursor_char_index: u32,  // Naive but okm
+            recenter_last_cursor_char_index: u32,  // Naive but ok
 
             undo_graph_is_open: bool,
 
@@ -2497,9 +2493,9 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     editor_initialize_custom_data(cx.editor, cx.gpu);
 }
 
-fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
+fn editor_initialize_custom_data(editor: &mut Editor, _gpu: &mut Gpu) {
     let was_custom_data_ever_initialized = editor.was_custom_data_ever_initialized();
-    let mut did_we_apply_any_sessions = false;
+    let mut _did_we_apply_any_sessions = false;
 
     if was_custom_data_ever_initialized {
         return; // nocheckin
@@ -2542,7 +2538,7 @@ fn editor_initialize_custom_data(editor: &mut Editor, gpu: &mut Gpu) {
     //
     open_initial_buffer(editor);
 
-    if !did_we_apply_any_sessions {
+    if !_did_we_apply_any_sessions {
         lister_create_fresh_buffers_views_panels(editor);
         commander_create_fresh_buffers_views_panels(editor);
     }
@@ -2598,15 +2594,23 @@ fn find_panel_by_kind(editor: &Editor, root: PanelId, kind: &PanelKind) -> Optio
     None
 }
 
-pub fn find_matching_paren(
+enum MatchingParen {
+    None,
+    Ok(u32, u32),
+    WeCouldntFindMatchingParenOrItsWayTooFar
+}
+
+fn find_matching_paren(
     buffer: &Buffer,
     start_line: u32, start_col: u32,
     scratch_paren: &mut Vec<char>,
-) -> Option<(u32, u32)> {
+) -> MatchingParen {
     let _tracy = tracy::span!("find_matching_paren");
 
     let (open, close, dir) = {
-        let ch = char_at_line_col(buffer, start_line, start_col)?;
+        let Some(ch) = char_at_line_col(buffer, start_line, start_col) else {
+            return MatchingParen::None;
+        };
 
         match ch {
             '(' => ('(', ')',  1),
@@ -2615,7 +2619,7 @@ pub fn find_matching_paren(
             ')' => ('(', ')', -1),
             ']' => ('[', ']', -1),
             '}' => ('{', '}', -1),
-            _ => return None,
+            _ => return MatchingParen::None,
         }
     };
 
@@ -2637,7 +2641,7 @@ pub fn find_matching_paren(
                 } else if ch == close {
                     depth -= 1;
                     if depth == 0 {
-                        return Some((line, col as u32));
+                        return MatchingParen::Ok(line, col as u32);
                     }
                 }
             }
@@ -2656,7 +2660,7 @@ pub fn find_matching_paren(
             for col in (0..scratch_paren.len()).rev() {
                 let ch = scratch_paren[col];
                 if ch == close      { depth += 1; }
-                else if ch == open  { depth -= 1; if depth == 0 { return Some((line, col as u32)); } }
+                else if ch == open  { depth -= 1; if depth == 0 { return MatchingParen::Ok(line, col as u32); } }
             }
 
             if line == 0 { break; }
@@ -2666,7 +2670,7 @@ pub fn find_matching_paren(
         }
     }
 
-    None
+    MatchingParen::WeCouldntFindMatchingParenOrItsWayTooFar
 }
 
 fn setup_hooks(cx: &mut CommandContext) {
@@ -2714,29 +2718,37 @@ fn setup_hooks(cx: &mut CommandContext) {
             *should_redraw = should_redraw.or_msg("Graph camera animation", &mut editor.redraw_reasons);
         }
 
-        let lister = editor.custom_data.lister_mut();
+        {
+            let lister = editor.custom_data.lister_mut();
 
-        //
-        // Lister smooth scrolling
-        //
-        if lister.tick(dt) {
-            *should_redraw = should_redraw.or_msg("Lister scrolling animation", &mut editor.redraw_reasons);
+            //
+            // Lister smooth scrolling
+            //
+
+            if lister.tick(dt) {
+                *should_redraw = should_redraw.or_msg("Lister scrolling animation", &mut editor.redraw_reasons);
+            }
+
+            //
+            // Lister opening animation
+            //
+
+            let target = if lister.is_open() { 1.0_f32 } else { 0.0 };
+
+            _ = lister.panel.tick(dt);
+
+            *should_redraw = should_redraw.or_if(
+                lister.panel.anim != target,
+                "Lister opening animation",
+                &mut editor.redraw_reasons
+            );
+
+            *should_redraw = should_redraw.or_if(
+                lister.panel.anim != target,
+                "Lister opening animation",
+                &mut editor.redraw_reasons
+            );
         }
-
-        //
-        // Lister opening animation
-        //
-        let target = if lister.is_open() { 1.0_f32 } else { 0.0 };
-
-        _ = lister.panel.tick(dt);
-
-        *should_redraw = should_redraw.or_if(
-            lister.panel.anim != target,
-            "Lister opening animation",
-            &mut editor.redraw_reasons
-        );
-
-        *should_redraw = should_redraw.or_if(lister.panel.anim != target, "Lister opening animation", &mut editor.redraw_reasons);
     });
 
     cx.editor.hooks.left_mouse_clicked = Some(|cx| {
@@ -2767,7 +2779,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             let lister = cx.editor.custom_data.lister_mut();
 
             if my >= list_y {
-                if let Some(index) = lister.frame_item_refs.iter().position(|&r| cx.editor.ui.was_clicked(r)) {
+                if let Some(index) = lister.frame_item_refs.iter().position(|&r| cx.editor.ui.is_active(r)) {
                     let actual_index = lister.frame_item_refs_first + index as u32;
 
                     lister.selected_index = actual_index as u32;
@@ -2865,11 +2877,6 @@ fn setup_hooks(cx: &mut CommandContext) {
                     return (true, true);
                 }
                 UndoGraphKeyDispatch::Navigated => {
-                    // Optional Bonus: Auto-scroll to keep the active node in view!
-                    let buf = cx.editor.active_buffer_mut();
-                    let head = buf.undo.head;
-                    let layout = buf.undo.get_or_build_layout();
-
                     return (true, true);
                 }
                 UndoGraphKeyDispatch::None => {
@@ -2995,7 +3002,6 @@ fn setup_hooks(cx: &mut CommandContext) {
 
     cx.editor.hooks.mouse_wheel_scrolled = Some(|cx, dy| {
         let editor = &mut cx.editor;
-        let gpu = &mut cx.gpu;
 
         if editor.lister().is_open() {
             //
@@ -3175,7 +3181,7 @@ fn setup_hooks(cx: &mut CommandContext) {
 
         if *editor.undo_graph_is_open() {
             let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
-            let (view, buf) = editor.active_view_and_buffer_mut();
+            let (_view, buf) = editor.active_view_and_buffer_mut();
             _ = buf.undo.get_or_build_layout();
 
             gpu::draw_blur_rect(gpu, graph_rect.x, graph_rect.y, graph_rect.w, graph_rect.h, palette().lister_bg.with_alpha(0.5));
@@ -3215,15 +3221,21 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             let show_cursor = editor.views[view_id].is_cursor_visible();
 
-            gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
             gpu::push_overlay_mode(gpu);
-            let t1 = Instant::now();
-            render_text_layout(editor, gpu, view_id, show_cursor);
-            editor.render_us_acc += t1.elapsed().as_micros() as f32;
-            gpu::pop_overlay_mode(gpu);
-            gpu::pop_clip(gpu);
+            {
+                gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+                {
+                    let t1 = Instant::now();
 
-            build_lister_ui(gpu, editor);
+                    render_text_layout(editor, gpu, view_id, show_cursor);
+
+                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
+                }
+                gpu::pop_clip(gpu);
+
+                build_and_render_lister(gpu, editor);
+            }
+            gpu::pop_overlay_mode(gpu);
         }
 
         if *editor.do_draw_metrics() {
@@ -3301,11 +3313,29 @@ fn setup_hooks(cx: &mut CommandContext) {
         };
 
         for &check_col in cols_to_check {
-            let Some((matching_line, matching_col)) = find_matching_paren(
+            let result = find_matching_paren(
                 buffer, *cursor_line, check_col, &mut editor.scratch_paren
-            ) else { continue };
+            );
 
-            for (line, col) in [(*cursor_line, check_col), (matching_line, matching_col)] {
+            if matches!(result, MatchingParen::None) {
+                continue;
+            }
+
+            let iter = match result {
+                MatchingParen::None => continue,
+
+                MatchingParen::Ok(line, col) => [
+                    Some((*cursor_line, check_col)),
+                    Some((line, col))
+                ],
+
+                MatchingParen::WeCouldntFindMatchingParenOrItsWayTooFar => [
+                    Some((*cursor_line, check_col)),
+                    None
+                ],
+            }.into_iter().flatten();
+
+            for (line, col) in iter {
                 if line >= *first_visible_line && line < *last_visible_line {
                     if let Some(ll) = layout.line_for_buffer_line(line) {
                         let x = layout.x_for_col(*origin_x, col, ll);
@@ -3337,7 +3367,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         //
         //
         for anim in &buffer.currently_animated_deletions {
-            let alpha = ((1.0 - anim.t) * 160.0) as u8;  // Linear fade
+            let alpha = ((1.0 - anim.t) * 160.0) as u8;
             if alpha == 0 { continue }
 
             let color = Color::rgba(
@@ -3496,150 +3526,260 @@ const fn lister_smaller_font_size(scaled_font_size: f32) -> f32 {
     scaled_font_size * 0.80
 }
 
-pub fn build_lister_ui(gpu: &mut Gpu, editor: &mut Editor) {
-    let scale     = editor.scale;
-    let font_size = editor.font_size();
-    let line_h    = editor.line_h();
-    let cursor_h  = editor.cursor_h();
-    let is_mouse_cursor_hidden = editor.is_mouse_cursor_visible;
+pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
+    if !editor.lister().is_visible() { return }
+
+    let scale             = editor.scale;
+    let font_size         = editor.font_size();
+    let line_h            = editor.line_h();
+    let smaller_font_size = lister_smaller_font_size(font_size);
+    let is_mouse_cursor_visible = editor.is_mouse_cursor_visible;
+
+    let (mx, my)          = editor.mouse_pos;
 
     let lister = editor.custom_data.lister_mut();
-    if !lister.is_visible() { return; }
 
     let open_anim = lister.panel.anim;
     let a = |c: Color| -> Color {
         Color::rgba(c.r, c.g, c.b, ((c.a as f32) * open_anim) as u8)
     };
-    let smaller_font_size = lister_smaller_font_size(font_size);
 
-    let Rect { x: px, y: py, w: pw, h: ph } = lister.lister_rect(gpu.win_w, gpu.win_h, editor.scale);
+    let lister_rect = lister.lister_rect(gpu.win_w, gpu.win_h, scale);
+    let Rect { x: px, y: py, w: pw, h: ph } = lister_rect;
 
     let pad     = (8.0 * scale).round();
     let item_h  = (line_h + pad).round();
+    let input_h = (line_h + pad).round();
     let sep     = scale.max(1.0);
-    let input_h = (line_h + cursor_h + pad).round();
+    let list_y  = py + input_h + sep;
     let list_h  = ph - input_h - sep;
 
+    lister.vlist.item_h = item_h;
+    lister.vlist.list_h = list_h;
+
     let total_items = lister.filtered.len();
-    let first       = lister.first();
-    let visible     = lister.visible();
-
-    lister.frame_item_refs.clear();
-    lister.frame_item_refs_first = first as u32;
-
-    lister.item_h = item_h;
-    lister.list_h = list_h;
-
-    let ui = &mut editor.ui;
+    let first       = lister.vlist.first();
+    let visible     = lister.vlist.visible();
 
     let p = palette();
 
     //
-    // Full-window root, column layout
-    // Push a floating container sized and positioned to the lister rect
+    // Panel decoration
     //
-    ui.col("lister##root")
-        .size(Size::px(pw), Size::px(ph))
-        .floating(px, py)
+
+    // Top stripe
+    gpu::draw_rect(gpu, px, py, pw, sep * 2.0, a(p.lister_glow));
+
+    // Bottom stripe
+    gpu::draw_rect(gpu, px, py + input_h, pw, sep, a(p.lister_glow));
+
+    //
+    // Item count
+    //
+
+    tprint!(&mut lister.scratch_str, "{} results", total_items);
+
+    let count_w = gpu::measure_text(gpu, &lister.scratch_str, smaller_font_size);
+    gpu::draw_text(
+        gpu, &lister.scratch_str,
+        px + pw - pad - count_w,
+        py + input_h * 0.44 + line_h * 0.35,
+        smaller_font_size,
+        a(p.lister_item_text_dim)
+    );
+
+    //
+    //
+    // Build the item boxes and layout them
+    //
+    //
+
+    lister.frame_item_refs.clear();
+
+    let ui = &mut editor.ui;
+
+    let root = ui.col("lister##root")
+        .size(Size::px(pw), Size::px(list_h))
+        .clip()
         .build_children(|ui| {
-            // ---- Header row: item count ----
-            ui.row("lister##header")
-                .size(Size::fill(), Size::px(input_h))
-                .build_children(|ui| {
-                    // spacer pushes count to the right
-                    ui.spacer_fill("lister##header_gap", Axis::X);
+            for slot in 0..visible {
+                let index = first + slot;
+                let Some(&item_index) = lister.filtered.get(index) else { break };
+                let Some(item)        = lister.items.try_get(item_index as usize) else { break };
 
-                    let mut scratch = SmallString::<[u8; 64]>::new();
-                    _ = write!(&mut scratch, "{} results", total_items);
-                    ui.label("lister##count")
-                        .size(Size::text(), Size::fill())
-                        .padding(pad)
-                        .text(&*scratch)
-                        .font_size(smaller_font_size)
-                        .color(a(p.lister_item_text_dim))
-                        .build();
-                });
+                let iy = lister.vlist.item_y(slot);
 
-            // ---- Separator ----
-            ui.spacer("lister##sep", Axis::Y, sep);
+                let row = ui.label(
+                    tprint!(&mut lister.scratch_str, "lister##item_{index}")
+                ).size(Size::fill(), Size::px(item_h))
+                    .floating(0.0, iy)
+                    .clickable()
+                    .padding_left(pad + sep * 5.0)
+                    .text(&*item.label)
+                    .font_size(font_size)
+                    .color(a(if index == lister.selected_index as usize {
+                        p.lister_item_selected_text
+                    } else {
+                        p.lister_item_text
+                    }))
+                    .build();
 
-            // ---- Scrollable list ----
-            ui.col("lister##list")
-                .size(Size::fill(), Size::fill())
-                .clip()
-                .build_children(|ui| {
-                    for slot in 0..visible {
-                        let index = first + slot;
-                        let Some(&item_index) = lister.filtered.get(index) else { break };
-                        let Some(item)        = lister.items.try_get(item_index as usize) else { break };
+                lister.frame_item_refs.push(row);
+            }
+        });
 
-                        let iy = lister.item_y(slot);
+    lister.frame_item_refs_first = first as u32;
 
-                        let is_selected = index == lister.selected_index as usize;
-                        let is_hovered  = is_mouse_cursor_hidden && lister.hovered_index == Some(index as u32);
+    editor.ui.solve_and_interact(
+        root,
 
-                        let row = ui.label(&format!("lister##item_{index}"))
-                            .size(Size::fill(), Size::px(item_h))
-                            .floating(0.0, iy)
-                            .clickable()
-                            .padding_left(pad + sep * 5.0)
-                            .text(&*item.label)
-                            .font_size(font_size)
-                            .color(if is_selected {
-                                a(Color::rgba(240, 208, 144, 170))
-                            } else {
-                                a(Color::rgba(200, 190, 165, 190))
-                            }.with_alpha(100.0)).build();
+        [px, list_y], [pw, list_h],  // origin and parent size
 
-                        let label_x = pad + sep * 5.0;
-                        let mut highlight_rects: Vec<(f32, f32)> = Default::default();  // @Memory @Speed
-                        if !item.match_positions.is_empty() {
-                            let mut x_cursor = 0.0f32;
-                            for (byte_pos, ch) in item.label.char_indices() {
-                                let char_w = gpu::get_glyph_no_upload(gpu, ch, font_size)
-                                    .map(|g| g.advance)
-                                    .unwrap_or(font_size * 0.6);
+        &mut |text, fs| [gpu::measure_text(gpu, text, fs), fs],
 
-                                if item.match_positions.contains(&(byte_pos as u32)) {
-                                    //
-                                    // Merge with previous rect if adjacent
-                                    //
-                                    if let Some(last) = highlight_rects.last_mut() {
-                                        if (last.0 + last.1 - x_cursor).abs() < 1.0 {
-                                            last.1 += char_w;
-                                        } else {
-                                            highlight_rects.push((x_cursor, char_w));
-                                        }
-                                    } else {
-                                        highlight_rects.push((x_cursor, char_w));
-                                    }
-                                }
+        lister.frame_item_refs.iter().copied(),
 
-                                x_cursor += char_w;
-                            }
+        [mx, my], editor.mouse_left_pressed,
+    );
+
+    //
+    // Item backgrounds: before render_box so text draws on top
+    //
+
+    for slot in 0..visible {
+        let index = first + slot;
+        let Some(&row) = lister.frame_item_refs.get(slot) else { break };
+
+        let [x0, y0, x1, y1] = editor.ui.boxes[row].rect;
+        let (x, y, w, h)     = (x0, y0, x1 - x0, y1 - y0);
+
+        if y > list_y + list_h { break; }
+
+        let is_selected = index == lister.selected_index as usize;
+        let is_hovered  = is_mouse_cursor_visible && lister.hovered_index == Some(index as u32);
+
+        if index % 2 == 0 {
+            gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_alt_tint));
+        }
+        if is_hovered && !is_selected {
+            gpu::draw_rect(gpu, x + sep*2.0, y, w - sep*4.0, h, a(p.lister_item_hovered_bg));
+        }
+        if is_selected {
+            gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_selected_bg));
+            gpu::draw_rect_gradient_h(
+                gpu, x, y, w, h,
+                Color::rgba(p.lister_accent.r, p.lister_accent.g, p.lister_accent.b, (70.0  * open_anim) as u8),
+                Color::rgba(p.lister_accent.r, p.lister_accent.g, p.lister_accent.b, (20.0  * open_anim) as u8)
+            );
+            gpu::draw_rect(gpu, x, y, sep * 2.0, h, a(p.lister_accent));
+        }
+
+        if is_mouse_cursor_visible && editor.ui.is_hot(row) {
+            gpu::push_clip(gpu, x, y, w, h);
+
+            let mut flash_color = p.lister_border;
+            flash_color.a = (flash_color.a as f32 * 0.92) as u8;
+            gpu::draw_flashlight(gpu, mx, my, scale*450.0, flash_color);
+
+            gpu::pop_clip(gpu);
+        }
+    }
+
+    //
+    // Render boxes - text on top of backgrounds
+    //
+
+    ui::render_box(root, &editor.ui, gpu);
+
+    //
+    // Match highlights + sublabels on top of text
+    //
+
+    let lister = editor.custom_data.lister_mut();
+
+    for slot in 0..visible {
+        let index = first + slot;
+        let Some(&item_index) = lister.filtered.get(index)                else { break };
+        let Some(item)        = lister.items.try_get(item_index as usize) else { break };
+        let Some(&row)        = lister.frame_item_refs.get(slot)          else { break };
+
+        let [x0, y0, x1, y1] = editor.ui.boxes[row].rect;
+        let (x, y, w, h)     = (x0, y0, x1 - x0, y1 - y0);
+
+        if y > list_y + list_h { break; }
+
+        let is_selected = index == lister.selected_index as usize;
+
+        if !item.match_positions.is_empty() {
+            let label_x    = x + pad + sep * 5.0;
+            let text_y_top = y + (h - font_size) * 0.5;
+
+            let mut x_cursor = 0.0f32;
+            let mut run: Option<(f32, f32)> = None;
+
+            for (byte_pos, ch) in item.label.char_indices() {
+                let char_w = gpu::get_glyph_no_upload(gpu, ch, font_size)
+                    .map(|g| g.advance)
+                    .unwrap_or(font_size * 0.6);
+
+                if item.match_positions.contains(&(byte_pos as u32)) {
+                    run = Some(match run {
+                        // Adjacent to previous run => extend
+                        Some((rx, re)) if (re - x_cursor).abs() < 1.0 => (rx, x_cursor + char_w),
+
+                        // Gap since   last     run => draw the current one and start a new run
+                        Some((rx, re)) => {
+                            gpu::draw_rect(
+                                gpu, label_x + rx, text_y_top, re - rx, font_size,
+                                a(p.lister_match_highlight)
+                            );
+
+                            (x_cursor, x_cursor + char_w)
                         }
 
-                        lister.frame_item_refs.push(row);
+                        // First matched char       => start a new run
+                        None => (x_cursor, x_cursor + char_w),
+                    });
+                }
 
-                        ui.boxes[row].custom = BoxCustom::ListerItem(ListerItemInfo {
-                            is_selected,
-                            is_hovered,
-                            index,
-                            sublabel:           item.sublabel.into(),
-                            sublabel_font_size: smaller_font_size,
-                            open_anim,
-                            highlight_rects: highlight_rects.into_boxed_slice(),
-                            label_x,
-                            font_size,
-                        });
-                    }
+                x_cursor += char_w;
+            }
 
-                    let below = total_items.saturating_sub(first + visible);
-                    if below > 0 {
-                        ui.spacer("lister##bottom", Axis::Y, below as f32 * item_h);
-                    }
-                });
-        });
+            if let Some((rx, re)) = run {
+                gpu::draw_rect(
+                    gpu, label_x + rx, text_y_top, re - rx, font_size,
+                    a(p.lister_match_highlight)
+                );
+            }
+        }
+
+        if !item.sublabel.is_empty() {
+            let sub_w  = gpu::measure_text(gpu, &item.sublabel, smaller_font_size);
+            let text_y = y + h * 0.5 + smaller_font_size * 0.35;
+            gpu::draw_text(
+                gpu, &item.sublabel,
+                x + w - pad - sub_w,
+                text_y,
+                smaller_font_size,
+                a(if is_selected { p.lister_sublabel_selected } else { p.lister_sublabel })
+            );
+        }
+    }
+
+    //
+    // Scrollbar
+    //
+
+    if total_items > 0 {
+        let lister   = editor.custom_data.lister_mut();
+        let total_h  = total_items as f32 * item_h;
+        let bar_h    = (list_h * (list_h / total_h).min(1.0)).max(sep * 4.0);
+        let bar_frac = (lister.vlist.scroll_anim / (total_h - list_h).max(1.0)).clamp(0.0, 1.0);
+        let bar_y    = list_y + bar_frac * (list_h - bar_h);
+
+        gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, a(p.lister_scrollbar_track));
+        gpu::draw_rect(gpu, px + pw - sep*1.0 - sep,  bar_y, sep*1.0,  bar_h, a(p.lister_scrollbar));
+    }
 }
 
 pub fn lister_rect(win_w: f32, win_h: f32, anim_w: f32, anim_h: f32, scale: f32) -> Rect {
@@ -3723,7 +3863,6 @@ where
     };
 }
 
-#[derive(Default)]
 pub struct PanelAnim {
     pub is_open:   bool,
     pub anim:      f32,
@@ -3731,6 +3870,19 @@ pub struct PanelAnim {
     pub anim_h:    f32,
     pub open_speed:  f32,
     pub close_speed: f32,
+}
+
+impl Default for PanelAnim {
+    fn default() -> Self {
+        PanelAnim {
+            open_speed: 18.0,
+            close_speed: 40.0,
+            anim_w: 0.0,
+            anim_h: 0.0,
+            is_open: false,
+            anim: 0.0
+        }
+    }
 }
 
 impl PanelAnim {
@@ -3776,7 +3928,7 @@ impl VirtualList {
     pub fn visible(&self) -> usize { (self.list_h / self.item_h) as usize + 2 }
 
     pub fn max_scroll(&self, item_count: u32) -> f32 {
-        (item_count as f32 * self.item_h + self.item_h * 2.0 - self.list_h).max(0.0)
+        (item_count as f32 * self.item_h - self.list_h).max(0.0)
     }
 
     pub fn scroll_by(&mut self, dy: f32, item_count: u32) {
@@ -4212,11 +4364,7 @@ impl DerefMut for Lister {
 impl Lister {
     pub fn new() -> Self {
         Self {
-            panel: PanelAnim {
-                open_speed: 18.0,
-                close_speed: 40.0,
-                ..Default::default()
-            },
+            panel: Default::default(),
             items: Default::default(),
             frame_item_refs_first: 0,
             matched_scratch: Vec::with_capacity(32),
@@ -4647,7 +4795,7 @@ pub fn draw_undo_tree(editor: &mut Editor, gpu: &mut Gpu) {
     let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
 
     let (view, buf) = editor.active_view_and_buffer_mut();
-    let layout = buf.undo.get_or_build_layout();
+    _ = buf.undo.get_or_build_layout();
     let layout = &buf.undo.layout_cache;
 
     gpu::push_clip(gpu, graph_rect.x, graph_rect.y, graph_rect.w, graph_rect.h);
@@ -4663,7 +4811,6 @@ pub fn draw_undo_tree(editor: &mut Editor, gpu: &mut Gpu) {
     //
     //
     for node in &layout.nodes {
-        let is_node_head = node.id == head_id;
         let nx = graph_rect.x + node.x - cam_x;
         let ny = graph_rect.y + node.y - cam_y;
 
@@ -4714,7 +4861,7 @@ pub fn draw_undo_tree(editor: &mut Editor, gpu: &mut Gpu) {
     //
     //
     macro_rules! node_visual {
-        ($node:expr, $nx:expr, $ny:expr, |$radius:ident, $color:ident| $body:expr) => {{
+        ($node:expr, $nx:expr, $ny:expr, |$radius:ident, $color:ident| $body:expr) => {#[allow(unused)]{
             let nx = $nx;
             let ny = $ny;
             let max_node_radius = 30.0;
@@ -4881,8 +5028,8 @@ pub fn editor_handle_undo_graph_key(editor: &mut Editor, event: &KeyInput) -> Un
     }
 
     let target_id = {
-        let (view, buf) = editor.active_view_and_buffer_mut();
-        let layout = buf.undo.get_or_build_layout();
+        let (_view, buf) = editor.active_view_and_buffer_mut();
+        _ = buf.undo.get_or_build_layout();
         let layout = &buf.undo.layout_cache;
 
         let head = buf.undo.head;
@@ -4990,10 +5137,9 @@ pub fn editor_handle_undo_graph_key(editor: &mut Editor, event: &KeyInput) -> Un
     if let Some(id) = target_id.expand() {
         editor.reset_blink();
 
-        let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
-
         let (view, buf) = editor.active_view_and_buffer_mut();
         view.graph_camera.prev_head = buf.undo.head;
+
         let is_forward = buf.jump_to(id, &mut view.cursor);
         view.graph_camera.last_nav_was_forward = is_forward;
 

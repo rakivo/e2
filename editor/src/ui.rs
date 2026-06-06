@@ -1,6 +1,5 @@
 use crate::color::{Color, lerp_color};
 use crate::gpu::{self, Gpu};
-use crate::palette;
 
 #[cfg(debug_assertions)]
 use std::cell::RefCell;
@@ -32,44 +31,6 @@ bitflags::bitflags! {
         const HOVERABLE       = 0x8;
         const CLIP_CHILDREN   = 0x10;
         const SCROLL_CHILDREN = 0x20;
-    }
-}
-
-pub struct TextInputInfo {
-    pub cursor_idle_secs:    f32,
-    pub cursor_pixel_offset: f32,
-    pub cursor_target_pixel_offset: f32,
-    pub cursor_char: Option<char>,
-}
-
-pub struct ListerItemInfo {
-    pub is_selected:        bool,
-    pub is_hovered:         bool,
-    pub index:              usize,
-    pub sublabel:           Boxed<str>,
-    pub sublabel_font_size: f32,
-    pub open_anim:          f32,
-    pub highlight_rects:    Boxed<[(f32, f32)]>, // (x_offset_from_label_start, width)
-    pub label_x:            f32,
-    pub font_size:          f32,
-}
-
-#[derive(Default)]
-pub enum BoxCustom {
-    #[default]
-    None,
-
-    TextInput(TextInputInfo),
-    ListerItem(ListerItemInfo),
-}
-
-impl BoxCustom {
-    #[inline]
-    pub fn text_input(&self) -> Option<&TextInputInfo> {
-        match self {
-            Self::TextInput(i) => Some(i),
-            _ => None
-        }
     }
 }
 
@@ -106,8 +67,6 @@ pub struct Box {
     pub rect:          [f32; 4],         // x0, y0, x1, y1
     pub computed_size: [f32; 2],         // w, h
     pub clip_rect:     Option<[f32; 4]>, // x0, y0, y1, y1
-
-    pub custom: BoxCustom,
 }
 
 impl Default for Box {
@@ -132,15 +91,7 @@ impl Default for Box {
             rect:          [0.0; 4],
             clip_rect:     None,
             font_size:     DEFAULT_FONT_SIZE,
-            custom:        Default::default(),
         }
-    }
-}
-
-impl Box {
-    #[inline]
-    pub fn text_input(&self) -> Option<&TextInputInfo> {
-        self.custom.text_input()
     }
 }
 
@@ -236,8 +187,26 @@ pub struct UiState {
     pub win_w:      f32,
     pub win_h:      f32,
 
+    layout_scratch: Vec<BoxRef>,
+
     #[cfg(debug_assertions)]
     __debug_label_strings: RefCell<HashMap<LabelHash, Boxed<str>>>
+}
+
+#[inline]
+fn collect_preorder(scratch: &mut Vec<BoxRef>, boxes: &PrimaryMap<BoxRef, Box>, root: BoxRef) {
+    scratch.clear();
+    scratch.push(root);
+
+    let mut i = 0;
+    while i < scratch.len() {
+        let id = scratch[i];
+        for &c in &boxes[id].children {
+            scratch.push(c);
+        }
+
+        i += 1;
+    }
 }
 
 impl UiState {
@@ -249,6 +218,7 @@ impl UiState {
 
             boxes:         PrimaryMap::default(),
             root:          None,
+            layout_scratch: Vec::with_capacity(128),
             parent_stack:  Vec::new(),
             stacks:        Stacks::default(),
             persist:       HashMap::new(),
@@ -315,9 +285,13 @@ impl UiState {
     }
 
     #[inline]
-    pub fn was_clicked(&self, id: BoxRef) -> bool {
-        let string_key = self.boxes[id].key;
-        string_key == self.active_key
+    pub fn is_active(&self, id: BoxRef) -> bool {
+        self.boxes[id].key == self.active_key
+    }
+
+    #[inline]
+    pub fn is_hot(&self, id: BoxRef) -> bool {
+        self.boxes[id].key == self.hot_key
     }
 
     /// Push a new box as child of current parent, return its key
@@ -386,7 +360,7 @@ impl UiState {
 
             p.scroll_target = new_target.clamp(0.0, max_scroll);
 
-            // overscroll only when hitting a hard boundary
+            // Overscroll only when hitting a hard boundary
             if new_target < 0.0 {
                 p.scroll_overscroll = new_target.max(-120.0);
             } else if new_target > max_scroll {
@@ -398,12 +372,18 @@ impl UiState {
     }
 
     #[inline]
-    pub fn update_interaction(&mut self, mouse: [f32; 2], clicked: bool) {
+    pub fn update_interaction_local(
+        &mut self,
+        refs: impl Iterator<Item = BoxRef> + core::iter::DoubleEndedIterator,
+        mouse: [f32; 2], clicked: bool
+    ) {
         self.hot_key = LabelHash(0);
 
         // Iterate in reverse so last-rendered (topmost) boxes win,
         // and break on first hit.
-        for b in self.boxes.values().rev() {
+        for id in refs.rev() {
+            let b = &self.boxes[id];
+
             if !b.flags.contains(BoxFlags::CLICKABLE) { continue }
 
             let [x0, y0, x1, y1] = b.rect;
@@ -431,20 +411,44 @@ impl UiState {
     }
 
     #[inline]
+    pub fn update_interaction_global(&mut self, mouse: [f32; 2], clicked: bool) {
+        self.update_interaction_local(self.boxes.keys(), mouse, clicked);
+    }
+
+    #[inline]
+    pub fn solve_layout(
+        &mut self,
+        root: BoxRef,
+        origin: [f32; 2], parent_size: [f32; 2],
+        measure: &mut impl FnMut(&str, f32) -> [f32; 2]
+    ) {
+        self.pass1_standalone(root, measure);
+        self.pass2a_parent_pct(root, parent_size);
+        self.pass2b_children_sum(root);
+        self.resolve_overflow(root);
+        self.pass3_place(root, origin, origin, None);
+    }
+
+    #[inline]
+    pub fn solve_and_interact(
+        &mut self,
+        root: BoxRef,
+        origin: [f32; 2], parent_size: [f32; 2],
+        measure: &mut impl FnMut(&str, f32) -> [f32; 2],
+        refs: impl Iterator<Item = BoxRef> + core::iter::DoubleEndedIterator,
+        mouse: [f32; 2], clicked: bool,
+    ) {
+        self.solve_layout(root, origin, parent_size, measure);
+        self.update_interaction_local(refs, mouse, clicked);
+    }
+
+    #[inline]
     pub fn clear_active(&mut self) {
         self.active_key = LabelHash(0);
     }
 
     #[inline]
     pub fn tick_animations(&mut self) {
-        //
-        // Collect cursor targets before mutably borrowing persist.
-        // @SmallVecCandidate
-        //
-        let cursor_targets = self.boxes.values()
-            .filter_map(|b| b.text_input().map(|t| (b.key, t.cursor_target_pixel_offset)))
-            .collect::<Vec<_>>();
-
         for (key, p) in &mut self.persist {
             //
             // Hover or active flashes
@@ -471,171 +475,208 @@ impl UiState {
             p.scroll_overscroll *= 0.82;
             if p.scroll_overscroll.abs() < 0.1 { p.scroll_overscroll = 0.0; }
             p.scroll_visual = p.scroll_offset + p.scroll_overscroll;
-
-            //
-            // Cursor: lerp toward target pixel offset
-            //
-
-            if let Some(&(_, target)) = cursor_targets.iter().find(|(k, _)| k == key) {
-                p.cursor_visual_x += (target - p.cursor_visual_x) * 0.25;
-            }
         }
     }
 
-    fn pass1_standalone(
+    #[inline]
+    pub fn pass1_standalone(
         &mut self,
-        id: BoxRef,
+        root: BoxRef,
         measure_callback: &mut impl FnMut(&str, f32) -> [f32; 2]
     ) {
-        let children = self.boxes[id].children.clone();
-        for axis in [Axis::X, Axis::Y] {
-            let axis = axis as usize;
+        collect_preorder(&mut self.layout_scratch, &self.boxes, root);
 
-            let kind = self.boxes[id].pref_size[axis].kind;
-            match kind {
-                SizeKind::Pixels(v) => self.boxes[id].computed_size[axis] = v,
+        for &id in &self.layout_scratch {
+            for axis in [Axis::X, Axis::Y] {
+                let axis = axis as usize;
+                match self.boxes[id].pref_size[axis].kind {
+                    SizeKind::Pixels(v) => {
+                        self.boxes[id].computed_size[axis] = v;
+                    }
 
-                SizeKind::TextContent => {
-                    let text = &self.boxes[id].text;
-                    let font_size = self.boxes[id].font_size;
-                    let pl = self.boxes[id].padding_left;
-                    let pr = self.boxes[id].padding_right;
-                    let measured = measure_callback(&text, font_size);
-                    self.boxes[id].computed_size[axis] = measured[axis] + pl + pr;
-                }
+                    SizeKind::TextContent => {
+                        let font_size = self.boxes[id].font_size;
+                        let pl = self.boxes[id].padding_left;
+                        let pr = self.boxes[id].padding_right;
+                        let text = &self.boxes[id].text;
+                        let measured = measure_callback(&text, font_size);
+                        self.boxes[id].computed_size[axis] = measured[axis] + pl + pr;
+                    }
 
-                _ => {}
-            }
-        }
-
-        for c in children {
-            self.pass1_standalone(c, measure_callback);
-        }
-    }
-
-    fn pass2a_parent_pct(&mut self, id: BoxRef, parent_size: [f32; 2]) {
-        let children = self.boxes[id].children.clone();
-        for axis in [Axis::X, Axis::Y] {
-            let axis = axis as usize;
-
-            let kind = self.boxes[id].pref_size[axis].kind;
-            if let SizeKind::ParentPct(pct) = kind {
-                self.boxes[id].computed_size[axis] = parent_size[axis] * pct;
-            }
-        }
-
-        let my_size = self.boxes[id].computed_size;
-        for c in children {
-            self.pass2a_parent_pct(c, my_size);
-        }
-    }
-
-    fn pass2b_children_sum(&mut self, id: BoxRef) {
-        let children = self.boxes[id].children.clone();
-        for c in &children {
-            self.pass2b_children_sum(*c);
-        }
-
-        let child_axis = self.boxes[id].child_axis as usize;
-        for axis in [Axis::X, Axis::Y] {
-            let axis = axis as usize;
-
-            let kind = self.boxes[id].pref_size[axis].kind;
-            if !matches!(kind, SizeKind::ChildrenSum) { continue }
-
-            let v = if axis == child_axis {
-                children.iter().map(|ck| self.boxes[*ck].computed_size[axis]).sum()
-            } else {
-                children.iter().map(|ck| self.boxes[*ck].computed_size[axis]).fold(0.0_f32, f32::max)
-            };
-
-            self.boxes[id].computed_size[axis] = v;
-        }
-    }
-
-    fn resolve_overflow(&mut self, id: BoxRef) {
-        let children = self.boxes[id].children.clone();
-
-        let axis = self.boxes[id].child_axis as usize;
-        let parent_size = self.boxes[id].computed_size[axis];
-        let total: f32 = children.iter().map(|ck| self.boxes[*ck].computed_size[axis]).sum();
-        let overflow = (total - parent_size).max(0.0);
-
-        if overflow > 0.0 {
-            let total_give: f32 = children.iter().map(|ck| {
-                let b = &self.boxes[*ck];
-                b.computed_size[axis] * (1.0 - b.pref_size[axis].strictness)
-            }).sum();
-
-            if total_give > 0.0 {
-                for c in &children {
-                    let b = &self.boxes[*c];
-                    let size = b.computed_size[axis];
-                    let give = size * (1.0 - b.pref_size[axis].strictness);
-                    let shrink = overflow * (give / total_give);
-                    self.boxes[*c].computed_size[axis] = (size - shrink).max(0.0);
+                    _ => {}
                 }
             }
         }
+    }
 
-        for c in children {
-            self.resolve_overflow(c);
+    #[inline]
+    pub fn pass2a_parent_pct(&mut self, root: BoxRef, parent_size: [f32; 2]) {
+        collect_preorder(&mut self.layout_scratch, &self.boxes, root);
+
+        for i in 0..self.layout_scratch.len() {
+            let id = self.layout_scratch[i];
+            for axis in [Axis::X, Axis::Y] {
+                let axis = axis as usize;
+                if let SizeKind::ParentPct(pct) = self.boxes[id].pref_size[axis].kind {
+                    let parent_s = if i == 0 { parent_size[axis] } else {
+                        let parent_id = self.boxes[id].parent.unwrap();
+                        self.boxes[parent_id].computed_size[axis]
+                    };
+
+                    self.boxes[id].computed_size[axis] = parent_s * pct;
+                }
+            }
         }
     }
 
-    fn pass3_place(&mut self, id: BoxRef, origin: [f32; 2], parent_origin: [f32; 2], clip: Option<[f32; 4]>) {
-        let children = self.boxes[id].children.clone();
+    #[inline]
+    pub fn pass2b_children_sum(&mut self, root: BoxRef) {
+        collect_preorder(&mut self.layout_scratch, &self.boxes, root);
 
-        let axis  = self.boxes[id].child_axis as usize;
-        let cross = 1 - axis;
-        let size  = self.boxes[id].computed_size;
-        let flags = self.boxes[id].flags;
+        for i in (0..self.layout_scratch.len()).rev() {
+            let id = self.layout_scratch[i];
+            let child_axis = self.boxes[id].child_axis as usize;
 
-        let origin = if let Some(fp) = self.boxes[id].floating_pos {
+            for axis in [Axis::X, Axis::Y] {
+                let axis = axis as usize;
+
+                if !matches!(self.boxes[id].pref_size[axis].kind, SizeKind::ChildrenSum) {
+                    continue;
+                }
+
+                let v = if axis == child_axis {
+                    self.boxes[id].children.iter().map(|&c| self.boxes[c].computed_size[axis]).sum()
+                } else {
+                    self.boxes[id].children.iter().map(|&c| self.boxes[c].computed_size[axis]).fold(0.0_f32, f32::max)
+                };
+
+                self.boxes[id].computed_size[axis] = v;
+            }
+        }
+    }
+
+    pub fn resolve_overflow(&mut self, root: BoxRef) {
+        collect_preorder(&mut self.layout_scratch, &self.boxes, root);
+
+        //
+        // Go post order: resolve children before parents so inner overflow is settled first
+        //
+
+        for i in (0..self.layout_scratch.len()).rev() {
+            let id = self.layout_scratch[i];
+
+            let axis = self.boxes[id].child_axis as usize;
+            let parent_size = self.boxes[id].computed_size[axis];
+
+            let children = self.boxes[id].children.clone();
+            let total: f32 = children.iter().map(|&c| self.boxes[c].computed_size[axis]).sum();
+
+            let overflow = (total - parent_size).max(0.0);
+            if overflow > 0.0 {
+                let total_give: f32 = children.iter().map(|&c| {
+                    let b = &self.boxes[c];
+                    b.computed_size[axis] * (1.0 - b.pref_size[axis].strictness)
+                }).sum();
+
+                if total_give > 0.0 {
+                    for &c in &children {
+                        let b = &self.boxes[c];
+                        let size = b.computed_size[axis];
+                        let give = size * (1.0 - b.pref_size[axis].strictness);
+                        let shrink = overflow * (give / total_give);
+                        self.boxes[c].computed_size[axis] = (size - shrink).max(0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn pass3_place(&mut self, root: BoxRef, origin: [f32; 2], parent_origin: [f32; 2], clip: Option<[f32; 4]>) {
+        collect_preorder(&mut self.layout_scratch, &self.boxes, root);
+
+        //
+        // We need parent's rect to place each child,
+        // store per-node (origin, parent_origin, clip) as we go.
+        //
+        // Since scratch is pre-order, parent is always at a lower index than its children.
+        //
+
+        // Seed the root
+        let root_origin = if let Some(fp) = self.boxes[root].floating_pos {
             [parent_origin[0] + fp[0], parent_origin[1] + fp[1]]  // Relative to parent
         } else {
             origin
         };
 
-        let rect = [
-            origin[0].round(),             origin[1].round(),
-            (origin[0] + size[0]).round(), (origin[1] + size[1]).round(),
+        let root_size = self.boxes[root].computed_size;
+        self.boxes[root].rect = [
+            root_origin[0].round(), root_origin[1].round(),
+            (root_origin[0] + root_size[0]).round(), (root_origin[1] + root_size[1]).round(),
         ];
-        self.boxes[id].rect      = rect;
-        self.boxes[id].clip_rect = clip;
+        self.boxes[root].clip_rect = clip;
 
-        // Apply scroll offset to children origin
-        let scroll_off = if flags.contains(BoxFlags::SCROLL_CHILDREN) {
-            let k = self.boxes[id].key;
-            self.persist.get(&k).map(|p| p.scroll_visual).unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        for i in 1..self.layout_scratch.len() {
+            let id       = self.layout_scratch[i];
+            let parent   = self.boxes[id].parent.unwrap();
+            let p_rect   = self.boxes[parent].rect;
+            let p_clip   = self.boxes[parent].clip_rect;
+            let p_flags  = self.boxes[parent].flags;
+            let p_axis   = self.boxes[parent].child_axis as usize;
+            let p_cross  = 1 - p_axis;
 
-        // If this box clips its children, it becomes the new clip rect
-        let child_clip = if flags.contains(BoxFlags::CLIP_CHILDREN) {
-            Some(rect)
-        } else {
-            clip
-        };
+            // If this box clips its children, it becomes the new clip rect
+            let child_clip = if p_flags.contains(BoxFlags::CLIP_CHILDREN) {
+                Some(p_rect)
+            } else {
+                p_clip
+            };
 
-        let mut cursor = (origin[axis] - scroll_off).round();
-        for c in children {
-            let child_size = self.boxes[c].computed_size;
-            let mut child_origin = origin;
-            child_origin[axis]  = cursor;
-            child_origin[cross] = origin[cross].round();
-            self.pass3_place(c, child_origin, origin, child_clip);
-            cursor = (cursor + child_size[axis]).round();
+            // Apply scroll offset to children origin
+            let scroll_off = if p_flags.contains(BoxFlags::SCROLL_CHILDREN) {
+                let k = self.boxes[parent].key;
+                self.persist.get(&k).map(|p| p.scroll_visual).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
+            let parent_origin = [p_rect[0], p_rect[1]];
+
+            let node_origin = if let Some(fp) = self.boxes[id].floating_pos {
+                [parent_origin[0] + fp[0], parent_origin[1] + fp[1]]
+
+            } else {
+                // @Speed
+                //
+                // Find cursor: sum of preceding siblings along parent axis
+                //
+
+                let siblings = &self.boxes[parent].children;
+                let pos = siblings.iter().position(|&s| s == id).unwrap();
+                let cursor: f32 = siblings[..pos].iter()
+                    .map(|&s| self.boxes[s].computed_size[p_axis])
+                    .sum();
+
+                let mut o = parent_origin;
+                o[p_axis]  = (parent_origin[p_axis] + cursor - scroll_off).round();
+                o[p_cross] = parent_origin[p_cross].round();
+                o
+            };
+
+            let size = self.boxes[id].computed_size;
+            self.boxes[id].rect = [
+                node_origin[0].round(), node_origin[1].round(),
+                (node_origin[0] + size[0]).round(), (node_origin[1] + size[1]).round(),
+            ];
+            self.boxes[id].clip_rect = child_clip;
         }
     }
 
-    pub fn push_size(&mut self, x: Size, y: Size) { self.stacks.size_x.push(x); self.stacks.size_y.push(y); }
-    pub fn pop_size(&mut self)                    { self.stacks.size_x.pop(); self.stacks.size_y.pop(); }
-    pub fn push_bg(&mut self, c: Color)           { self.stacks.bg_color.push(c); }
-    pub fn pop_bg(&mut self)                      { self.stacks.bg_color.pop(); }
-    pub fn push_axis(&mut self, a: Axis)          { self.stacks.child_axis.push(a); }
-    pub fn pop_axis(&mut self)                    { self.stacks.child_axis.pop(); }
+    #[inline] pub fn push_size(&mut self, x: Size, y: Size) { self.stacks.size_x.push(x); self.stacks.size_y.push(y); }
+    #[inline] pub fn pop_size(&mut self)                    { self.stacks.size_x.pop(); self.stacks.size_y.pop(); }
+    #[inline] pub fn push_bg(&mut self, c: Color)           { self.stacks.bg_color.push(c); }
+    #[inline] pub fn pop_bg(&mut self)                      { self.stacks.bg_color.pop(); }
+    #[inline] pub fn push_axis(&mut self, a: Axis)          { self.stacks.child_axis.push(a); }
+    #[inline] pub fn pop_axis(&mut self)                    { self.stacks.child_axis.pop(); }
 }
 
 //
@@ -651,9 +692,7 @@ pub fn render(ui: &UiState, gpu: &mut Gpu) {
     }
 }
 
-fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
-    let p = palette();
-
+pub fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
     let b = &ui.boxes[id];
     let [x0, y0, x1, y1] = b.rect;
     let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
@@ -690,45 +729,7 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
         gpu::draw_rect(gpu, x, y, 1.0, h, b.border_color);
     }
 
-    if let BoxCustom::ListerItem(info) = &b.custom {
-        let a = |c: Color| -> Color {
-            Color::rgba(c.r, c.g, c.b, ((c.a as f32) * info.open_anim) as u8)
-        };
-        let sep = 1.0f32;
-
-        if info.index % 2 == 0 {
-            gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_alt_tint));
-        }
-        if info.is_hovered && !info.is_selected {
-            gpu::draw_rect(gpu, x + sep*2.0, y, w - sep*4.0, h, a(p.lister_item_hovered_bg));
-        }
-        if info.is_selected {
-            // gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_selected_bg)); // nocheckin
-
-            gpu::draw_rect_gradient_h(
-                gpu, x, y, w, h,
-                a(Color::rgba(220, 15, 25, 70)),  // left
-                a(Color::rgba(220, 15, 25, 20)),   // right
-            );
-
-            gpu::draw_rect(gpu, x, y, sep * 3.0, h, a(p.lister_accent));
-        }
-
-        let text_y_top = y + (h - info.font_size) * 0.5;
-        for &(hx, hw) in info.highlight_rects.iter() {
-            gpu::draw_rect(
-                gpu,
-                x + info.label_x + hx,
-                text_y_top,
-                hw,
-                info.font_size,
-                a(p.lister_match_highlight)
-            );
-        }
-    }
-
     if b.flags.contains(BoxFlags::DRAW_TEXT) {
-        let pad = b.padding;
         let text_x = x + b.padding_left;
         let text_y = y + h * 0.5 + b.font_size * 0.35;
 
@@ -738,71 +739,6 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
 
         if !display_text.is_empty() {
             gpu::draw_text(gpu, display_text, text_x, text_y, b.font_size, b.text_color);
-        }
-
-        if let BoxCustom::TextInput(TextInputInfo {
-            cursor_pixel_offset,
-            cursor_idle_secs,
-            cursor_char,
-            ..
-        }) = &b.custom {
-            // Use smoothed position from persist, fall back to raw offset
-            let smooth_x = persist
-                .map(|p| p.cursor_visual_x)
-                .unwrap_or(*cursor_pixel_offset);
-
-            let cursor_w = b.font_size * 0.57; // roughly one char width
-            let cursor_h = b.font_size;
-            let cursor_x = x + pad + smooth_x;
-            let cursor_y = y + (h - cursor_h) * 0.5;
-
-            let alpha = if *cursor_idle_secs < 0.5 {
-                1.0
-            } else if ((cursor_idle_secs - 0.5) % 1.0) < 0.5 {
-                1.0
-            } else {
-                0.0
-            };
-
-            if alpha > 0.0 {
-                gpu::draw_rect(
-                    gpu,
-                    cursor_x,
-                    cursor_y,
-                    cursor_w,
-                    cursor_h,
-                    Color::rgba(150, 190, 220, 255)
-                );
-
-                if let Some(ch) = cursor_char {
-                    gpu::draw_text(
-                        gpu,
-                        &ch.to_string(),
-                        cursor_x,
-                        text_y,
-                        b.font_size,
-                        Color::rgba(8, 8, 10, 255)
-                    );
-                }
-            }
-        }
-
-        if let BoxCustom::ListerItem(info) = &b.custom {
-            let a = |c: Color| -> Color {
-                Color::rgba(c.r, c.g, c.b, ((c.a as f32) * info.open_anim) as u8)
-            };
-
-            if !info.sublabel.is_empty() {
-                let sub_w = gpu::measure_text(gpu, &info.sublabel, info.sublabel_font_size);
-                let text_y = y + h * 0.5 + info.sublabel_font_size * 0.35;
-                gpu::draw_text(
-                    gpu, &info.sublabel,
-                    x + w - b.padding - sub_w,
-                    text_y,
-                    info.sublabel_font_size,
-                    a(if info.is_selected { p.lister_sublabel_selected } else { p.lister_sublabel }),
-                );
-            }
         }
     }
 
@@ -1095,19 +1031,6 @@ impl UiState {
         self.push_size(sx, sy);
         self.push_box(self.hash_str(key), BoxFlags::empty());
         self.pop_size();
-    }
-
-    // Layout - runs all three passes from the root
-    #[inline]
-    pub fn layout(&mut self, mut measure_callback: impl FnMut(&str, f32) -> [f32; 2]) {
-        if let Some(root) = self.root {
-            let win = [self.win_w, self.win_h];
-            self.pass1_standalone(root, &mut measure_callback);
-            self.pass2a_parent_pct(root, win);
-            self.pass2b_children_sum(root);
-            self.resolve_overflow(root);
-            self.pass3_place(root, [0.0, 0.0], [0.0, 0.0], None);
-        }
     }
 
     #[inline]

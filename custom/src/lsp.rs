@@ -68,6 +68,7 @@ impl LspClient {
         Self(None)
     }
 
+    #[allow(unused)]
     pub fn is_disabled(&self) -> bool {
         self.0.is_none()
     }

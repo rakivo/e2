@@ -594,17 +594,13 @@ fn run(mut app: App) {
                     last_input_time = Instant::now();
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
 
+                    editor.mouse_left_pressed = true;
+
                     {
                         let mut cx = make_command_context!(reset None);
                         should_redraw |= editor_handle_left_mouse_click(&mut cx);
+                        should_redraw |= true;  // @Cleanup
                     }
-
-                    editor.mouse_left_pressed = true;
-
-                    editor.ui.update_interaction(
-                        [editor.mouse_pos.0, editor.mouse_pos.1],
-                        editor.mouse_left_pressed,
-                    );
                 }
 
                 Event::MouseButtonUp { mouse_btn: MouseButton::Left, .. } => {
@@ -612,11 +608,6 @@ fn run(mut app: App) {
 
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
                     editor.mouse_left_pressed = false;
-
-                    editor.ui.update_interaction(
-                        [editor.mouse_pos.0, editor.mouse_pos.1],
-                        editor.mouse_left_pressed,
-                    );
                 }
 
                 Event::MouseMotion { x, y, .. } => {
@@ -625,11 +616,6 @@ fn run(mut app: App) {
                     last_input_time = Instant::now();
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
                     editor.mouse_pos = (x as f32, y as f32);
-
-                    editor.ui.update_interaction(
-                        [editor.mouse_pos.0, editor.mouse_pos.1],
-                        editor.mouse_left_pressed,
-                    );
 
                     let (custom_redraw, short_circuit) = run_hook!(
                         editor.hooks.mouse_moved,
@@ -673,7 +659,9 @@ fn run(mut app: App) {
                 if elapsed < target_frame_time {
                     let remaining_micros = (target_frame_time - elapsed).as_micros();
 
-                    // Sleep for most of the time to yield the CPU, but wake up ~2ms early
+                    // nocheckin :Configuration
+                    //
+                    // Sleep for most of the time to yield the CPU, but wake up ~1.5ms early
                     if remaining_micros > 1500 {
                         let sleep_ms = ((remaining_micros - 1500) / 1000) as u32;
                         if let Some(early_event_) = event_pump.wait_event_timeout(sleep_ms) {
@@ -811,8 +799,8 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
         editor.render_us_acc = 0.0;
     }
 
-    debug_assert_eq!(gpu.clip_depth, 0, "clip stack not balanced at frame start");
-    gpu.clip_depth = 0;
+    debug_assert!(gpu.clip_stack.is_empty(), "clip stack not balanced at frame start");
+    gpu.clip_stack.clear();
 
     if let Some(about_to_redraw_a_frame_hook) = editor.hooks.about_to_redraw_a_frame {
         let mut cx = make_command_context!(defer);
@@ -954,18 +942,18 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
 
     {
         editor.ui.end_frame();
-        editor.ui.layout(|text, font_size| {
-            let w = text.chars()
-                .filter_map(|c| gpu::get_glyph_no_upload(gpu, c, font_size))
-                .map(|g| g.advance)
-                .sum();
+        // editor.ui.layout(|text, font_size| {
+        //     let w = text.chars()
+        //         .filter_map(|c| gpu::get_glyph_no_upload(gpu, c, font_size))
+        //         .map(|g| g.advance)
+        //         .sum();
 
-            [w, font_size]
-        });
+        //     [w, font_size]
+        // });
 
-        gpu::push_overlay_mode(gpu);
-        ui::render(&editor.ui, gpu);
-        gpu::pop_overlay_mode(gpu);
+        // gpu::push_overlay_mode(gpu);
+        // ui::render(&editor.ui, gpu);
+        // gpu::pop_overlay_mode(gpu);
     }
 
     for buffer in editor.buffers.values_mut() {

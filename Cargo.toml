@@ -1,5 +1,5 @@
 [workspace]
-members = ["editor", "core", "editor-macros", "custom", "tracy"]
+members = ["editor", "core", "editor-macros", "editor-helpers", "custom", "tracy"]
 resolver = "2"
 
 [workspace.dependencies]
