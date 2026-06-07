@@ -594,11 +594,13 @@ fn run(mut app: App) {
                     last_input_time = Instant::now();
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
 
-                    editor.mouse_left_pressed = true;
+                    editor.mouse_left_down    = true;   // one frame
+                    editor.mouse_left_pressed = true;   // held
+                    editor.drag_started       = false;
 
                     {
                         let mut cx = make_command_context!(reset None);
-                        should_redraw |= editor_handle_left_mouse_click(&mut cx);
+                        should_redraw |= editor_handle_mouse_left(&mut cx);
                         should_redraw |= true;  // @Cleanup
                     }
                 }
@@ -607,7 +609,11 @@ fn run(mut app: App) {
                     input_this_frame = true;
 
                     show_mouse_cursor(&sdl, &mut editor.is_mouse_cursor_visible);
-                    editor.mouse_left_pressed = false;
+
+                    editor.mouse_left_released = true;  // one frame
+                    editor.mouse_left_pressed  = false; // held
+
+                    should_redraw |= true;  // @Cleanup
                 }
 
                 Event::MouseMotion { x, y, .. } => {
@@ -626,7 +632,7 @@ fn run(mut app: App) {
 
                     if editor.mouse_left_pressed {
                         let mut cx = make_command_context!(reset None);
-                        should_redraw |= editor_handle_left_mouse_click(&mut cx);
+                        should_redraw |= editor_handle_mouse_left(&mut cx);
                     }
                 }
 
@@ -678,6 +684,9 @@ fn run(mut app: App) {
         } else {
             renderer_requested_redraw = false;
         }
+
+        app.editor.mouse_left_down     = false;
+        app.editor.mouse_left_released = false;
     }
 
     //

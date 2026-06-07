@@ -16,6 +16,8 @@ const DEFAULT_FONT_SIZE: f32 = 14.0;
 #[derive(Eq, PartialEq, PartialOrd, Copy, Clone, Debug, Hash)]
 pub struct LabelHash(pub u64);
 
+pub const KEY_NULL: LabelHash = LabelHash(0);
+
 #[derive(Eq, PartialEq, PartialOrd, Copy, Clone, Debug, Hash)]
 pub struct BoxRef(pub u32);
 
@@ -177,8 +179,9 @@ pub struct UiState {
     pub persist:    HashMap<LabelHash, BoxPersist>,
 
     // interaction
-    pub hot_key:    LabelHash,  // Currently hovered box, 0 => no box
-    pub active_key: LabelHash,  // Currently pressed box, 0 => no box
+    pub hot_key:     LabelHash,  // Currently hovered box, 0 => no box
+    pub active_key:  LabelHash,  // Currently pressed box, 0 => no box
+    pub pressed_key: LabelHash, // Captured on mouse down, held until release
 
     // Used to reap dead persist entries
     pub frame_counter: u64,
@@ -224,6 +227,7 @@ impl UiState {
             persist:       HashMap::new(),
             hot_key:       LabelHash(0),
             active_key:    LabelHash(0),
+            pressed_key:   LabelHash(0),
             frame_counter: 0,
 
             #[cfg(debug_assertions)]
@@ -285,13 +289,20 @@ impl UiState {
     }
 
     #[inline]
+    #[doc(alias = "is_clicked")]
     pub fn is_active(&self, id: BoxRef) -> bool {
         self.boxes[id].key == self.active_key
     }
 
     #[inline]
+    #[doc(alias = "is_hovered")]
     pub fn is_hot(&self, id: BoxRef) -> bool {
         self.boxes[id].key == self.hot_key
+    }
+
+    #[inline]
+    pub fn is_pressed(&self, id: BoxRef) -> bool {
+        self.boxes[id].key == self.pressed_key
     }
 
     /// Push a new box as child of current parent, return its key
@@ -375,7 +386,9 @@ impl UiState {
     pub fn update_interaction_local(
         &mut self,
         refs: impl Iterator<Item = BoxRef> + core::iter::DoubleEndedIterator,
-        mouse: [f32; 2], clicked: bool
+        mouse: [f32; 2],
+        mouse_down:    bool,  // Just pressed  this frame
+        mouse_up:      bool,  // Just released this frame
     ) {
         self.hot_key = LabelHash(0);
 
@@ -403,16 +416,28 @@ impl UiState {
             }
         }
 
-        if clicked {
-            self.active_key = self.hot_key;
-        } else if self.active_key != LabelHash(0) {
-            self.active_key = LabelHash(0);
+        if mouse_down {
+            // Capture whatever is under the cursor
+            self.pressed_key = self.hot_key;
+        }
+
+        //
+        // A box is clicked if the mouse released over the same box that was pressed
+        //
+        self.active_key = if mouse_up && self.hot_key == self.pressed_key && self.pressed_key != KEY_NULL {
+            self.pressed_key
+        } else {
+            LabelHash(0)
+        };
+
+        if mouse_up {
+            self.pressed_key = LabelHash(0);
         }
     }
 
     #[inline]
-    pub fn update_interaction_global(&mut self, mouse: [f32; 2], clicked: bool) {
-        self.update_interaction_local(self.boxes.keys(), mouse, clicked);
+    pub fn update_interaction_global(&mut self, mouse: [f32; 2], mouse_down: bool, mouse_up: bool) {
+        self.update_interaction_local(self.boxes.keys(), mouse, mouse_down, mouse_up);
     }
 
     #[inline]
@@ -436,10 +461,10 @@ impl UiState {
         origin: [f32; 2], parent_size: [f32; 2],
         measure: &mut impl FnMut(&str, f32) -> [f32; 2],
         refs: impl Iterator<Item = BoxRef> + core::iter::DoubleEndedIterator,
-        mouse: [f32; 2], clicked: bool,
+        mouse: [f32; 2], mouse_down: bool, mouse_up: bool,
     ) {
         self.solve_layout(root, origin, parent_size, measure);
-        self.update_interaction_local(refs, mouse, clicked);
+        self.update_interaction_local(refs, mouse, mouse_down, mouse_up);
     }
 
     #[inline]

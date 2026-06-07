@@ -11,7 +11,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod lsp;
 
 use editor::ts::{TreeSitter, extract_prefix_at_cursor, query_completions};
-use editor::ui::{BoxRef, Size};
+use editor::ui::{BoxRef, KEY_NULL, Size};
 use editor_helpers::tprint;
 use lsp::*;
 
@@ -2751,57 +2751,34 @@ fn setup_hooks(cx: &mut CommandContext) {
         }
     });
 
-    cx.editor.hooks.left_mouse_clicked = Some(|cx| {
-        if cx.editor.lister().is_open() {
-            let (mx, my) = cx.editor.mouse_pos;
+    cx.editor.hooks.mouse_left = Some(|cx| {
+        let (mx, my) = cx.editor.mouse_pos;
+        let mouse_released = cx.editor.mouse_left_released;
 
+        if cx.editor.lister().is_open() {
             let lister_rect = cx.editor.lister().lister_rect(cx.gpu.win_w, cx.gpu.win_h, cx.editor.scale);
             if !lister_rect.contains(mx, my) {
                 let lister = cx.editor.custom_data.lister_mut();
 
-                //
-                // Click outside lister closes it
-                //
+                if mouse_released {
+                    //
+                    // Click outside lister closes it
+                    //
 
-                let panel = lister.close().unwrap();
-                cx.editor.set_active_panel(panel);
+                    let panel = lister.close().unwrap();
+                    cx.editor.set_active_panel(panel);
+                }
 
                 return (true, true);
-            }
-
-            let line_h   = cx.editor.line_h();
-            let scale    = cx.editor.scale;
-            let pad      = (8.0 * scale).round();
-            let input_h  = (line_h + pad).round();
-            let sep      = scale.max(1.0);
-            let list_y   = lister_rect.y + input_h + sep;
-
-            let lister = cx.editor.custom_data.lister_mut();
-
-            if my >= list_y {
-                if let Some(index) = lister.frame_item_refs.iter().position(|&r| cx.editor.ui.is_active(r)) {
-                    let actual_index = lister.frame_item_refs_first + index as u32;
-
-                    lister.selected_index = actual_index as u32;
-
-                    let panel = cx.editor.lister_mut().close().unwrap();
-                    cx.editor.set_active_panel(panel);
-                    cx.editor.reset_blink();
-
-                    editor_dispatch_lister_confirm(cx);
-
-                    return (true, true);
-                } else {
-                    //
-                    // Clicked onto an empty item slot in Lister, just do nothing
-                    //
-                    return (true, true);
-                }
+            } else {
+                //
+                // Click inside lister eats it for the active key pass after the lister rendering
+                //
+                return (true, true);
             }
         }
 
         if *cx.editor.undo_graph_is_open() {
-            let (mx, my) = cx.editor.mouse_pos;
             let graph_rect = get_graph_rect_and_do_scroll_if_necessary(cx.editor);
 
             let (view, buf) = cx.editor.active_view_and_buffer_mut();
@@ -2820,16 +2797,19 @@ fn setup_hooks(cx: &mut CommandContext) {
                     cam_y  // Pass camera Y
                 );
 
-                if let Some(node_id) = hit {
+                if mouse_released && let Some(node_id) = hit {
                     let (view, buf) = cx.editor.active_view_and_buffer_mut();
-
                     view.graph_camera.prev_head = buf.undo.head;
+
                     let is_forward = buf.jump_to(node_id, &mut view.cursor);
                     view.graph_camera.last_nav_was_forward = is_forward;
-                    cx.editor.reset_blink();
 
-                    return (true, true);
+                    center_undo_graph_on_head(cx.editor);
+
+                    cx.editor.reset_blink();
                 }
+
+                return (true, true);
             }
         }
 
@@ -3176,8 +3156,8 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.drew_all_leaf_panels = Some(|cx| {
         let _tracy = tracy::span!("drew_all_leaf_panels");
 
-        let editor = &mut cx.editor;
-        let gpu = &mut cx.gpu;
+        let mut editor = &mut cx.editor;
+        let mut gpu = &mut cx.gpu;
 
         if *editor.undo_graph_is_open() {
             let graph_rect = get_graph_rect_and_do_scroll_if_necessary(editor);
@@ -3234,7 +3214,30 @@ fn setup_hooks(cx: &mut CommandContext) {
                 gpu::pop_clip(gpu);
 
                 build_and_render_lister(gpu, editor);
+
+                if editor.mouse_left_released {   // @Cleanup
+                    let active = editor.ui.active_key;
+                    let lister = editor.custom_data.lister_mut();
+                    if active != KEY_NULL && let Some(index) = lister.frame_item_refs
+                        .iter()
+                        .position(|&r| editor.ui.boxes[r].key == active)
+                    {
+                        let actual_index = lister.frame_item_refs_first as usize + index;
+                        lister.selected_index = actual_index as u32;
+
+                        let panel = lister.close().unwrap();
+                        editor.set_active_panel(panel);
+
+                        editor_dispatch_lister_confirm(cx);
+
+                        cx.finish();    // nocheckin @Hack?
+
+                        editor = &mut cx.editor;
+                        gpu = &mut cx.gpu;
+                    }
+                }
             }
+
             gpu::pop_overlay_mode(gpu);
         }
 
@@ -3554,6 +3557,8 @@ pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
     let list_y  = py + input_h + sep;
     let list_h  = ph - input_h - sep;
 
+    gpu::push_clip(gpu, px, list_y, pw, list_h);
+
     lister.vlist.item_h = item_h;
     lister.vlist.list_h = list_h;
 
@@ -3604,7 +3609,7 @@ pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
         .build_children(|ui| {
             for slot in 0..visible {
                 let index = first + slot;
-                let Some(&item_index) = lister.filtered.get(index) else { break };
+                let Some(&item_index) = lister.filtered.get(index)                else { break };
                 let Some(item)        = lister.items.try_get(item_index as usize) else { break };
 
                 let iy = lister.vlist.item_y(slot);
@@ -3639,7 +3644,9 @@ pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
 
         lister.frame_item_refs.iter().copied(),
 
-        [mx, my], editor.mouse_left_pressed,
+        [mx, my],
+
+        editor.mouse_left_down, editor.mouse_left_released,
     );
 
     //
@@ -3656,13 +3663,13 @@ pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
         if y > list_y + list_h { break; }
 
         let is_selected = index == lister.selected_index as usize;
-        let is_hovered  = is_mouse_cursor_visible && lister.hovered_index == Some(index as u32);
+        let is_pressed  = editor.ui.is_pressed(row);
 
         if index % 2 == 0 {
             gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_alt_tint));
         }
-        if is_hovered && !is_selected {
-            gpu::draw_rect(gpu, x + sep*2.0, y, w - sep*4.0, h, a(p.lister_item_hovered_bg));
+        if is_pressed && !is_selected {
+            gpu::draw_rect(gpu, x + sep*2.0, y, w - sep*4.0, h, a(p.lister_item_pressed_bg));
         }
         if is_selected {
             gpu::draw_rect(gpu, x, y, w, h, a(p.lister_item_selected_bg));
@@ -3780,6 +3787,8 @@ pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
         gpu::draw_rect(gpu, px + pw - sep*3.0 - sep, list_y, sep*3.0, list_h, a(p.lister_scrollbar_track));
         gpu::draw_rect(gpu, px + pw - sep*1.0 - sep,  bar_y, sep*1.0,  bar_h, a(p.lister_scrollbar));
     }
+
+    gpu::pop_clip(gpu); // gpu::push_clip(gpu, px, list_y, pw, list_h);
 }
 
 pub fn lister_rect(win_w: f32, win_h: f32, anim_w: f32, anim_h: f32, scale: f32) -> Rect {

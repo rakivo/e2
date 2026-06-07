@@ -164,7 +164,7 @@ hooks! {
         ///
         /// Second bool corresponds to whether mouse click handler should short-circuit
         /// out of the function and let the custom layer have full control over the user input.
-        pub left_mouse_clicked:     fn (&mut CommandContext)               -> (bool, bool),
+        pub mouse_left:     fn (&mut CommandContext)               -> (bool, bool),
 
         /// Returns: Same as left_mouse_clicked
         pub mouse_wheel_scrolled:   fn (&mut CommandContext, delta_y: f32) -> (bool, bool),
@@ -443,6 +443,7 @@ pub struct Palette {
     pub lister_item_text_dim:   Color,
     pub lister_item_selected_bg: Color,
     pub lister_item_selected_text: Color,
+    pub lister_item_pressed_bg: Color,
     pub lister_item_hovered_bg: Color,
     pub lister_item_alt_tint:   Color,
     pub lister_accent:          Color, // left bar, hairlines
@@ -482,6 +483,7 @@ pub const fn palette() -> Palette {
         lister_item_text_dim:    Color::rgba(130, 120, 100, 160),
         lister_item_selected_bg: Color::rgba(60,  12, 14, 100),   // dark red tint
         lister_item_selected_text: Color::rgba(255, 200, 200, 255),
+        lister_item_pressed_bg:  Color::rgba(45,  20, 25, 140),
         lister_item_hovered_bg:  Color::rgba(35,  10, 10, 140),
         lister_item_alt_tint:    Color::rgba(255, 255, 255, 5),
         lister_accent:           Color::rgba(220, 20, 35, 255),   // cursor red
@@ -2725,8 +2727,11 @@ pub struct Editor {
 
     // Mouse
     pub mouse_pos:          (f32, f32),
-    pub mouse_left_pressed: bool,
-    pub is_mouse_cursor_visible:  bool,
+    pub mouse_left_down:         bool,
+    pub mouse_left_pressed:      bool,
+    pub mouse_left_released:     bool,
+    pub drag_started:            bool,
+    pub is_mouse_cursor_visible: bool,
 
     pub clipboard:       Option<arboard::Clipboard>,
 
@@ -2820,6 +2825,9 @@ impl Editor {
             hooks: Default::default(),
             modifiers: Default::default(),
             last_input_time: Instant::now(),
+            mouse_left_down: false,
+            drag_started: false,
+            mouse_left_released: false,
             refresh_rate_millihertz: u32::MAX,
             win_h: 0.0,
             win_w: 0.0,
@@ -4155,22 +4163,18 @@ pub fn editor_write_buffer_onto_disk(editor: &mut Editor, buffer_id: BufferId) -
     editor.buffers[buffer_id].write_onto_disk()
 }
 
-pub fn editor_handle_left_mouse_click(cx: &mut CommandContext) -> bool {
+pub fn editor_handle_mouse_left(cx: &mut CommandContext) -> bool {
     let mut should_request_redraw = false;
 
     //
     // Custom layer takes priority
     //
-    let (
-        custom_window_redraw_requested,
-        should_short_circuit
-    ) = cx.editor.hooks.left_mouse_clicked.map_or(
+    let (custom_redraw, should_short_circuit) = cx.editor.hooks.mouse_left.map_or(
         (false, false),
         |f| f(cx)
     );
 
-    should_request_redraw |= custom_window_redraw_requested;
-
+    should_request_redraw |= custom_redraw;
     if should_short_circuit {
         return should_request_redraw;
     }
@@ -4203,12 +4207,16 @@ pub fn editor_handle_left_mouse_click(cx: &mut CommandContext) -> bool {
     view.cursor_target_line = line;
     view.cursor_target_col  = col;
 
-    if cx.editor.mouse_left_pressed {
+    if cx.editor.mouse_left_pressed && !cx.editor.mouse_left_down {
+        cx.editor.drag_started = true;
+    }
+
+    if cx.editor.mouse_left_down {
+        view.cursor.unset_anchor();
+    } else if cx.editor.drag_started {
         if !view.cursor.is_anchor_set() {
             view.cursor.set_anchor();
         }
-    } else {
-        view.cursor.unset_anchor();
     }
 
     cx.editor.set_active_panel(pid);
