@@ -425,6 +425,7 @@ dependencies = [
  "mimalloc",
  "paste",
  "piece-tree",
+ "regex",
  "rustc-edit-distance",
  "serde_json",
  "smallstr",
@@ -526,14 +527,14 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "dirs",
- "ecow",
+ "editor-buffer",
  "editor-helpers",
+ "editor-lexer",
  "gpu-allocator",
  "indexmap",
  "libloading 0.9.0",
  "memchr",
  "nohash-hasher",
- "papaya",
  "paste",
  "piece-tree",
  "raw-window-handle",
@@ -549,8 +550,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "editor-buffer"
+version = "0.1.0"
+dependencies = [
+ "cranelift-entity",
+ "editor-helpers",
+ "editor-lexer",
+ "piece-tree",
+ "smallstr",
+ "smallvec",
+ "tracy",
+]
+
+[[package]]
 name = "editor-helpers"
 version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "cranelift-entity",
+ "dashmap",
+ "ecow",
+ "nohash-hasher",
+ "papaya",
+ "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "editor-lexer"
+version = "0.1.0"
+dependencies = [
+ "editor-helpers",
+ "memchr",
+]
 
 [[package]]
 name = "editor-macros"

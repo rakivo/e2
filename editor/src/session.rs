@@ -181,8 +181,6 @@ pub fn save_session(editor: &Editor, path: &Path) -> std::io::Result<f32> {
         view_index.insert(view_id, view_index.len() as u32);
         let bidx = buffer_index.get(&view.buffer_id).copied().unwrap_or(0);
         write_u32(&mut out, bidx);
-        write_u32(&mut out, view.cursor_target_line);
-        write_u32(&mut out, view.cursor_target_col);
         write_f32(&mut out, view.scroll_anim);
     }
 
@@ -397,8 +395,6 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
             vid
         };
 
-        let total_lines = editor.buffers[buf_id].text.len_lines() as u32;
-
         editor.views[view_id].cursor_anim_x      = f32::NAN;
         editor.views[view_id].cursor_anim_y      = f32::NAN;
         editor.buffers[buf_id].is_dirty          = true;
@@ -415,8 +411,6 @@ pub fn apply_session(editor: &mut Editor, session: Session) -> f32 {
             sv.line, sv.col,
             &mut editor.views[view_id].cursor,
         );
-        editor.views[view_id].cursor_target_line = sv.line.clamp(0, total_lines.saturating_sub(15));
-        editor.views[view_id].cursor_target_col  = sv.col;
 
         view_ids.push(view_id);
     }

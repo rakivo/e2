@@ -362,6 +362,7 @@ fn run(mut app: App) {
 
         let editor = &mut app.editor;
         editor.frame_time_in_seconds = dt;
+        editor.time_in_seconds += dt;
 
         //
         // Tick messager
@@ -578,8 +579,6 @@ fn run(mut app: App) {
                         let mut cursor = editor.views[view_id].active_cursor().clone();
                         editor.buffers[buf_id].set_cursor_line_col(new_line, cur_col, &mut cursor.cursor);
 
-                        editor.views[view_id].cursor_target_line = new_line;
-                        editor.views[view_id].cursor_target_col  = cur_col;
                         editor.views[view_id].normal_cursor      = cursor;
 
                         editor.snap_cursor_to_target(view_id, new_line, cur_col, rect);
@@ -908,16 +907,20 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
         let r = rect_including_bar;
         let show_cursor = editor.views[view_id].is_cursor_visible();
 
-        gpu::push_clip(gpu, r.x, r.y, r.w, r.h);
         let t1 = Instant::now();
+        gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
         {
             render_text_layout(editor, gpu, view_id, show_cursor);
-            render_panel_bar(gpu, editor, view_id);
             render_completion_dropdown(gpu, editor, view_id);
         }
-        editor.render_us_acc += t1.elapsed().as_micros() as f32;
-
         gpu::pop_clip(gpu);
+
+        gpu::push_clip(gpu, r.x, r.y, r.w, r.h);
+        {
+            render_panel_bar(gpu, editor, view_id);
+        }
+        gpu::pop_clip(gpu);
+        editor.render_us_acc += t1.elapsed().as_micros() as f32;
     }
 
     if let Some(drew_all_leaf_panels_hook) = editor.hooks.drew_all_leaf_panels {
@@ -973,7 +976,7 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
     }
 
     wait_for_atlas_upload(gpu);
-    _ = gpu.submit_frame();
+    _ = gpu.submit_frame(editor.time_in_seconds);
 
     redraw = redraw.or_if(editor.messager.count != editor.last_messager_count, "Messager animation", &mut editor.redraw_reasons);
     redraw = redraw.or_if(editor.messager.count != 0, "Messager animation", &mut editor.redraw_reasons); // nocheckin

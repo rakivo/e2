@@ -15,6 +15,7 @@ tracy = ["tracy/enable"]
 
 [dependencies]
 memchr             .workspace = true
+bytemuck           .workspace = true
 piece-tree         .workspace = true
 smallstr           .workspace = true
 smallvec           .workspace = true
@@ -23,11 +24,15 @@ paste              .workspace = true
 crossbeam-channel  .workspace = true
 libloading         .workspace = true
 raw-window-handle  .workspace = true
+dashmap            .workspace = true
+rustc-hash         .workspace = true
+nohash-hasher      .workspace = true
 
 editor-helpers = { path = "../editor-helpers" }
+editor-buffer = { path = "../editor-buffer" }
+editor-lexer = { path = "../editor-lexer" }
 tracy = { path = "../tracy" }
 
-bytemuck = { version = "1", features = ["derive"] }
 bitflags = "2.11.0"
 tempfile = { version = "3.27.0", default-features = false }
 swash = { version = "0.2.7", default-features = false, features = ["scale", "std", "render"] }
@@ -36,11 +41,6 @@ dirs = { version = "6.0.0", default-features = false }
 arboard = { version = "3.6.1", default-features = false }
 tree-sitter-rust = "0.24.2"
 tree-sitter = "0.26.8"
-papaya = "0.2.4"
-ecow = "0.2.6"
-dashmap = "6.1.0"
-rustc-hash = "2.1.2"
-nohash-hasher = "0.2.0"
 gpu-allocator = "0.28"
 ash = { version = "0.38" }#, features = ["linked"] }
 ash-window = "0.13.0"

@@ -2,3 +2,13 @@
 name = "editor-helpers"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+bytemuck           .workspace = true
+cranelift-entity   .workspace = true
+dashmap            .workspace = true
+rustc-hash         .workspace = true
+nohash-hasher      .workspace = true
+
+papaya = "0.2.4"
+ecow = "0.2.6"

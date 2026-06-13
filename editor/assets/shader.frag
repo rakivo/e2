@@ -11,7 +11,8 @@ layout(set=0, binding=2) uniform texture2D blur_tex;  // Blurred scene
 layout(set=0, binding=3) uniform sampler   blur_smp;
 
 layout(push_constant) uniform PushConstants {
-    vec2 screen_size;
+    vec2  screen_size;
+    float time;
 } pc;
 
 const float ATLAS_SIZE = 4096.0;
@@ -30,6 +31,72 @@ void main() {
 
     if (f_uv.x == 0.0 && f_uv.y == 0.0) {
         out_color = f_color;
+        return;
+    }
+
+    // SEARCH MATCH WAVE
+    if (f_uv.x > 59000.0) {
+        float rx = f_uv.x - 59000.0;
+        float ry = f_uv.y;
+        float rw = f_uv2.x;
+        float rh = f_uv2.y;
+
+        vec2 uv = (gl_FragCoord.xy - vec2(rx, ry)) / vec2(rw, rh);
+        float t = pc.time * 7.9;
+
+        //
+        // Each row of pixels gets its own wave phase offset based on y
+        //
+        float y = uv.y;
+        float x = uv.x;
+
+        //
+        // Trochoidal layers
+        //
+        float w = 0.0;
+        w += sin(x * 6.2831 - t * 1.0000 + y * 0.30) * 0.20;
+        w += sin(x * 4.7123 - t * 1.6180 + y * 0.52) * 0.18;
+        w += sin(x * 9.4247 - t * 1.4142 + y * 0.18) * 0.14;
+        w += sin(x * 3.1415 - t * 1.7320 + y * 0.71) * 0.16;
+        w += sin(x * 7.8539 - t * 1.2360 + y * 0.13) * 0.12;
+        w += sin(x * 5.4977 - t * 1.9318 + y * 0.61) * 0.10;
+        w += sin(x * 2.3561 - t * 1.1180 + y * 0.44) * 0.10;
+
+        // float brightness = 0.7 + 0.3 * w;
+
+        // vec3 base   = vec3(0.50, 0.04, 0.06);
+        // vec3 bright = vec3(0.86, 0.08, 0.14);
+        // vec3 col = mix(base, bright, brightness);
+
+        // float alpha = f_color.a * clamp(0.8 + 0.2 * w, 0.0, 1.0);
+        // if (alpha <= 0.01) discard;
+
+        // =========================================
+
+        // float brightness = 0.7 + 0.3 * w;
+        // vec3 col = f_color.rgb * brightness;
+
+        // float alpha = f_color.a * clamp(0.8 + 0.2 * w, 0.0, 1.0);
+        // if (alpha <= 0.01) discard;
+
+        // out_color = vec4(col * alpha, alpha);
+
+        // =========================================
+
+        // 1. Map the wave from [-1.0, 1.0] to a clean [0.0, 1.0] range
+        float wave_normalized = w * 0.5 + 0.5;
+
+        // 2. Modulate the input color directly so the hue NEVER changes.
+        // At the peak, it hits 100% of your Rust color. At the valley, it drops to 70%.
+        float brightness = mix(0.70, 1.0, wave_normalized);
+        vec3 col = f_color.rgb * brightness;
+
+        // 3. Keep the alpha baseline high so it stays punchy
+        float alpha = f_color.a * clamp(0.9 + 0.1 * w, 0.0, 1.0);
+        if (alpha <= 0.01) discard;
+
+        out_color = vec4(col * alpha, alpha);
+
         return;
     }
 

@@ -1,4 +1,4 @@
-use crate::buffer::{Buffer, e2_Point, e2_InputEdit};
+use crate::buffer::Buffer;
 use crate::{BufferId, CompletionItem, CompletionItemKind};
 use crate::atum::{Atom, AtomTable};
 
@@ -18,24 +18,6 @@ use rustc_hash::FxHashMap;
 use smallstr::SmallString;
 use smallvec::SmallVec;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
-
-pub const fn point_to_ts(e2: e2_Point) -> Point {
-    Point {
-        column: e2.column as _,
-        row: e2.row as _,
-    }
-}
-
-pub const fn edit_to_ts(e2: e2_InputEdit) -> InputEdit {
-    InputEdit {
-        start_byte:       e2.start_byte as _,
-        old_end_byte:     e2.old_end_byte as _,
-        new_end_byte:     e2.new_end_byte as _,
-        start_position:   point_to_ts(e2.start_position),
-        old_end_position: point_to_ts(e2.old_end_position),
-        new_end_position: point_to_ts(e2.new_end_position),
-    }
-}
 
 pub enum ParserMessage {
     Initialize {

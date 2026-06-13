@@ -1,4 +1,4 @@
-use crate::color::Color;
+use editor_helpers::color::Color;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]

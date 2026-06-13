@@ -1,0 +1,14 @@
+[package]
+name = "editor-buffer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+piece-tree         .workspace = true
+smallstr           .workspace = true
+smallvec           .workspace = true
+cranelift-entity   .workspace = true
+
+tracy = { path = "../tracy" }
+editor-helpers = { path = "../editor-helpers" }
+editor-lexer = { path = "../editor-lexer" }

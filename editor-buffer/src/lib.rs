@@ -1,8 +1,6 @@
-use crate::{
-    COPY_ANIMATION_MAX_ID, PASTE_ANIMATION_MAX_ID, Rect,
-    lexer::{LexState, Token, lex_from},
-    ts::{e2_InputEdit, e2_Point}
-};
+#![allow(non_camel_case_types)]
+
+use editor_lexer::{LexState, Token, lex_from};
 
 use std::hash::Hash;
 use std::fmt::Write as _;
@@ -12,6 +10,51 @@ use piece_tree::{HistoryEntry, NodeRef, PieceTree};
 use smallstr::SmallString;
 use smallvec::SmallVec;
 use cranelift_entity::{EntityList, ListPool, PrimaryMap, packed_option::PackedOption};
+
+pub const PASTE_ANIMATION_MAX_ID: usize = 7;  // pastes: 1..=7
+pub const COPY_ANIMATION_MAX_ID:  usize = 15; // copies: 8..=15
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Default)]
+pub struct e2_Point {
+    pub row:    u32,
+    pub column: u32,
+}
+
+impl e2_Point {
+    pub const fn new(row: usize, column: usize) -> Self {
+        Self { row: row as _, column: column as _ }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Default)]
+pub struct e2_InputEdit {
+    pub start_byte:       u32,
+    pub old_end_byte:     u32,
+    pub new_end_byte:     u32,
+    pub start_position:   e2_Point,
+    pub old_end_position: e2_Point,
+    pub new_end_position: e2_Point,
+}
+
+pub enum ByteOp {
+    Insert { at: usize, len: u32 },
+    Delete { at: usize, len: u32 },
+}
+
+impl e2_InputEdit {
+    pub fn as_byte_op(&self) -> ByteOp {
+        let at = self.start_byte as usize;
+
+        let del = self.old_end_byte.saturating_sub(self.start_byte);
+
+        if del == 0 {
+            let ins = self.new_end_byte.saturating_sub(self.start_byte);
+            ByteOp::Insert { at, len: ins }
+        } else {
+            ByteOp::Delete { at, len: del }
+        }
+    }
+}
 
 #[derive(Default, Copy, Clone, Debug)]
 pub struct Cursor {
@@ -136,7 +179,7 @@ pub struct Buffer {
     pub next_copy_id:  u8, // Starts at 8, wraps at  COPY_ANIMATION_MAX_ID+1
     pub next_paste_id: u8, // Starts at 1, wraps at PASTE_ANIMATION_MAX_ID+1
 
-    pub filestem_atom: crate::atum::Atom,
+    pub filestem_atom: editor_helpers::atum::Atom,
 
     pub currently_animated_copies: SmallVec<[AnimatedRegion; 4]>, // copy,  ids 9..=15
     pub currently_animated_pastes: SmallVec<[AnimatedRegion; 4]>, // paste, ids 1..=8
@@ -1590,34 +1633,4 @@ impl UndoTree {
             );
         }
     }
-}
-
-#[inline]
-pub fn undo_graph_hit_test(
-    layout: &UndoGraphLayout,
-    mx: f32,
-    my: f32,
-    rect: Rect,
-    scroll_x: f32,
-    scroll_y: f32,
-) -> Option<UndoNodeRef> {
-    let r = 10.0;
-
-    let local_x = mx - rect.x + scroll_x;
-    let local_y = my - rect.y + scroll_y;
-
-    let mut best = None;
-
-    for node in &layout.nodes {
-        let dx = local_x - node.x;
-        let dy = local_y - node.y;
-        let dist2 = dx * dx + dy * dy;
-
-        if dist2 <= r * r {
-            best = Some(node.id);
-            break;
-        }
-    }
-
-    best
 }

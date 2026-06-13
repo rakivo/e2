@@ -2,13 +2,14 @@
 
 use crate::messager::MESSAGER_FONT_SIZE;
 use crate::util::format_bytes;
-use crate::{Editor, Glyph, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_MAX_ID, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, scale_base_font_size};
+use crate::{Editor, Glyph, GlyphColorOverride, PASTE_ANIMATION_BITS, PASTE_ANIMATION_MASK, PASTE_ANIMATION_PER_WORD, SCALE_STEP, palette, scale_base_font_size};
 use crate::color::{Color, GpuColor, lerp_color};
 
 use std::ffi::CStr;
 use std::ops::Range;
 
 use ash::vk;
+use editor_buffer::PASTE_ANIMATION_MAX_ID;
 use smallvec::SmallVec;
 use gpu_allocator::MemoryLocation;
 use raw_window_handle::{DisplayHandle, WindowHandle};
@@ -276,10 +277,10 @@ impl Gpu {
     }
 
     #[inline]
-    pub fn submit_frame(&mut self) -> Result<(), vk::Result> {
+    pub fn submit_frame(&mut self, dt: f32) -> Result<(), vk::Result> {
         let _tracy = tracy::span!("submit_frame");
 
-        unsafe { self.submit_frame_impl() }
+        unsafe { self.submit_frame_impl(dt) }
     }
 }
 
@@ -640,6 +641,37 @@ pub fn pop_clip(gpu: &mut Gpu) {
 }
 
 #[inline(always)]
+pub fn draw_rect_with_waves_inside(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
+    let inv_sw = 1.0 / gpu.win_w;
+    let inv_sh = 1.0 / gpu.win_h;
+    let c: GpuColor = color.into();
+    let sentinel = 59000.0;
+    let uv_x  = sentinel + x;
+    let uv_y  = y;
+    let uv2_x = w;
+    let uv2_y = h;
+    let uv2_z = 0.0;
+    let x0 =  x       * inv_sw * 2.0 - 1.0;
+    let x1 = (x + w)  * inv_sw * 2.0 - 1.0;
+    let y0 =  1.0 - y       * inv_sh * 2.0;
+    let y1 =  1.0 - (y + h) * inv_sh * 2.0;
+    let mut push = |px: f32, py: f32| {
+        gpu.verts_mut().push(Vert {
+            pos:   [px, py],
+            uv:    [uv_x, uv_y],
+            uv2:   [uv2_x, uv2_y, uv2_z],
+            color: c,
+        });
+    };
+    push(x0, y0);
+    push(x1, y0);
+    push(x1, y1);
+    push(x0, y0);
+    push(x1, y1);
+    push(x0, y1);
+}
+
+#[inline(always)]
 pub fn draw_rect_rounded(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) {
     let inv_sw = 1.0 / gpu.win_w;
     let inv_sh = 1.0 / gpu.win_h;
@@ -995,6 +1027,8 @@ pub fn draw_text_for_editor(
     insertion_ids:     &[u64],
     global_glyph_start: usize,   // ll.glyph_start
     insertion_ts:       [f32; PASTE_ANIMATION_MAX_ID * 2 + 2],
+
+    color_overrides: &[GlyphColorOverride]
 ) {
     let animated = !insertion_ids.is_empty();
     let cursor_ci = cursor_col_glyph_index.unwrap_or(usize::MAX);
@@ -1057,6 +1091,21 @@ pub fn draw_text_for_editor(
             lerp_color(highlight_color, base_color, ease)
         } else {
             base_color
+        };
+
+        // Apply glyph color overrides
+        let color = if std::hint::unlikely(!color_overrides.is_empty()) {
+            let mut c = color;
+            let i = i as u32;
+            for ov in color_overrides {
+                if i >= ov.glyph_start && i < ov.glyph_end_exclusive {
+                    c = ov.color;
+                    break;
+                }
+            }
+            c
+        } else {
+            color
         };
 
         unsafe {
@@ -1514,7 +1563,7 @@ impl Gpu {
         let push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(8);
+            .size(12);
         let pipeline_layout = device.create_pipeline_layout(
             &vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(std::slice::from_ref(&desc_set_layout))
@@ -1796,7 +1845,7 @@ impl Gpu {
         gpu
     }
 
-    unsafe fn submit_frame_impl(&mut self) -> Result<(), vk::Result> {
+    unsafe fn submit_frame_impl(&mut self, dt: f32) -> Result<(), vk::Result> {
         let fi = self.frame_index % FRAMES_IN_FLIGHT;
         let frame = &self.frames[fi];
 
@@ -1856,6 +1905,11 @@ impl Gpu {
 
         self.device.reset_fences(&[fence]).unwrap();
         self.device.reset_command_pool(cmd_pool, vk::CommandPoolResetFlags::empty()).unwrap();
+
+        self.device.cmd_push_constants(
+            cmd, self.pipeline_layout, vk::ShaderStageFlags::FRAGMENT,
+            0, bytemuck::cast_slice(&[self.win_w, self.win_h, dt]),
+        );
 
         //
         // Build vertex data
@@ -2141,10 +2195,6 @@ impl Gpu {
                 x: 0.0, y: 0.0, width: self.win_w, height: self.win_h,
                 min_depth: 0.0, max_depth: 1.0,
             }]);
-            self.device.cmd_push_constants(
-                cmd, self.pipeline_layout, vk::ShaderStageFlags::FRAGMENT,
-                0, bytemuck::cast_slice(&[self.win_w, self.win_h]),
-            );
 
             self.device.cmd_bind_vertex_buffers(
                 cmd, 0, &[self.blur_vertex_buffer.as_ref().unwrap().buffer], &[0]);

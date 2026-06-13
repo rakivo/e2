@@ -318,6 +318,16 @@ impl Keymap {
         km.bind(KeyCombo::named(Tab),        table.intern("tab"));
         km.bind(KeyCombo::named(Escape),     table.intern("unset_anchor"));
 
+        km.bind(KeyCombo::ctrl('a'), table.intern("move_line_start"));
+        km.bind(KeyCombo::ctrl('e'), table.intern("move_line_end"));
+        km.bind(KeyCombo::ctrl('f'), table.intern("move_right"));
+        km.bind(KeyCombo::ctrl('b'), table.intern("move_left"));
+        km.bind(KeyCombo::ctrl('n'), table.intern("move_down"));
+        km.bind(KeyCombo::ctrl('p'), table.intern("move_up"));
+        km.bind(KeyCombo::ctrl('v'), table.intern("move_page_down"));
+        km.bind(KeyCombo::alt('v'),  table.intern("move_page_up"));
+        km.bind(KeyCombo::alt('m'),  table.intern("move_to_first_character_in_current_line"));
+
         km.bind(KeyCombo::named_ctrl(Home), table.intern("move_file_start"));
         km.bind(KeyCombo::named_ctrl(End), table.intern("move_file_end"));
         km.bind(KeyCombo::alt('<'), table.intern("move_file_start"));
@@ -333,26 +343,17 @@ impl Keymap {
         km.bind(KeyCombo::named_mods(NamedKey::Backspace, Mods::alt()),   table.intern("delete_word_backward"));  // M-DEL
         km.bind(KeyCombo::named_mods(NamedKey::Backspace, Mods::ctrl()),  table.intern("delete_word_backward"));  // common alternative
 
-        km.bind(KeyCombo::ctrl('a'), table.intern("move_line_start"));
-        km.bind(KeyCombo::ctrl('e'), table.intern("move_line_end"));
         km.bind(KeyCombo::ctrl('o'), table.intern("insert_newline_after"));
-        km.bind(KeyCombo::ctrl('f'), table.intern("move_right"));
-        km.bind(KeyCombo::ctrl('b'), table.intern("move_left"));
-        km.bind(KeyCombo::ctrl('n'), table.intern("move_down"));
-        km.bind(KeyCombo::ctrl('p'), table.intern("move_up"));
         km.bind(KeyCombo::ctrl('k'), table.intern("delete_forward_until_newline"));
         km.bind(KeyCombo::ctrl('d'), table.intern("delete_forward"));
-        km.bind(KeyCombo::ctrl('v'), table.intern("move_page_down"));
         km.bind(KeyCombo::ctrl('y'), table.intern("paste"));
         km.bind(KeyCombo::ctrl('w'), table.intern("delete_selection_and_copy"));
         km.bind(KeyCombo::alt ('w'), table.intern("copy"));
         km.bind(KeyCombo::named_mods(Space, Mods::ctrl()), table.intern("set_anchor"));
         km.bind(KeyCombo::ctrl('g'), table.intern("unset_anchor"));
-        km.bind(KeyCombo::alt('v'),  table.intern("move_page_up"));
         km.bind(KeyCombo::alt('q'),  table.intern("open_file"));
-        km.bind(KeyCombo::alt('m'),  table.intern("move_to_first_character_in_current_line"));
 
-        // Splits - physical keys so they're layout-independent
+        // Splits
         km.bind(KeyCombo::ctrl('3'), table.intern("split_vertically"));
         km.bind(KeyCombo::ctrl('2'), table.intern("split_horizontally"));
         km.bind(KeyCombo::alt('0'),  table.intern("close_focused_split"));

@@ -1,3 +1,6 @@
+pub mod atum;
+pub mod color;
+
 #[macro_export]
 macro_rules! tprint {
     ($scratch:expr, $($tt:tt)*) => {

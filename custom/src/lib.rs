@@ -15,8 +15,8 @@ use editor::ui::{BoxRef, KEY_NULL, Size};
 use editor_helpers::tprint;
 use lsp::*;
 
-use crossbeam_channel::{Receiver, Sender};
-use editor::buffer::{Buffer, UndoNodeRef, UndoTree, format_age, seconds_ago, undo_graph_hit_test};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use editor::buffer::{Buffer, UndoNodeRef, UndoTree, format_age, seconds_ago};
 use editor::color::Color;
 use editor::director::{EntryKind, ScanState};
 use editor::gpu::Gpu;
@@ -32,6 +32,7 @@ use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::fmt::Write;
@@ -46,6 +47,9 @@ pub const COMMANDER_CUSTOM_CHUNK_ID: CustomChunkId = 1337;
 
 pub const LISTER_SPLIT_CUSTOM_PANEL: CustomPanel = CustomPanel { extra0: 420, extra1: 67, extra2: 69 };
 pub const LISTER_SPLIT_PANEL_KIND: PanelKind = PanelKind::Custom(LISTER_SPLIT_CUSTOM_PANEL);
+
+pub const SEARCHER_SPLIT_CUSTOM_PANEL: CustomPanel = CustomPanel { extra0: 333, extra1: 33, extra2: 73 };
+pub const SEARCHER_SPLIT_PANEL_KIND: PanelKind = PanelKind::Custom(SEARCHER_SPLIT_CUSTOM_PANEL);
 
 // @Cleanup: Move this out of here
 macro_rules! custom_data {
@@ -144,11 +148,36 @@ custom_data! {
             lister: Lister,
             commander: Commander,
 
+            searcher: Searcher,
+
             lsp: LspClient,
+
+            flashed_lines: Vec<FlashedLine>,
+            highlight_scratch: Vec<Highlight>,
         }
 
         transient {}
     }
+}
+
+pub struct FlashedLine {
+    pub buffer_line: u32,
+    pub buffer_id:   BufferId,
+    pub t:           f32,  // 1.0 = just flashed, 0.0 = fully faded, evict when 0
+}
+
+pub fn flash_line(editor: &mut Editor, buffer_line: u32, buffer_id: BufferId) {
+    let flashed = editor.custom_data.flashed_lines_mut();
+
+    //
+    // If already flashing this line, just reset it
+    //
+    if let Some(existing) = flashed.iter_mut().find(|f| f.buffer_line == buffer_line) {
+        existing.t = 1.0;
+        return;
+    }
+
+    flashed.push(FlashedLine { buffer_line, t: 1.0, buffer_id });
 }
 
 #[command]
@@ -2033,7 +2062,7 @@ pub fn indent_region_impl(text: &str, start_line: usize, end_line: usize, indent
     // Strip trailing line comments before checking what a line opens/closes with.
     // Naive find("//") is fine for indentation purposes.
     fn strip_comment(l: &str) -> &str {
-        if let Some(idx) = l.find("//") { &l[..idx] } else { l }
+        if let Some(index) = l.find("//") { &l[..index] } else { l }
     }
 
     fn is_bare_brace(l: &str) -> bool {
@@ -2394,9 +2423,6 @@ pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32
     let (view, _buf) = editor.view_and_buffer_mut(view_id);
     view.cursor.char_index = (line_char_index + col) as usize;
     view.scroll_to_cursor_centered(line, line_h, rect);
-
-    view.cursor_target_col = col;
-    view.cursor_target_line = line;
 }
 
 #[command]
@@ -2411,6 +2437,160 @@ pub fn goto_definition(cx: &mut CommandContext) {
 
     let lsp = cx.editor.custom_data.lsp_mut();
     lsp.goto_definition_async(canon.to_str().unwrap(), line, col);
+}
+
+#[command]
+pub fn search_next(cx: &mut CommandContext) {
+    if !cx.editor.searcher().is_open { return }
+
+    let match_count = cx.editor.searcher().matches.len();
+    if match_count == 0 { return }
+
+    let prev = cx.editor.searcher().active_match_index;
+    let next = match cx.editor.searcher().active_match_index {
+        None    => 0,
+        Some(i) => (i + 1).min(match_count - 1),
+    };
+
+    cx.editor.searcher_mut().active_match_index = Some(next);
+    jump_to_active_match(cx.editor, prev);
+}
+
+#[command]
+pub fn search_prev(cx: &mut CommandContext) {
+    if !cx.editor.searcher().is_open { return }
+
+    let match_count = cx.editor.searcher().matches.len();
+    if match_count == 0 { return }
+
+    let prev = cx.editor.searcher().active_match_index;
+    let next = match cx.editor.searcher().active_match_index {
+        None    => 0,
+        Some(i) => i.saturating_sub(1),
+    };
+
+    cx.editor.searcher_mut().active_match_index = Some(next);
+    jump_to_active_match(cx.editor, prev);
+}
+
+fn jump_to_active_match(editor: &mut Editor, prev_match_index: Option<usize>) {
+    let Some(index) = editor.searcher().active_match_index else { return };
+    let Some(m) = editor.searcher().matches.get(index)     else { return };
+
+    let byte_start    = m.byte_start;
+    let target_buffer = editor.searcher().target_buffer;
+    let char_index    = editor.buffers[target_buffer].text.byte_to_char(byte_start) as _;
+
+    let (line, _)     = editor.buffers[target_buffer].text.byte_to_line_col(byte_start);
+    let prev_line = prev_match_index
+        .and_then(|i| editor.searcher().matches.get(i))
+        .map(|pm| editor.buffers[target_buffer].text.byte_to_line_col(pm.byte_start).0);
+
+    if prev_line != Some(line) {
+        flash_line(editor, line, target_buffer);
+    }
+
+    let view_id = editor.searcher().target_view;
+    if editor.views[view_id].buffer_id != target_buffer { return }
+
+    let panel_id = editor.views[view_id].panel_id.unwrap();
+    editor.views[view_id].cursor.char_index        = char_index;
+    editor.views[view_id].cursor.anchor_char_index = None;
+    scroll_to_cursor_in(editor, view_id, panel_id);
+}
+
+fn collect_searcher_leaves(editor: &Editor) -> SmallVec<[(PanelId, Rect); 4]> {
+    let target_buffer = editor.searcher().target_buffer;
+    let qp = editor.searcher().query_panel;
+    let mut all_leaves = Default::default();
+    collect_leaves(editor, editor.root_panel, &mut all_leaves);
+
+    all_leaves.iter().filter(|(panel_id, view_id, ..)| {
+        editor.views[*view_id].buffer_id == target_buffer && *panel_id != qp
+    }).map(|(panel_id, ..)| {
+        (*panel_id, editor.panels[*panel_id].rect_including_panel_bar)
+    }).collect()
+}
+
+fn layout_searcher(editor: &mut Editor) {
+    let pad          = 5.0*editor.scale;
+
+    let bar_h        = editor.panel_bar_h();
+    let line_h       = editor.line_h();
+    let cursor_h     = editor.cursor_h();
+    let searcher_h   = bar_h + line_h + cursor_h*2.0 + pad;
+
+    let panel_rect   = editor.searcher().target_panel_rect;
+    let query_panel  = editor.searcher().query_panel;
+    let query_split  = editor.searcher().query_split;
+    let target_panel = editor.searcher().target_panel;
+
+    let mut query_split_rect = panel_rect;
+    query_split_rect.y = panel_rect.y + bar_h;
+    query_split_rect.h = searcher_h;
+
+    let mut query_rect = query_split_rect;
+
+    query_split_rect.h -= pad;
+    query_rect.h       -= pad;
+
+    editor.layout_panel(query_split, query_split_rect);
+    editor.layout_panel(query_panel, query_rect);
+
+    let mut current_rect = panel_rect;
+    current_rect.y += searcher_h - pad;
+    current_rect.h -= searcher_h + pad;
+
+    editor.layout_panel(target_panel, current_rect);
+
+    // @KindaHack?
+    editor.panels[target_panel].rect.h += pad*2.0;
+    editor.panels[target_panel].rect_including_panel_bar.y = panel_rect.y;
+    editor.panels[target_panel].rect_including_panel_bar.h = panel_rect.h;
+}
+
+#[command]
+pub fn search(cx: &mut CommandContext) {
+    let is_open = !cx.editor.searcher().is_open;
+    cx.editor.searcher_mut().is_open = is_open;
+
+    clear_buffer(cx.editor, cx.editor.searcher().query_buffer);
+
+    let view = cx.editor.active_view_id();
+    let view = &cx.editor.views[view];
+    let target_panel = view.panel_id.unwrap();
+
+    let searcher = cx.editor.custom_data.searcher_mut();
+
+    if !is_open {
+        let should_reopen = ![searcher.target_panel, searcher.query_split].contains(&target_panel);
+        let old_target_view = searcher.target_view;
+
+        searcher.target_view   = ViewId::reserved_value();
+        searcher.target_buffer = BufferId::reserved_value();
+
+        if should_reopen {
+            search(cx);
+            cx.editor.layout_panels();
+        } else {
+            let new_panel = cx.editor.views[old_target_view].panel_id.unwrap();
+            cx.editor.set_active_panel(new_panel);
+            cx.editor.layout_panels();
+        }
+
+        return;
+    }
+
+    searcher.target_view = view.id;
+    searcher.target_buffer = view.buffer_id;
+
+    searcher.target_panel      = target_panel;
+    searcher.target_panel_rect = cx.editor.panels[target_panel].rect_including_panel_bar;
+
+    let query_split = searcher.query_split;
+    cx.editor.set_active_panel(query_split);
+
+    layout_searcher(cx.editor);
 }
 
 #[command]
@@ -2464,6 +2644,7 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));          // nocheckin
     cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));     // nocheckin
     cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk"));   // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl('s'), cx.command_table.intern("search"));   // nocheckin
     cx.keymap.bind(KeyCombo::ctrl_alt('\\'), cx.command_table.intern("indent_region"));      // nocheckin
     cx.keymap.bind(KeyCombo::ctrl_alt('w'), cx.command_table.intern("toggle_active_cursor"));      // nocheckin
     cx.keymap.bind(KeyCombo::alt('W'), cx.command_table.intern("toggle_active_cursor_saving_anchor"));      // nocheckin
@@ -2478,7 +2659,7 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::ctrl_alt('f'), cx.command_table.intern("jump_matching_delim_forward"));   // nocheckin
 
     cx.keymap.bind(KeyCombo::alt('{'), cx.command_table.intern("move_backward_paragraph"));   // nocheckin
-   cx.keymap.bind(KeyCombo::alt('}'), cx.command_table.intern("move_forward_paragraph"));    // nocheckin
+    cx.keymap.bind(KeyCombo::alt('}'), cx.command_table.intern("move_forward_paragraph"));    // nocheckin
     cx.keymap.bind(KeyCombo::alt('k'), cx.command_table.intern("kill_paragraph_forward"));    // nocheckin
 
     cx.keymap.bind(KeyCombo::alt('['), cx.command_table.intern("completion_prev"));   // nocheckin
@@ -2509,8 +2690,12 @@ fn editor_initialize_custom_data(editor: &mut Editor, _gpu: &mut Gpu) {
 
         lister: Lister::new(),
         commander: Commander::new(),
+        searcher: Searcher::default(),
 
-        lsp: LspClient::disabled()
+        lsp: LspClient::disabled(),
+
+        flashed_lines: Vec::with_capacity(32),
+        highlight_scratch: Vec::with_capacity(32),
     });
     editor.set_custom_transient_data(CustomDataTransient {});
 
@@ -2540,6 +2725,7 @@ fn editor_initialize_custom_data(editor: &mut Editor, _gpu: &mut Gpu) {
 
     if !_did_we_apply_any_sessions {
         lister_create_fresh_buffers_views_panels(editor);
+        searcher_create_fresh_buffers_views_panels(editor);
         commander_create_fresh_buffers_views_panels(editor);
     }
 }
@@ -2572,6 +2758,36 @@ fn lister_create_fresh_buffers_views_panels(editor: &mut Editor) {
     lister.query_view   = lister_query_view;
     lister.query_panel  = lister_query_panel;
     lister.query_split  = lister_split_panel;
+}
+
+fn searcher_create_fresh_buffers_views_panels(editor: &mut Editor) {   // @Cutnpaste from lister_create_fresh_buffers_views_panels
+    let searcher_query_buffer = editor.buffers.push(Buffer::new());
+
+    let searcher_query_view = editor.views.next_key();
+    editor.views.push(View::new(searcher_query_view, searcher_query_buffer));
+
+    let searcher_query_panel = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   searcher_query_panel,
+        rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
+        kind: PanelKind::Leaf { view_id: searcher_query_view },
+    });
+    editor.views[searcher_query_view].panel_id = searcher_query_panel.into();
+
+    let searcher_split_panel = editor.panels.next_key();
+    editor.panels.push(Panel {
+        id:   searcher_split_panel,
+        rect: Rect::default(),
+        rect_including_panel_bar: Rect::default(),
+        kind: SEARCHER_SPLIT_PANEL_KIND,
+    });
+
+    let searcher = editor.searcher_mut();
+    searcher.query_buffer = searcher_query_buffer;
+    searcher.query_view   = searcher_query_view;
+    searcher.query_panel  = searcher_query_panel;
+    searcher.query_split  = searcher_split_panel;
 }
 
 fn commander_create_fresh_buffers_views_panels(editor: &mut Editor) { // nocheckin
@@ -2673,19 +2889,271 @@ fn find_matching_paren(
     MatchingParen::WeCouldntFindMatchingParenOrItsWayTooFar
 }
 
+#[derive(Clone, Copy)]
+pub struct Highlight {      // @Memory
+    pub line: u32,
+    pub x0: f32,
+    pub x1: f32,
+    pub y: f32,
+    pub h: f32,
+    pub color: Color,
+    pub is_priority: bool,  // @Memory
+}
+
+//
+// This function exists because we want to make the current line highlight appear
+// TALLER, so that it draws more attention and is easier to spot, BUT: doing this
+// naively, results in not-so-much-good-looking overlaps between adjacent line highlights.
+//
+// So, this function solves that, by detecting adjacent overlapping lines and truncating them.
+//
+pub fn resolve_seamless_highlights(highlights: &mut [Highlight], context: &LayoutRenderingContext) {
+    for i in 0..highlights.len() {
+        let mut yield_top    = false;
+        let mut yield_bottom = false;
+
+        let item_line = highlights[i].line;
+        let item_x0   = highlights[i].x0;
+        let item_x1   = highlights[i].x1;
+        let item_prio = highlights[i].is_priority;
+
+        for j in 0..highlights.len() {
+            if i == j { continue }
+            let other = &highlights[j];
+
+            if item_x0 < other.x1 && item_x1 > other.x0 {
+                if other.line + 1 == item_line && !item_prio {
+                    yield_top = true;
+                }
+                if other.line == item_line + 1 && other.is_priority {
+                    yield_bottom = true;
+                }
+            }
+        }
+
+        let mut y = context.line_y(item_line) + context.cursor_h;
+        let mut h = context.line_h + context.cursor_h;
+
+        if yield_top {
+            y += context.cursor_h;
+            h -= context.cursor_h;
+        }
+        if yield_bottom {
+            h -= context.cursor_h;
+        }
+
+        highlights[i].y = y;
+        highlights[i].h = h;
+    }
+}
+
+fn draw_search_matches(editor: &mut Editor, gpu: &mut Gpu, view_id: ViewId, context: &LayoutRenderingContext) {
+    if !editor.searcher().is_open {
+        return;
+    }
+
+    let target_buffer = editor.searcher().target_buffer;
+
+    if view_id != editor.searcher().query_view && editor.views[view_id].buffer_id != target_buffer {
+        return;
+    }
+
+    let p = palette();
+
+    let matches = core::mem::take(&mut editor.searcher_mut().matches);  // Borrow checker...
+
+    let rect     = context.rect;
+    let origin_x = context.origin_x;
+    let view     = &editor.views[view_id];
+    let buffer   = &editor.buffers[target_buffer];
+    let active_match_index = editor.searcher().active_match_index;
+
+    let Some(layout) = &view.layout else { return };
+
+    let scratch_buffer = editor.custom_data.highlight_scratch_mut();
+    scratch_buffer.clear();
+
+    for (i, m) in matches.iter().enumerate() {
+        let is_priority = Some(i) == active_match_index;
+        let color = if is_priority {
+            p.search_match_active
+        } else {
+            p.search_match
+        };
+
+        let (start_line, start_col) = buffer.text.byte_to_line_col(m.byte_start);
+        let (end_line,   end_col)   = buffer.text.byte_to_line_col(m.byte_end);
+
+        let draw_start = start_line.max(context.first_visible_line);
+        let draw_end   = end_line.min(context.last_visible_line.saturating_sub(1));
+
+        for line_index in draw_start..=draw_end {
+            let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
+
+            let x0 = if line_index == start_line {
+                layout.x_for_col(origin_x, start_col, ll)
+            } else {
+                rect.x
+            };
+            let x1 = if line_index == end_line {
+                layout.x_for_col(origin_x, end_col, ll)
+            } else {
+                rect.x + rect.w
+            };
+
+            if x1 > x0 {
+                scratch_buffer.push(Highlight {
+                    line: line_index as u32,
+                    x0,
+                    x1,
+                    color,
+                    is_priority,
+                    y: 0.0,  // Filled by solver
+                    h: 0.0,  // Filled by solver
+                });
+            }
+        }
+    }
+
+    resolve_seamless_highlights(scratch_buffer, context);
+
+    for h in scratch_buffer.iter() {
+        gpu::draw_rect_with_waves_inside(gpu, h.x0, h.y, h.x1 - h.x0, h.h, h.color);
+    }
+
+    editor.searcher_mut().matches = matches;
+}
+
+fn draw_flashed_lines(editor: &mut Editor, gpu: &mut Gpu, view_id: ViewId, context: &LayoutRenderingContext) {
+    let view = &editor.views[view_id];
+
+    let rect = context.rect;
+
+    let mut scratch_buffer = core::mem::take(editor.custom_data.highlight_scratch_mut());  // BorrowChecker...
+    scratch_buffer.clear();
+
+    let flashes = editor.custom_data.flashed_lines();
+
+    for f in flashes {
+        if view.buffer_id != f.buffer_id                                { continue }
+
+        let ease = 1.0 - (1.0 - f.t).powi(2);
+        let color = Color::rgba(220, 20, 35, (ease * 80.0) as u8);
+
+        scratch_buffer.push(Highlight {
+            line: f.buffer_line as u32,
+            x0: rect.x,
+            x1: rect.x + rect.w,
+            color,
+            is_priority: false,  // Flashsed lines dont have priorities...?  @Design
+            y: 0.0,  // Filled by solver
+            h: 0.0,  // Filled by solver
+        });
+    }
+
+    resolve_seamless_highlights(&mut scratch_buffer, context);
+
+    for h in scratch_buffer.iter() {
+        gpu::draw_rect(gpu, h.x0, h.y, h.x1 - h.x0, h.h, h.color);
+    }
+
+    *editor.highlight_scratch_mut() = scratch_buffer;
+}
+
+fn draw_matching_parens(editor: &mut Editor, gpu: &mut Gpu, view_id: ViewId, context: &LayoutRenderingContext) {
+    let LayoutRenderingContext {
+        cursor_col, cursor_line,
+        line_h,
+        first_visible_line, last_visible_line,
+        min_cursor_w, origin_x, cursor_h, ..
+    } = context;
+
+    let view = &editor.views[view_id];
+    let Some(layout) = &view.layout else { return };
+
+    let buffer = &editor.buffers[view.buffer_id];
+
+    let cursor_radius = editor.cursor_radius();
+
+    let cols_to_check: &[_] = if *cursor_col > 0 {
+        &[*cursor_col, *cursor_col - 1]
+    } else {
+        &[*cursor_col]
+    };
+
+    for &check_col in cols_to_check {
+        let result = find_matching_paren(
+            buffer, *cursor_line, check_col, &mut editor.scratch_paren
+        );
+
+        if matches!(result, MatchingParen::None) {
+            continue;
+        }
+
+        let iter = match result {
+            MatchingParen::None => continue,
+
+            MatchingParen::Ok(line, col) => [
+                Some((*cursor_line, check_col)),
+                Some((line, col))
+            ],
+
+            MatchingParen::WeCouldntFindMatchingParenOrItsWayTooFar => [
+                Some((*cursor_line, check_col)),
+                None
+            ],
+        }.into_iter().flatten();
+
+        for (line, col) in iter {
+            if line >= *first_visible_line && line < *last_visible_line {
+                if let Some(ll) = layout.line_for_buffer_line(line) {
+                    let x = layout.x_for_col(*origin_x, col, ll);
+                    let w = layout.glyph_width_at_col(col, *min_cursor_w, ll);
+                    let y = context.line_y(line);
+                    gpu::draw_rect_rounded(gpu, x, y + cursor_h, w, line_h + cursor_h, cursor_radius, palette().paren_match);
+                }
+            }
+        }
+    }
+}
+
 fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.layout_panels = Some(|editor, win_rect| {
+        // :CustomPanel
+        //
+        // Layout the lister
+        //
         {
             let qp = editor.lister().query_panel;
             let qs = editor.lister().query_split;
             editor.layout_panel(qs, lister_rect(win_rect.w, win_rect.h, 1.0, 1.0, editor.scale));
             editor.layout_panel(qp, lister_rect(win_rect.w, win_rect.h, 1.0, 1.0, editor.scale));
         }
+
+        //
+        // Layout the searcher
+        //
+        if editor.searcher().is_open {
+            let target_panel = editor.searcher().target_panel;
+
+            //
+            // If target_panel got split, find the active leaf under it
+            //
+
+            let actual_panel = find_leftmost_leaf(editor, target_panel);
+            let actual_rect = editor.panels[actual_panel].rect_including_panel_bar;
+
+            editor.searcher_mut().target_panel = actual_panel;
+            editor.searcher_mut().target_panel_rect = actual_rect;
+
+            layout_searcher(editor);
+        }
     });
 
     cx.editor.hooks.layout_panel = Some(|editor, id, _rect| {
         match editor.panels[id].kind.as_custom() {
             LISTER_SPLIT_CUSTOM_PANEL => {}
+            SEARCHER_SPLIT_CUSTOM_PANEL => {}
 
             _ => {}
         }
@@ -2694,6 +3162,7 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.active_view_id = Some(|editor, custom_panel| {
         match custom_panel {
             LISTER_SPLIT_CUSTOM_PANEL => editor.lister().query_view,
+            SEARCHER_SPLIT_CUSTOM_PANEL => editor.searcher().query_view,
 
             _ => unreachable!()
         }
@@ -2708,6 +3177,13 @@ fn setup_hooks(cx: &mut CommandContext) {
                 ]
             }
 
+            SEARCHER_SPLIT_CUSTOM_PANEL => {
+                let s = editor.searcher();
+                smallvec![
+                    (id, s.query_view, editor.panels[s.query_panel].rect, editor.panels[s.query_panel].rect_including_panel_bar)
+                ]
+            }
+
             _ => unreachable!()
         }
     });
@@ -2716,6 +3192,17 @@ fn setup_hooks(cx: &mut CommandContext) {
         if *editor.undo_graph_is_open() {
             editor.active_view_mut().graph_camera.animate(dt); // @Cleanup
             *should_redraw = should_redraw.or_msg("Graph camera animation", &mut editor.redraw_reasons);
+        }
+
+        {
+            let flashed = editor.custom_data.flashed_lines_mut();
+            if !flashed.is_empty() {
+                for f in flashed.iter_mut() {
+                    f.t = (f.t - dt * 2.0).max(0.0);
+                }
+                flashed.retain(|f| f.t > 0.0);
+                *should_redraw = should_redraw.or_msg("Flashed lines animation", &mut editor.redraw_reasons);
+            }
         }
 
         {
@@ -2822,7 +3309,44 @@ fn setup_hooks(cx: &mut CommandContext) {
             return (false, false);
         };
 
-        let is_active_view_query = cx.editor.active_view_id() == cx.editor.lister().query_view;
+        let is_typing_into_search =
+            cx.editor.searcher().is_open && cx.editor.active_buffer_id() == cx.editor.searcher().query_buffer;
+        if is_typing_into_search {
+            let result = cx.editor.searcher_mut().searcher_key(event);
+            match result {
+                SearcherKeyDispatch::Close => {
+                    search(cx);
+                    return (true, true);
+                }
+                SearcherKeyDispatch::Next => {
+                    search_next(cx);
+                    return (true, true);
+                }
+                SearcherKeyDispatch::Prev => {
+                    search_prev(cx);
+                    return (true, true);
+                }
+                SearcherKeyDispatch::Other => {
+                    cx.editor.reset_blink();
+                    return (true, true);
+                }
+                SearcherKeyDispatch::None => {}
+            }
+        }
+
+        let is_in_target_buffer = cx.editor.searcher().is_open
+            && cx.editor.active_buffer_id() == cx.editor.searcher().target_buffer;
+        if is_in_target_buffer {
+            let Mods { ctrl, .. } = event.mods;
+            let should_close = matches!(&event.logical, LogicalKey::Named(NamedKey::Escape))
+                || matches!(&event.logical, LogicalKey::Char('g') if ctrl);
+            if should_close {
+                search(cx);
+                return (true, true);
+            }
+        }
+
+        let is_active_view_query = cx.editor.active_buffer_id() == cx.editor.lister().query_buffer;
         if is_active_view_query {
             let lister = cx.editor.custom_data.lister_mut();
 
@@ -2882,7 +3406,10 @@ fn setup_hooks(cx: &mut CommandContext) {
             cx.editor.commit_buffer_cycle();
         }
 
-        (false, false)
+        let redraw = false;
+        let short_circuit = false;
+
+        (redraw, short_circuit)
     });
 
     cx.editor.hooks.post_command_execution = Some(|cx, _command_atom| {
@@ -2907,6 +3434,10 @@ fn setup_hooks(cx: &mut CommandContext) {
             };
         }
 
+        if editor_is_searcher_buffer_dirty(cx.editor) {
+            launch_search(cx.editor);
+        }
+
         let is_undo_graph_open = *cx.editor.undo_graph_is_open();
         if is_undo_graph_open {
             center_undo_graph_on_head(cx.editor);
@@ -2919,6 +3450,10 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.collect_leaf_panels_init_stack = Some(|editor, _id, stack| {
         if editor.lister().is_open() {
             stack.push(editor.lister().query_split);
+        }
+
+        if editor.searcher().is_open {
+            stack.push(editor.searcher().query_split);
         }
     });
 
@@ -2933,6 +3468,11 @@ fn setup_hooks(cx: &mut CommandContext) {
     cx.editor.hooks.register_new_buffer_in_most_recently_used_list = Some(|editor, buffer_id| {
         if buffer_id == editor.lister().query_buffer {
             // Don't register lister's internal buffer in the MRU list.
+            return true;
+        }
+
+        if buffer_id == editor.searcher().query_buffer {
+            // Don't register searcher's internal buffer in the MRU list.
             return true;
         }
 
@@ -2968,6 +3508,10 @@ fn setup_hooks(cx: &mut CommandContext) {
 
         {
             redraw |= drain_pending_lsp_goto(editor);
+        }
+
+        {
+            redraw |= drain_search_results(editor);
         }
 
         {
@@ -3104,24 +3648,30 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.about_to_redraw_a_frame = Some(|cx, _dt| {
+        let editor = &mut cx.editor;
+
         let mut redraw = ShouldRequestFrameRedraw::No;
 
         {
-            redraw |= drain_pending_lsp_goto(cx.editor);
+            redraw |= drain_pending_lsp_goto(editor);
         }
 
         {
-            cx.editor.lister_mut().last_is_lister_open = cx.editor.lister().is_open();
+            redraw |= drain_search_results(editor);
         }
 
         {
-            let commander_buffer = cx.editor.commander().command_buffer;
-            let char_count = cx.editor.buffers[commander_buffer].text.len_chars() as usize;
-            cx.editor.commander_mut().last_command_buffer_character_count = char_count;
+            editor.lister_mut().last_is_lister_open = editor.lister().is_open();
+        }
 
-            redraw = redraw.or_if(cx.editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut cx.editor.redraw_reasons);
+        {
+            let commander_buffer = editor.commander().command_buffer;
+            let char_count = editor.buffers[commander_buffer].text.len_chars() as usize;
+            editor.commander_mut().last_command_buffer_character_count = char_count;
 
-            redraw |= drain_commander_output(cx.editor);
+            redraw = redraw.or_if(editor.buffers[commander_buffer].is_dirty, "Commander buffer is dirty", &mut editor.redraw_reasons);
+
+            redraw |= drain_commander_output(editor);
         }
 
         redraw
@@ -3137,6 +3687,16 @@ fn setup_hooks(cx: &mut CommandContext) {
         should_request_redraw
     });
 
+    cx.editor.hooks.animated_all_animations = Some(|cx| {
+        let should_request_redraw = ShouldRequestFrameRedraw::No;
+
+        if cx.editor.searcher().is_open {
+            render_split_seams(cx.gpu, cx.editor, cx.editor.searcher().query_split, Color::hex(0x2a2a2a));
+        }
+
+        should_request_redraw   // @Incomplete
+    });
+
     cx.editor.hooks.about_to_draw_this_panel = Some(|cx, _panel, view, _rect| {
         let mut should_skip = false;
 
@@ -3149,8 +3709,33 @@ fn setup_hooks(cx: &mut CommandContext) {
         should_skip
     });
 
+    cx.editor.hooks.should_exclude_panel_from_toggle_cycle = Some(|editor, panel_id| {
+        editor.searcher().is_open && panel_id == editor.searcher().query_panel
+    });
+
+    cx.editor.hooks.before_split = Some(|editor, active_panel| {
+        if editor.searcher().is_open {
+            let s = editor.searcher();
+            let is_query_panel_or_split = [s.query_panel, s.query_split].contains(&active_panel);
+            let is_viewing_query_buffer = match editor.panels[active_panel].kind {
+                PanelKind::Leaf { view_id } => editor.views[view_id].buffer_id == s.query_buffer,
+                SEARCHER_SPLIT_PANEL_KIND => true,
+                _ => false,
+            };
+            if is_query_panel_or_split || is_viewing_query_buffer {
+                let leaves = collect_searcher_leaves(editor);
+                return leaves.first().map(|(panel_id, _)| *panel_id).unwrap_or(active_panel);
+            }
+        }
+        active_panel
+    });
+
     cx.editor.hooks.should_view_have_panel_bar = Some(|cx, view_id| {
-        ![cx.lister().query_view].contains(&view_id)
+        let views_that_shouldnt_have_bars = [
+            cx.lister().query_view,
+        ];
+
+        !views_that_shouldnt_have_bars.contains(&view_id)
     });
 
     cx.editor.hooks.drew_all_leaf_panels = Some(|cx| {
@@ -3206,9 +3791,7 @@ fn setup_hooks(cx: &mut CommandContext) {
                 gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
                 {
                     let t1 = Instant::now();
-
                     render_text_layout(editor, gpu, view_id, show_cursor);
-
                     editor.render_us_acc += t1.elapsed().as_micros() as f32;
                 }
                 gpu::pop_clip(gpu);
@@ -3247,7 +3830,37 @@ fn setup_hooks(cx: &mut CommandContext) {
             editor.render_us_acc += t1.elapsed().as_micros() as f32;
         }
 
+        // :SearcherLayoutDebug
+        // {
+        //     let view = cx.editor.active_view_id();
+        //     let view = &cx.editor.views[view];
+        //     let target_panel = view.panel_id.unwrap();
+        //     let rect = cx.editor.panels[target_panel].rect_including_panel_bar;
+        //     gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, 1.0, Color::rgba(255, 0, 0, 255));
+        //     let rect = cx.editor.panels[target_panel].rect;
+        //     gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, 1.0, Color::rgba(0, 255, 0, 255));
+
+        //     let rect = cx.editor.panels[cx.editor.searcher().query_panel].rect_including_panel_bar;
+        //     gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, 1.0, Color::rgba(255, 0, 255, 255));
+        //     let rect = cx.editor.panels[target_panel].rect;
+        //     gpu::draw_rect_outline(gpu, rect.x, rect.y, rect.w, rect.h, 1.0, Color::rgba(255, 255, 0, 255));
+        // }
+
         ShouldRequestFrameRedraw::No
+    });
+
+    cx.editor.hooks.render_custom_split_seams = Some(|editor, gpu, panel_id, color| {
+        if panel_id == editor.searcher().query_split || panel_id == editor.searcher().query_panel {
+            let qp = editor.searcher().query_panel;
+            let rect = editor.panels[qp].rect_including_panel_bar;
+            let bar_h = editor.panel_bar_h();
+            let border_thickness = editor.panel_bar_border_thickness();
+
+            // Bar/buffer separator
+            gpu::draw_rect(gpu, rect.x, rect.y + bar_h, rect.w, border_thickness, color);
+            // Bottom seam
+            gpu::draw_rect(gpu, rect.x, editor.panels[qp].rect.y + editor.panels[qp].rect.h, rect.w, border_thickness, color);
+        }
     });
 
     cx.editor.hooks.additional_font_sizes_to_prewarm = Some(|editor| {
@@ -3257,6 +3870,18 @@ fn setup_hooks(cx: &mut CommandContext) {
     });
 
     cx.editor.hooks.format_panel_bar = Some(|editor, view_id| {
+        if view_id == editor.searcher().query_view {   // :Searcher
+            _ = write!(&mut editor.scratch_panel_bar, "Search for:");
+
+            if let Some(match_index) = editor.searcher().active_match_index {
+                let count = editor.searcher().matches.len();
+                let match_index = match_index + 1;
+                _ = write!(&mut editor.scratch_panel_bar_dim, "[{match_index}/{count}]");
+            }
+
+            return;
+        }
+
         let view = &editor.views[view_id];
         let buffer = &editor.buffers[view.buffer_id];
         let (line, col) = buffer.cursor_line_col(&view.cursor);
@@ -3288,76 +3913,82 @@ fn setup_hooks(cx: &mut CommandContext) {
         }
     });
 
-    cx.editor.hooks.drew_current_line_highlight_about_to_draw_cursor = Some(|editor, gpu, view_id, context| {
+    cx.editor.hooks.glyph_color_overrides = Some(|editor, _gpu, view_id, _line, glyphs, _context| {
         //
-        //
-        // Matching paren
-        //
+        // @Note: Called *INSIDE* the text rendering loop, *ONLY* for visible lines.
         //
 
-        let LayoutRenderingContext {
-            cursor_col, cursor_line,
-            line_h,
-            first_visible_line, last_visible_line,
-            min_cursor_w, origin_x, cursor_h, ..
-        } = context;
+        let mut overrides = SmallVec::new();
 
-        let view = &editor.views[view_id];
-        let Some(layout) = &view.layout else { return };
+        if !editor.searcher().is_open {
+            return overrides;
+        }
 
-        let buffer = &editor.buffers[view.buffer_id];
+        let target_buffer = editor.searcher().target_buffer;
+        if editor.views[view_id].buffer_id != target_buffer {
+            return overrides;
+        }
 
-        let cursor_radius = editor.cursor_radius();
+        let matches = &editor.searcher().matches;
+        if matches.is_empty() || glyphs.is_empty() {
+            return overrides;
+        }
 
-        let cols_to_check: &[_] = if *cursor_col > 0 {
-            &[*cursor_col, *cursor_col - 1]
-        } else {
-            &[*cursor_col]
-        };
+        let p = palette();
 
-        for &check_col in cols_to_check {
-            let result = find_matching_paren(
-                buffer, *cursor_line, check_col, &mut editor.scratch_paren
-            );
+        let active_match_index = editor.searcher().active_match_index;
 
-            if matches!(result, MatchingParen::None) {
-                continue;
+        let line_byte_start = glyphs.first().unwrap().byte_offset;
+        let line_byte_end = glyphs.last().unwrap().byte_offset + 4;   // @Redundant?
+
+        //
+        // Binary search to skip matches that end completely before this line starts
+        //
+        let first_match_index = matches.partition_point(|m| m.byte_end <= line_byte_start);
+
+        //
+        // Iterate over the remaining potentially overlapping matches
+        //
+        for (i, m) in matches.iter().enumerate().skip(first_match_index) {
+            //
+            // Since matches are sorted by byte_start, if this match starts after our line ends,
+            // all subsequent matches will also be completely past this line.
+            //
+            if m.byte_start >= line_byte_end {
+                break;
             }
 
-            let iter = match result {
-                MatchingParen::None => continue,
+            //
+            // Binary search the glyphs to find the start and end indices for this match
+            //
+            let start_index = glyphs.partition_point(|g| g.byte_offset < m.byte_start);
+            let end_index   = glyphs.partition_point(|g| g.byte_offset < m.byte_end);
 
-                MatchingParen::Ok(line, col) => [
-                    Some((*cursor_line, check_col)),
-                    Some((line, col))
-                ],
+            if start_index < end_index {
+                let color = if Some(i) == active_match_index { // @Design
+                    p.background
+                } else {
+                    p.background
+                };
 
-                MatchingParen::WeCouldntFindMatchingParenOrItsWayTooFar => [
-                    Some((*cursor_line, check_col)),
-                    None
-                ],
-            }.into_iter().flatten();
-
-            for (line, col) in iter {
-                if line >= *first_visible_line && line < *last_visible_line {
-                    if let Some(ll) = layout.line_for_buffer_line(line) {
-                        let x = layout.x_for_col(*origin_x, col, ll);
-                        let w = layout.glyph_width_at_col(col, *min_cursor_w, ll);
-                        let y = context.line_y(line);
-                        gpu::draw_rect_rounded(gpu, x, y + cursor_h, w, line_h + cursor_h, cursor_radius, palette().paren_match);
-                    }
-                }
+                overrides.push(GlyphColorOverride {
+                    glyph_start: start_index as u32,
+                    glyph_end_exclusive: end_index as u32,
+                    color: color.into(),
+                });
             }
         }
+
+        overrides
+    });
+
+    cx.editor.hooks.drew_current_line_highlight_about_to_draw_cursor = Some(|editor, gpu, view_id, context| {
+        draw_flashed_lines(editor,   gpu, view_id, context);
+        draw_search_matches(editor,  gpu, view_id, context);
+        draw_matching_parens(editor, gpu, view_id, context);
     });
 
     cx.editor.hooks.drew_cursor_about_to_draw_text = Some(|editor, gpu, view_id, context| {
-        //
-        //
-        // Matching paren
-        //
-        //
-
         let LayoutRenderingContext { rect, origin_x, .. } = context;
 
         let view = &editor.views[view_id];
@@ -3386,17 +4017,20 @@ fn setup_hooks(cx: &mut CommandContext) {
 
                 let full_x0 = if line == anim.start_line { layout.x_for_col(*origin_x, anim.start_col, ll) } else { rect.x };
                 let full_x1 = if line == anim.end_line   { layout.x_for_col(*origin_x, anim.end_col,   ll) } else { rect.x + rect.w };
-                let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim.round();
+
                 if full_x1 <= full_x0 { continue; }
 
-                gpu::draw_rect(gpu, full_x0, y, full_x1 - full_x0, layout.line_h, color);
+                let y = layout.rect.y + line as f32 * layout.line_h - view.scroll_anim;
+                let h = layout.line_h + editor.cursor_h()*2.0;
+
+                gpu::draw_rect(gpu, full_x0, y, full_x1 - full_x0, h, color);
 
                 if line == anim.start_line
                     && anim.start_line != anim.end_line
                     && anim.start_col > 0
                     && full_x0 > rect.x + 1.0
                 {
-                    gpu::draw_rect(gpu, rect.x, y, full_x0 - rect.x, layout.line_h, color);
+                    gpu::draw_rect(gpu, rect.x, y, full_x0 - rect.x, h, color);
                 }
             }
         }
@@ -3819,6 +4453,11 @@ pub fn editor_is_lister_buffer_dirty(editor: &Editor) -> bool {
 }
 
 #[inline]
+pub fn editor_is_searcher_buffer_dirty(editor: &Editor) -> bool {
+    editor.buffers[editor.searcher().query_buffer].is_dirty
+}
+
+#[inline]
 pub fn editor_open_lister<I>(editor: &mut Editor, items: I, on_confirm: ListerSelectFn)
 where
     I: IntoIterator,
@@ -3956,8 +4595,8 @@ impl VirtualList {
     }
 
     pub fn hovered_index(&self, local_y: f32, item_count: u32) -> Option<u32> {
-        let idx = ((local_y + self.scroll_anim) / self.item_h) as u32;
-        if idx < item_count { Some(idx) } else { None }
+        let index = ((local_y + self.scroll_anim) / self.item_h) as u32;
+        if index < item_count { Some(index) } else { None }
     }
 
     pub fn tick(&mut self, dt: f32) -> bool {
@@ -4329,7 +4968,7 @@ pub struct Lister {
 
     pub last_seen_cached_dir_generation: u64, // u64::MAX if we didnt see any generations
 
-    pub query:         SmallString<[u8; 128]>,
+    pub query:        SmallString<[u8; 128]>,
 
     pub query_buffer: BufferId,
     pub query_view:   ViewId,
@@ -5212,5 +5851,169 @@ pub fn center_undo_graph_on_head(editor: &mut Editor) {
 
         view.graph_camera.target_head_x = head_node.x;
         view.graph_camera.target_head_y = head_node.y;
+    }
+}
+
+pub struct SearchMatch {
+    pub byte_start: u32,
+    pub byte_end:   u32,
+}
+
+pub struct AttachedPanel {
+    pub panel_id:    PanelId,
+    pub original_rect: Rect,
+}
+
+#[derive(Default)]
+pub struct Searcher {
+    pub is_open: bool,
+
+    pub active_match_index: Option<usize>,
+
+    pub target_panel: PanelId,
+    pub target_panel_rect: Rect,
+
+    pub target_view:   ViewId,
+    pub target_buffer: BufferId,
+
+    pub query_buffer: BufferId,
+    pub query_view:   ViewId,
+    pub query_panel:  PanelId,
+    pub query_split:  PanelId,
+
+    pub matches:       Vec<SearchMatch>,
+    pub search_sender: Option<Sender<SearchMatch>>,
+    pub search_recv:   Option<Receiver<SearchMatch>>,
+    pub cancel_flag:   Arc<AtomicBool>,
+    pub last_query:    String,   // @Speed: Make this into a hash
+}
+pub enum SearcherKeyDispatch {
+    Close,
+    Next,
+    Prev,
+    Other,
+    None,
+}
+
+impl Searcher {
+    pub fn searcher_key(&mut self, event: KeyInput) -> SearcherKeyDispatch {
+        if !self.is_open { return SearcherKeyDispatch::None; }
+
+        let Mods { ctrl, alt: _, shift: _ } = event.mods;
+
+        match &event.logical {
+            LogicalKey::Named(NamedKey::Escape | NamedKey::Enter) => {
+                SearcherKeyDispatch::Close
+            }
+
+            LogicalKey::Named(NamedKey::Down) => {
+                SearcherKeyDispatch::Next
+            }
+
+            LogicalKey::Named(NamedKey::Up) => {
+                SearcherKeyDispatch::Prev
+            }
+
+            LogicalKey::Char(c) if ctrl => match c {
+                'n' => SearcherKeyDispatch::Next,
+                'p' => SearcherKeyDispatch::Prev,
+                'g' => SearcherKeyDispatch::Close,
+                _   => SearcherKeyDispatch::None,
+            }
+
+            _ => SearcherKeyDispatch::None,
+        }
+    }
+}
+
+fn launch_search(editor: &mut Editor) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    editor.searcher_mut().active_match_index = None;
+
+    let query_buffer = editor.searcher().query_buffer;
+    let query = editor.buffers[query_buffer].text.to_string(); // flatten piece tree
+    let query = query.trim_end_matches('\n').to_string();
+
+    if query == editor.searcher().last_query {
+        return;
+    }
+    editor.searcher_mut().last_query = query.clone();
+    editor.searcher_mut().matches.clear();
+
+    // Cancel previous search
+    editor.searcher().cancel_flag.store(true, Ordering::Relaxed);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    editor.searcher_mut().cancel_flag = cancel_flag.clone();
+
+    if query.is_empty() {
+        editor.searcher_mut().search_recv = None;
+        return;
+    }
+
+    let regex = match regex::Regex::new(&query) {
+        Ok(r)  => r,
+        Err(_) => {
+            editor.searcher_mut().search_recv = None;
+            return;
+        }
+    };
+
+    // Flatten the target buffer's text into a String and ship it over
+    let target_buffer = editor.searcher().target_buffer;
+    let text = Arc::new(editor.buffers[target_buffer].text.to_string());
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+    editor.searcher_mut().search_recv = Some(rx);
+
+    std::thread::spawn(move || {
+        const CANCEL_CHECK_INTERVAL: usize = 512;
+        let mut checked = 0usize;
+        for m in regex.find_iter(&text) {
+            checked += 1;
+            if checked % CANCEL_CHECK_INTERVAL == 0 {
+                if cancel_flag.load(Ordering::Relaxed) { return; }
+            }
+            if tx.send(SearchMatch {
+                byte_start: m.start() as u32,
+                byte_end:   m.end()   as u32,
+            }).is_err() {
+                return; // receiver dropped, stop
+            }
+        }
+    });
+}
+
+fn drain_search_results(editor: &mut Editor) -> ShouldRequestFrameRedraw {
+    let mut redraw = ShouldRequestFrameRedraw::No;
+    let Some(rx) = &editor.searcher().search_recv else { return redraw };
+    let rx = rx.clone(); // @Hack
+    loop {
+        match rx.try_recv() {
+            Ok(m) => {
+                editor.searcher_mut().matches.push(m);
+                if editor.searcher().active_match_index.is_none() {
+                    editor.searcher_mut().active_match_index = Some(0);
+                    jump_to_active_match(editor, None);
+                }
+                redraw = redraw.or_msg("Search result", &mut editor.redraw_reasons);
+            }
+            Err(TryRecvError::Empty)        => break,
+            Err(TryRecvError::Disconnected) => {
+                editor.searcher_mut().search_recv = None;
+                break;
+            }
+        }
+    }
+
+    redraw
+}
+
+fn find_leftmost_leaf(editor: &Editor, panel: PanelId) -> PanelId {
+    match editor.panels[panel].kind {
+        PanelKind::Split(s) => find_leftmost_leaf(editor, s.left_id),
+
+        PanelKind::Leaf { .. } => panel,
+        PanelKind::Custom(_) => panel,
     }
 }
