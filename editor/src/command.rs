@@ -173,7 +173,7 @@ pub struct KeyInput {
     pub mods:     Mods,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Eq, PartialEq, Debug, Clone, Copy)]
 pub enum LogicalKey {
     Char(char),    // Printable, shift already applied
     Named(NamedKey),

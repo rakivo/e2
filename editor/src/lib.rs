@@ -43,7 +43,7 @@ pub mod audioer_blank;
 pub use audioer_blank as audioer;
 
 use editor_buffer::UndoGraphLayout;
-use ts::edit_to_ts;
+use ts::{WordTables, edit_to_ts};
 use cranelift_entity::packed_option::ReservedValue;
 use buffer::PASTE_ANIMATION_MAX_ID;
 use atum::{Atom, AtomTable};
@@ -56,7 +56,7 @@ use color::{Color, GpuColor};
 use command::{CommandAtom, CommandContext, Mods};
 use director::Director;
 use tree_sitter::Tree;
-use ts::{FunctionTable, ParseResultKind, SymbolKind, SymbolTable, TreeSitter, extract_prefix_at_cursor, query_completions};
+use ts::{FunctionTable, ParseResultKind, SymbolTable, TreeSitter, extract_prefix_at_cursor, query_completions};
 use gpu::{Gpu, GpuGlyph, draw_text_for_editor};
 use ui::UiState;
 
@@ -71,6 +71,7 @@ use std::fmt::Write as _;
 use std::collections::VecDeque;
 use std::ops::{BitOr, BitAnd, BitOrAssign, BitAndAssign};
 
+use arrayvec::ArrayString;
 use cranelift_entity::packed_option::{PackedOption};
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use smallstr::SmallString;
@@ -567,7 +568,7 @@ define_base_and_scale! {
     const BASE_FONT_SIZE:                  f32 = 15.0;
     const BASE_CURSOR_HEIGHT:              f32 = 2.0;
     const BASE_CURSOR_WIDTH:               f32 = 2.0;
-    const BASE_CURSOR_OUTLINE_THICKNESS:   f32 = 1.2;
+    const BASE_CURSOR_OUTLINE_THICKNESS:   f32 = 1.4;
     const BASE_PANEL_BAR_BORDER_THICKNESS: f32 = 1.0;
 }
 
@@ -1369,6 +1370,7 @@ pub fn render_text_layout(
 
             for line_index in draw_start..=draw_end {
                 let Some(ll) = layout.line_for_buffer_line(line_index) else { continue };
+
                 let y = context.line_y(line_index) + cursor_h;
                 let h = line_h + cursor_h*2.0;
 
@@ -1388,9 +1390,7 @@ pub fn render_text_layout(
 
                     (layout.x_for_col(origin_x, start_col, ll), rect.x + rect.w)
                 } else if line_index == end_line {
-                    if end_col == 0 { continue }  // Don't draw newline characters
-
-                    (rect.x,                                    layout.x_for_col(origin_x, end_col, ll))
+                    (rect.x,            layout.x_for_col(origin_x, end_col, ll))
                 } else {
                     (rect.x,                                    rect.x + rect.w)
                 };
@@ -1432,7 +1432,9 @@ pub fn render_text_layout(
             .map(|a| a != view.cursor.char_index)
             .unwrap_or(false);
 
-        if has_selection {
+        if !has_selection {
+            gpu::draw_rect(gpu, rect.x, y, rect.w, h, palette().current_line);
+        } else {
             let (start_index, end_index) = {
                 let a = view.cursor.anchor_char_index.unwrap();
                 let c = view.cursor.char_index;
@@ -1468,8 +1470,6 @@ pub fn render_text_layout(
                 gpu::draw_rect(gpu, rect.x, y, rect.w, h, palette().current_line);
             }
 
-        } else {
-            gpu::draw_rect(gpu, rect.x, y, rect.w, h, palette().current_line);
         }
     }
 
@@ -1539,6 +1539,17 @@ pub fn render_text_layout(
     let buffer = &editor.buffers[buffer_id];
 
     //
+    // Draw the ghost (unactive) cursor
+    //
+    if layout.cursor_style == CursorStyle::Block
+    && let Some(ll) = layout.line_for_buffer_line(ghost_cursor_line)
+    {
+        let cursor_glyph_w = layout.glyph_width_at_col(ghost_cursor_col, min_cursor_w, ll).max(min_cursor_w);
+        let rect = context.ghost_cursor_rect(cursor_glyph_w);
+        gpu::draw_rect_rounded_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_radius, cursor_outline_thickness, palette().cursor);
+    }
+
+    //
     //
     // Text
     //
@@ -1604,7 +1615,7 @@ pub fn render_text_layout(
                 &color_overrides
             );
 
-            if ll.buffer_line == cursor_line {
+            if ll.buffer_line == cursor_line && view.typed_since_last_move {
                 if let Some(ref ghost) = view.completion.ghost_text {
                     if !ghost.is_empty() {
                         let ghost_x = ll.x_for_col(origin_x, cursor_col, &layout.glyphs);
@@ -1621,6 +1632,7 @@ pub fn render_text_layout(
     // Function call overlay
     //
     if is_this_view_focused &&
+        view.typed_since_last_move &&
         let Some(overlay) = &view.overlay.current &&
         let Some(ll) = layout.line_for_buffer_line(cursor_line)
     {
@@ -1724,18 +1736,6 @@ pub fn render_text_layout(
 
     if let Some(hook) = editor.hooks.drew_text_about_to_return {
         hook(editor, gpu, view_id, &context);
-    }
-
-    // Reload borrows again...
-    let view = &editor.views[view_id];
-    let Some(layout) = &view.layout else { return };
-
-    if layout.cursor_style == CursorStyle::Block
-    && let Some(ll) = layout.line_for_buffer_line(ghost_cursor_line)
-    {
-        let cursor_glyph_w = layout.glyph_width_at_col(ghost_cursor_col, min_cursor_w, ll).max(min_cursor_w);
-        let rect = context.ghost_cursor_rect(cursor_glyph_w);
-        gpu::draw_rect_rounded_outline(gpu, rect.x, rect.y, rect.w, rect.h, cursor_radius, cursor_outline_thickness, palette().cursor);
     }
 }
 
@@ -2100,17 +2100,20 @@ pub struct PanelId(pub u32);
 cranelift_entity::entity_impl!(PanelId);
 
 impl Default for PanelId { fn default() -> Self { Self::reserved_value() } }
+impl nohash_hasher::IsEnabled for PanelId {}
 
 #[derive(Hash, Ord, Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct BufferId(pub u32);
 cranelift_entity::entity_impl!(BufferId);
 
 impl Default for BufferId { fn default() -> Self { Self::reserved_value() } }
+impl nohash_hasher::IsEnabled for BufferId {}
 
 #[derive(Hash, Ord, Eq, PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct ViewId(pub u32);
 cranelift_entity::entity_impl!(ViewId);
 
+impl nohash_hasher::IsEnabled for ViewId {}
 impl Default for ViewId { fn default() -> Self { Self::reserved_value() } }
 
 pub const PANEL_NONE: PanelId = PanelId(u32::MAX-1);
@@ -2394,6 +2397,8 @@ pub struct View {
     pub buffer_id: BufferId,
     pub  panel_id: PackedOption<PanelId>,
 
+    pub typed_since_last_move: bool,   // @Memory?
+
     pub current_cursor: CurrentCursor,
 
     // Vertical scrolling
@@ -2438,6 +2443,7 @@ impl View {
             current_cursor: Default::default(),
 
             id, buffer_id, scroll,
+            typed_since_last_move: false,
             scroll_x: 0.0,
             scroll_anim_x: 0.0,
             scroll_anim: scroll,
@@ -2560,31 +2566,25 @@ impl View {
 
     #[inline]
     pub fn scroll_to_cursor(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
-        //
-        //
-        // Vertical scrolling
-        //
-        //
+        self.scroll_to_cursor_v(line, line_h, rect);
+        self.scroll_to_cursor_h(cursor_x, rect);
+    }
 
+    #[inline]
+    pub fn scroll_to_cursor_v(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top    = line as f32 * line_h;
-        let cursor_bottom = cursor_top + line_h + (ADDITIONAL_BOTTOM_SCROLL_SPACE/2.0);
-
-        // Only scroll when cursor is fully off screen - no margin
+        let cursor_bottom = cursor_top + line_h + (ADDITIONAL_BOTTOM_SCROLL_SPACE / 2.0);
         if cursor_top < self.scroll {
             self.scroll = cursor_top;
         }
-
         let view_bottom = self.scroll + rect.h;
         if cursor_bottom > view_bottom {
             self.scroll = cursor_bottom - rect.h;
         }
+    }
 
-        //
-        //
-        // Horizontal scrolling
-        //
-        //
-
+    #[inline]
+    pub fn scroll_to_cursor_h(&mut self, cursor_x: f32, rect: Rect) {
         // cursor_x is in content-space (origin_x + glyph.x), before scroll offset.
         // We want it visible within [rect.x + padding_left, rect.x + rect.w].
         let margin      = 8.0; // small lookahead so cursor isn't flush against the edge
@@ -2599,26 +2599,71 @@ impl View {
         }
     }
 
-    //
-    // @Incomplete: Make these scroll horizontally as well
-    //
+    #[inline]
+    pub fn scroll_to_cursor_centered(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        self.scroll_to_cursor_centered_v(line, line_h, rect);
+        self.scroll_to_cursor_centered_h(cursor_x, rect);
+    }
 
     #[inline]
-    pub fn scroll_to_cursor_centered(&mut self, line: u32, line_h: f32, rect: Rect) {
+    pub fn scroll_to_cursor_centered_v_but_not_centered_h(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        self.scroll_to_cursor_centered_v(line, line_h, rect);
+        self.scroll_to_cursor_h(cursor_x, rect);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_top_v_but_not_centered_h(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        self.scroll_to_cursor_top_v(line, line_h);
+        self.scroll_to_cursor_h(cursor_x, rect);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_bottom_v_but_not_centered_h(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        self.scroll_to_cursor_bottom_v(line, line_h, rect);
+        self.scroll_to_cursor_h(cursor_x, rect);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_centered_v(&mut self, line: u32, line_h: f32, rect: Rect) {
         let cursor_top = line as f32 * line_h;
         self.scroll = (cursor_top - rect.h / 2.0 + line_h / 2.0).max(0.0);
     }
 
     #[inline]
-    pub fn scroll_to_cursor_top(&mut self, line: u32, line_h: f32, _rect: Rect) {
-        let cursor_top = line as f32 * line_h;
-        self.scroll = cursor_top;
+    pub fn scroll_to_cursor_centered_h(&mut self, cursor_x: f32, rect: Rect) {
+        self.scroll_x = (cursor_x - rect.w / 2.0).max(0.0);
     }
 
     #[inline]
-    pub fn scroll_to_cursor_bottom(&mut self, line: u32, line_h: f32, rect: Rect) {
-        let cursor_top = line as f32 * line_h;
-        self.scroll = (cursor_top - rect.h + line_h).max(0.0);
+    pub fn scroll_to_cursor_top(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        self.scroll_to_cursor_top_v(line, line_h);
+        self.scroll_to_cursor_top_h(cursor_x, rect);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_top_v(&mut self, line: u32, line_h: f32) {
+        self.scroll = line as f32 * line_h;
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_top_h(&mut self, cursor_x: f32, rect: Rect) {
+        self.scroll_x = (cursor_x - rect.w / 2.0).max(0.0);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_bottom(&mut self, line: u32, line_h: f32, cursor_x: f32, rect: Rect) {
+        self.scroll_to_cursor_bottom_v(line, line_h, rect);
+        self.scroll_to_cursor_bottom_h(cursor_x, rect);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_bottom_v(&mut self, line: u32, line_h: f32, rect: Rect) {
+        self.scroll = (line as f32 * line_h - rect.h + line_h).max(0.0);
+    }
+
+    #[inline]
+    pub fn scroll_to_cursor_bottom_h(&mut self, cursor_x: f32, rect: Rect) {
+        self.scroll_x = (cursor_x - rect.w / 2.0).max(0.0);
     }
 
     #[inline]
@@ -2641,54 +2686,56 @@ impl View {
     pub fn line_to_screen_y(&self, line: u32, rect: Rect, line_h: f32) -> f32 {
         rect.y + line as f32 * line_h - self.scroll
     }
+
+    #[inline]
+    pub fn cursor_x(&self, line: u32, col: u32, rect: Rect) -> f32 {
+        self.layout.as_ref()
+            .and_then(|l| l.cursor_x_content(line, col))
+            .unwrap_or(rect.x)
+    }
 }
+
+//
+//
+//
+// These data structures are allocating a lot and this is really bad, and they all need to a @Cleanup.
+//
+//
+//
 
 #[derive(Clone, Default)]
 pub struct CompletionState {
     pub active:          bool,
-    pub prefix:          Box<str>,
-    pub prefix_start:    usize,  // Char index where prefix starts
+
     pub items:           Vec<CompletionItem>,
-    pub selected:        usize,
+
+    pub prefix_start_char_index: u32,
+    pub selected_index:          u32,
+
+    pub scroll_offset:           u32,      // First visible item
+
     pub ghost_text:      Option<Box<str>>, // Suffix to display after cursor
+
+    pub prefix:          SmallString<[u8; 32]>,
+}
+
+impl CompletionState {
+    pub fn clamp_scroll(&mut self, max_visible: usize) {
+        let s = self.selected_index as usize;
+        let o = self.scroll_offset as usize;
+        if s < o {
+            self.scroll_offset = s as u32;
+        } else if s >= o + max_visible {
+            self.scroll_offset = (s - max_visible + 1) as u32;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct CompletionItem {
     pub name:   Atom,
-    pub detail: Box<str>,
-    pub kind:   CompletionItemKind,
+    pub detail: ArrayString<32>,
     pub score:  u32,
-}
-
-#[derive(Debug, Copy, Clone)]
-pub enum CompletionItemKind {
-    Function,
-    Struct,
-    Enum,
-    EnumVariant,
-    Trait,
-    TypeAlias,
-    Const,
-    Static,
-    Mod,
-    Local
-}
-
-impl From<SymbolKind> for CompletionItemKind {
-    fn from(k: SymbolKind) -> Self {
-        match k {
-            SymbolKind::Struct      => CompletionItemKind::Struct,
-            SymbolKind::Enum        => CompletionItemKind::Enum,
-            SymbolKind::EnumVariant => CompletionItemKind::EnumVariant,
-            SymbolKind::Trait       => CompletionItemKind::Trait,
-            SymbolKind::TypeAlias   => CompletionItemKind::TypeAlias,
-            SymbolKind::Const       => CompletionItemKind::Const,
-            SymbolKind::Static      => CompletionItemKind::Static,
-            SymbolKind::Mod         => CompletionItemKind::Mod,
-            SymbolKind::Local       => CompletionItemKind::Local,
-        }
-    }
 }
 
 pub struct FlyingCursor {
@@ -3061,7 +3108,7 @@ impl Editor {
     #[inline]
     pub fn command_finish(&mut self, dont_reset_blink: bool) {
         adjust_cursors_after_buffer_mutation(self);
-        scroll_to_cursor(self);
+        scroll_to_cursor_follow_x(self);
 
         if !dont_reset_blink {
             self.reset_blink();
@@ -3143,6 +3190,7 @@ impl Editor {
                         let edit_base = buf_gen.saturating_sub(edits.len() as u64);
                         let to_skip   = tree_gen.saturating_sub(edit_base) as usize;
                         let to_apply  = &edits[to_skip.min(edits.len())..];
+                        assert!(to_apply.len() == edits.len()); // @WTF?
 
                         for &edit in to_apply {
                             tree_mut.edit(&edit_to_ts(edit));
@@ -3152,15 +3200,26 @@ impl Editor {
                         // Bump the tree's generation to match what we've applied
                         //
                         tree_mut.buffer_last_edit_generation = buf_gen;
-                    }
 
-                    self.tree_sitter.send_reparse(buffer_id, tree.clone(), buf_gen);
+                        let old_tree = tree_mut.tree.clone();
+                        self.tree_sitter.send_reparse(buffer_id, tree.clone(), old_tree, buf_gen);
+                    } else {
+                        // ...?
+                    }
                 }
             }
 
             let (view, buf) = self.active_view_and_buffer_mut();
 
             let has_cursor_moved = char_index as u32 != last_pos;
+
+            if has_cursor_moved && buf.ts_edits_in_this_frame.is_empty() {
+                view.typed_since_last_move = false;
+            }
+            if !buf.ts_edits_in_this_frame.is_empty() {
+                view.typed_since_last_move = true;
+            }
+
             let needs_cursor_query = !buf.ts_edits_in_this_frame.is_empty() || has_cursor_moved;
 
             for edit in &buf.ts_edits_in_this_frame {
@@ -3197,8 +3256,8 @@ impl Editor {
                 let (view, buf) = self.active_view_and_buffer_mut();
                 if view.completion.active {
                     let (start, current_prefix) = extract_prefix_at_cursor(buf, view.cursor.char_index);
-                    if start != view.completion.prefix_start
-                    || !current_prefix.starts_with(view.completion.prefix.as_ref())
+                    if start != view.completion.prefix_start_char_index
+                    || !current_prefix.starts_with(view.completion.prefix.as_str())
                     {
                         view.completion = CompletionState::default();
                         redraw |= true;
@@ -3218,6 +3277,7 @@ impl Editor {
                         &self.tree_sitter.symbol_table,
                         &self.tree_sitter.func_table,
                         &self.tree_sitter.atom_table,
+                        &self.tree_sitter.word_tables,
                     );
                 }
             }
@@ -3245,9 +3305,10 @@ impl Editor {
         // @Cleanup :TreeSitter
         while let Ok(result) = self.tree_sitter.result.try_recv() {
             let buffer_stem = self.buffers[result.buffer_id].filestem_atom;
-            if let ParseResultKind::SymbolsUpdate { functions, symbols } = result.kind {
+            if let ParseResultKind::SymbolsUpdate { functions, symbols, words } = result.kind {
                 self.tree_sitter.func_table.replace_buffer_batch(result.buffer_id, buffer_stem, functions);
                 self.tree_sitter.symbol_table.replace_buffer(result.buffer_id, symbols);
+                self.tree_sitter.word_tables.insert(result.buffer_id, words);
 
                 continue;
             }
@@ -3393,8 +3454,6 @@ impl Editor {
     /// For now: root can either be a Leaf (single view) or a Split
     /// (exactly two children, both Leaf).  N+2 panels max.
     pub fn layout_panels(&mut self) {
-        println!("===== (((( LAYOUT ))))) =======================================");
-
         let win_rect = Rect::full(self.win_w, self.win_h);
         self.layout_panel(self.root_panel, win_rect);
         if let Some(layout_panels_hook) = self.hooks.layout_panels {
@@ -3662,7 +3721,7 @@ impl Editor {
     }
 
     #[inline] pub fn line_h(&self)    -> f32 { scale_base_line_height(self.scale) }
-    #[inline] pub fn cursor_radius(&self) -> f32 { self.scale*5.0 }
+    #[inline] pub fn cursor_radius(&self) -> f32 { self.scale*4.2 }
     #[inline] pub fn font_size(&self) -> f32 { scale_base_font_size(self.scale) }
     #[inline] pub fn panel_bar_border_thickness(&self) -> f32 { scale_base_panel_bar_border_thickness(self.scale) }
     #[inline] pub fn panel_bar_h(&self) -> f32 { self.line_h() + self.cursor_h() + self.scale * 3.5 }
@@ -3680,7 +3739,8 @@ impl Editor {
         let mut leaves = Default::default();
         collect_leaves(self, self.root_panel, &mut leaves);
 
-        for (panel_id, ..) in leaves {
+        // Last panel in the list is drawn on top, so iterate in reverse
+        for (panel_id, ..) in leaves.into_iter().rev() {
             if self.panels[panel_id].rect.contains(px, py) {
                 return Some(panel_id)
             }
@@ -4275,7 +4335,8 @@ pub fn rescale(editor: &mut Editor, new_scale: f32) {
     if new != editor.scale {
         apply_scale(editor, new, None);
         editor.layout_panels();
-        force_layouts_from_all_views_to_rebuild(editor);
+        scroll_to_cursor_follow_x(editor);
+        force_layouts_from_all_views_to_rebuild(editor);   // @Redundant?
     }
 }
 
@@ -4397,19 +4458,22 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
 
+                view.set_unactive_cursor_position_to_normal_cursor_position();
+
                 let mut adjusted = false;
-
-                // Clamp the primary cursor index
-                if view.cursor.char_index > max_len {
-                    view.cursor.char_index = max_len;
-                    adjusted = true;
-                }
-
-                // Clamp the anchor index if it exists
-                if let Some(a) = view.cursor.anchor_char_index {
-                    if a > max_len {
-                        view.cursor.anchor_char_index = Some(max_len);
+                for vc in [&mut view.normal_cursor] {
+                    // Clamp the primary cursor index
+                    if vc.cursor.char_index > max_len {
+                        vc.cursor.char_index = max_len;
                         adjusted = true;
+                    }
+
+                    // Clamp the anchor index if it exists
+                    if let Some(a) = vc.cursor.anchor_char_index {
+                        if a > max_len {
+                            vc.cursor.anchor_char_index = Some(max_len);
+                            adjusted = true;
+                        }
                     }
                 }
 
@@ -4428,15 +4492,24 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
         if let Some((at, len)) = buffer.last_insert.take() {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
-                if vid == active_view_id       { continue }
 
-                if view.cursor.char_index > at {
-                    view.cursor.char_index += len as usize;
-                    adjusted_views.push(vid);
+                // Normal cursor: skip active view
+                if vid != active_view_id {
+                    if view.normal_cursor.cursor.char_index > at {
+                        view.normal_cursor.cursor.char_index += len as usize;
+                        adjusted_views.push(vid);
+                    }
+                    if let Some(a) = view.normal_cursor.cursor.anchor_char_index {
+                        if a > at { view.normal_cursor.cursor.anchor_char_index = Some(a + len as usize); }
+                    }
                 }
 
-                if let Some(a) = view.cursor.anchor_char_index {
-                    if a > at { view.cursor.anchor_char_index = Some(a + len as usize); }
+                // Ghost cursor: always adjust
+                if view.ghost_cursor.cursor.char_index > at {
+                    view.ghost_cursor.cursor.char_index += len as usize;
+                }
+                if let Some(a) = view.ghost_cursor.cursor.anchor_char_index {
+                    if a > at { view.ghost_cursor.cursor.anchor_char_index = Some(a + len as usize); }
                 }
             }
         }
@@ -4444,15 +4517,23 @@ pub fn adjust_cursors_after_buffer_mutation(editor: &mut Editor) {
         if let Some((at, len)) = buffer.last_delete.take() {
             for (vid, view) in editor.views.iter_mut() {
                 if view.buffer_id != buffer_id { continue }
-                if vid == active_view_id       { continue }
 
-                if view.cursor.char_index > at {
-                    view.cursor.char_index = view.cursor.char_index.saturating_sub(len as usize).max(at);
-                    adjusted_views.push(vid);
+                if vid != active_view_id {
+                    if view.normal_cursor.cursor.char_index > at {
+                        view.normal_cursor.cursor.char_index = view.normal_cursor.cursor.char_index.saturating_sub(len as usize).max(at);
+                        adjusted_views.push(vid);
+                    }
+                    if let Some(a) = view.normal_cursor.cursor.anchor_char_index {
+                        if a > at { view.normal_cursor.cursor.anchor_char_index = Some(a.saturating_sub(len as usize).max(at)); }
+                    }
                 }
 
-                if let Some(a) = view.cursor.anchor_char_index {
-                    if a > at { view.cursor.anchor_char_index = Some(a.saturating_sub(len as usize).max(at)); }
+                // Ghost cursor: always adjust
+                if view.ghost_cursor.cursor.char_index > at {
+                    view.ghost_cursor.cursor.char_index = view.ghost_cursor.cursor.char_index.saturating_sub(len as usize).max(at);
+                }
+                if let Some(a) = view.ghost_cursor.cursor.anchor_char_index {
+                    if a > at { view.ghost_cursor.cursor.anchor_char_index = Some(a.saturating_sub(len as usize).max(at)); }
                 }
             }
         }
@@ -4491,6 +4572,36 @@ pub fn snap_cursor_to_target_point_in_active_view(editor: &mut Editor) {
     editor.snap_cursor_to_target(view_id, line, col, rect);
 }
 
+pub fn scroll_to_cursor_follow_x(editor: &mut Editor) {
+    let view_id  = editor.active_view_id();
+    let panel_id = editor.active_panel;
+    let rect     = editor.panels[panel_id].rect;
+
+    let line_h   = editor.line_h();
+
+    let view     = &mut editor.views[view_id];
+    let buf      = &editor.buffers[view.buffer_id];
+
+    let (line, col) = buf.cursor_line_col(&view.cursor);
+    let cursor_x = view.cursor_x(line, col, rect);
+
+    view.scroll_to_cursor_v(line, line_h, rect);
+
+    // @Cutnpaste from scroll_to_cursor_h
+    //
+    // Always follow cursor x with no dead zone
+    //
+    let margin    = 25.0*editor.scale;
+    let screen_x  = cursor_x - view.scroll_x;
+    view.scroll_x = if screen_x < rect.x + margin {
+        (cursor_x - rect.x - margin).max(0.0)
+    } else if screen_x > rect.x + rect.w - margin {
+        cursor_x - rect.x - rect.w + margin
+    } else {
+        view.scroll_x
+    };
+}
+
 pub fn scroll_to_cursor(editor: &mut Editor) {
     let view_id  = editor.active_view_id();
     let panel_id = editor.active_panel;
@@ -4513,13 +4624,11 @@ pub fn scroll_to_cursor_in_impl(editor: &mut Editor, view_id: ViewId, panel_id: 
     let buf = &mut editor.buffers[view.buffer_id];
     let (line, col) = buf.cursor_line_col(&view.cursor);
 
-    let cursor_x = view.layout.as_ref()
-        .and_then(|l| l.cursor_x_content(line, col))
-        .unwrap_or(rect.x);
+    let cursor_x = view.cursor_x(line, col, rect);
 
     let view = &mut editor.views[view_id];
     if centered {
-        view.scroll_to_cursor_centered(line, line_h, rect);
+        view.scroll_to_cursor_centered(line, line_h, cursor_x, rect);
     } else {
         view.scroll_to_cursor(line, line_h, cursor_x, rect);
     }
@@ -4665,6 +4774,7 @@ pub fn update_ghost_text_from_keystroke(
     symbol_table:  &SymbolTable,
     func_table: &FunctionTable,
     atom_table: &AtomTable,
+    word_tables: &WordTables,
 ) {
     if view.completion.active {
         return;  // Dropdown takes priority
@@ -4679,6 +4789,7 @@ pub fn update_ghost_text_from_keystroke(
         symbol_table,
         func_table,
         atom_table,
+        word_tables,
         view.buffer_id,
         cursor_byte as _,
         tree,
@@ -4689,120 +4800,133 @@ pub fn update_ghost_text_from_keystroke(
     if items.is_empty() { view.completion.ghost_text = None; return; }
 
     let name_str = atom_table.lookup_ref(items[0].name);
-    view.completion.ghost_text = if items.len() == 1 && name_str.as_ref() != prefix {
+    view.completion.ghost_text = if items.len() == 1 && name_str.as_ref() != prefix.as_str() {
         Some(name_str.as_ref()[prefix.len()..].into())
     } else {
         None
     };
-    view.completion.prefix_start = start;
+    view.completion.prefix_start_char_index = start;
     view.completion.prefix = prefix.into();
 }
 
-pub fn render_completion_dropdown(gpu: &mut Gpu, editor: &Editor, view_id: ViewId) { // @PaletteRefactor @Cleanup
-    let view   = &editor.views[view_id];
-    let buf    = &editor.buffers[view.buffer_id];
-    let comp   = &view.completion;
+//
+//
+// @PaletteRefactor
+//
+//
 
-    if !comp.active || comp.items.is_empty() { return; }
+fn completion_dropdown_background_rect(gpu: &mut Gpu, editor: &Editor, view_id: ViewId) -> Option<(f32, f32, f32, f32, f32)> {
+    let view = &editor.views[view_id];
+    let buf  = &editor.buffers[view.buffer_id];
+    let comp = &view.completion;
+    if !comp.active || comp.items.is_empty() { return None; }
 
-    let font_size    = editor.font_size();
-    let line_h       = editor.line_h();
-    let scale        = editor.scale;
-    let pad_x        = 8.0 * scale;
-    let pad_y        = 3.0 * scale;
-    let item_h       = (font_size + pad_y * 2.0).round();
-    let detail_font  = font_size * 0.80;
-    let max_items    = 8usize;
-    let visible      = comp.items.len().min(max_items);
-    let sep          = scale.max(1.0);
-    let p            = palette();
+    let font_size        = editor.font_size();
+    let line_h           = editor.line_h();
+    let scale            = editor.scale;
+    let pad_x            = 8.0 * scale;
+    let pad_y            = 3.0 * scale;
+    let item_h           = (font_size + pad_y * 2.0).round();
+    let max_items        = 8usize;
+    let visible          = comp.items.len().min(max_items);
+    let max_detail_col_w = 120.0 * scale;
 
-    // Measure widest name + detail to size the panel
     let mut max_name_w   = 0.0f32;
-    let mut max_detail_w = 0.0f32;
-    for item in comp.items.iter().take(visible) { // @Speed
-        max_name_w   = max_name_w.max(gpu::measure_text(gpu, &editor.tree_sitter.atom_table.lookup_ref(item.name),   font_size));
-        max_detail_w = max_detail_w.max(gpu::measure_text(gpu, &item.detail, detail_font));
+    for item in comp.items.iter().take(visible) {
+        max_name_w = max_name_w.max(gpu::measure_text(gpu, &editor.tree_sitter.atom_table.lookup_ref(item.name), font_size));
     }
-    let max_detail_col_w = 120.0 * scale;  // Fixed cap for detail column
-    let name_col_w       = (max_name_w + font_size * 0.7 + pad_x * 2.0).min(200.0 * scale);
-    let panel_w          = (name_col_w + max_detail_col_w + pad_x)
-        .ceil()
-        .min(gpu.win_w * 0.35);  // Never wider than 35% of screen @Tune
-    let panel_h = (item_h * visible as f32 + sep).ceil();
+    let name_col_w = (max_name_w + font_size * 0.7 + pad_x * 2.0).min(200.0 * scale);
+    let panel_w    = (name_col_w + max_detail_col_w + pad_x).ceil().min(gpu.win_w * 0.35);
+    let panel_h    = (item_h * visible as f32).ceil();
 
-    // Anchor to cursor position
-    let layout = match &editor.views[view_id].layout {
-        Some(l) => l,
-        None    => return,
-    };
+    let layout = editor.views[view_id].layout.as_ref()?;
     let (cursor_line, cursor_col) = buf.cursor_line_col(&view.cursor);
-    let Some(ll) = layout.line_for_buffer_line(cursor_line) else { return };
+    let ll = layout.line_for_buffer_line(cursor_line)?;
 
-    let padding_left = padding_left(layout.should_pad_left_when_rendering);
-    let origin_x = layout.rect.x + padding_left - view.scroll_anim_x;
+    let padding_left     = padding_left(layout.should_pad_left_when_rendering);
+    let origin_x         = layout.rect.x + padding_left - view.scroll_anim_x;
+    let first_buf_line   = (view.scroll_anim.round() / line_h).floor() as u32;
+    let cursor_x         = ll.x_for_col(origin_x, cursor_col, &layout.glyphs);
+    let cursor_y         = layout.rect.y + (cursor_line as f32 - first_buf_line as f32) * line_h;
 
-    let first_buffer_line = (view.scroll_anim.round() / line_h).floor() as u32;
-    let cursor_x = ll.x_for_col(origin_x, cursor_col, &layout.glyphs);
-    let cursor_y = layout.rect.y
-        + (cursor_line as f32 - first_buffer_line as f32) * line_h;
-
-    // Position below cursor, flip up if too close to bottom
     let mut px = cursor_x;
     let mut py = cursor_y + line_h + 2.0 * scale;
-    if py + panel_h > gpu.win_h - 8.0 * scale {
-        py = cursor_y - panel_h - 2.0 * scale;
-    }
-    if px + panel_w > gpu.win_w - 8.0 * scale {
-        px = gpu.win_w - panel_w - 8.0 * scale;
+    if py + panel_h > gpu.win_h - 8.0 * scale { py = cursor_y - panel_h - 2.0 * scale; }
+    if px + panel_w > gpu.win_w - 8.0 * scale { px = gpu.win_w - panel_w - 8.0 * scale; }
+
+    Some((px, py, panel_w, panel_h, item_h))
+}
+
+pub fn render_completion_dropdown_background(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
+    let comp = &editor.views[view_id].completion;
+    if !comp.active || comp.items.is_empty() { return; }
+    let Some((px, py, pw, ph, _)) = completion_dropdown_background_rect(gpu, editor, view_id) else { return };
+    gpu::draw_blur_rect(gpu, px, py, pw, ph, palette().lister_bg.with_alpha(0.35));
+    gpu::draw_rect_gradient_h(gpu, px, py, pw, ph,
+                              Color::rgba(80, 10, 10, 48),
+                              Color::rgba(40, 5, 5, 78),
+    );
+}
+
+pub fn render_completion_dropdown_foreground(gpu: &mut Gpu, editor: &mut Editor, view_id: ViewId) {
+    let view   = &editor.views[view_id];
+    let comp   = &view.completion;
+
+    if !comp.active || comp.items.is_empty() {
+        return;
     }
 
-    //
-    // Background
-    //
-    gpu::draw_rect(gpu, px, py, panel_w, panel_h, Color::rgba(13, 10, 6, 245));
-    gpu::draw_rect_outline(gpu, px, py, panel_w, panel_h, sep, p.lister_border);
+    let Some((px, py, panel_w, panel_h, item_h)) = completion_dropdown_background_rect(
+        gpu, editor, view_id
+    ) else { return };
 
-    //
-    //
-    // Items
-    //
-    //
+    let font_size        = editor.font_size();
+    let scale            = editor.scale;
+    let pad_x            = 8.0 * scale;
+    let detail_font      = font_size * 0.80;
+    let sep              = scale.max(1.0);
+    let p                = palette();
 
     gpu::push_clip(gpu, px, py, panel_w, panel_h);
-    for (slot, item) in comp.items.iter().take(visible).enumerate() {
+
+    let max_items = 8usize;
+    let visible   = comp.items.len().min(max_items);
+    let offset    = comp.scroll_offset as usize;
+
+    for (slot, item) in comp.items.iter().skip(offset).take(visible).enumerate() {
         let iy          = py + slot as f32 * item_h;
-        let is_selected = slot == comp.selected;
+        let is_selected = slot + offset == comp.selected_index as usize;
+
+        let name     = editor.tree_sitter.atom_table.lookup_ref(item.name);
+        let name_w        = gpu::measure_text(gpu, &name, font_size);
+        let available_w   = panel_w - pad_x - name_w - pad_x - pad_x; // right pad + gap after name
+        let detail        = trim_detail(&item.detail, available_w.max(0.0), detail_font, gpu);
+        let detail_w      = gpu::measure_text(gpu, &detail, detail_font);
+        let detail_x      = (px + panel_w - pad_x - detail_w).max(px + pad_x + name_w + pad_x);
+
+        gpu::push_clip(gpu, px, iy, panel_w, item_h);
 
         if slot % 2 == 0 {
             gpu::draw_rect(gpu, px, iy, panel_w, item_h, Color::rgba(255, 255, 255, 4));
         }
 
         if is_selected {
-            gpu::draw_rect(gpu, px, iy, panel_w, item_h,
-                Color::rgba(60, 12, 14, 220));
-            gpu::draw_rect_gradient_h(gpu, px, iy, panel_w, item_h,
-                Color::rgba(220, 15, 25, 40),
-                Color::rgba(220, 15, 25, 0));
+            gpu::draw_rect(gpu, px, iy, panel_w, item_h, Color::rgba(60, 12, 14, 120));
+            gpu::draw_rect_gradient_h(
+                gpu, px + sep * 3.0, iy, panel_w - sep * 3.0 - sep, item_h,
+                Color::rgba(220, 15, 25, 80),
+                Color::rgba(220, 15, 25, 0)
+            );
             gpu::draw_rect(gpu, px, iy, sep * 3.0, item_h, p.lister_accent);
         }
 
         let ty = iy + item_h * 0.5 + font_size * 0.35;
 
         //
-        // Kind icon @Design?
-        //
-        let kind_color = kind_color(item.kind);
-        gpu::draw_rect(gpu, px + pad_x, iy + item_h * 0.5 - font_size * 0.35,
-            font_size * 0.55, font_size * 0.75, kind_color);
-
-        //
-        // Name
+        // Completion itself
         //
         gpu::draw_text(
-            gpu, &editor.tree_sitter.atom_table.lookup_ref(item.name),
-            px + pad_x + font_size * 0.7,
-            ty, font_size,
+            gpu, &name, px + pad_x, ty, font_size,
             if is_selected { Color::rgba(255, 200, 200, 255) }
             else           { Color::rgba(200, 190, 165, 220) }
         );
@@ -4810,40 +4934,36 @@ pub fn render_completion_dropdown(gpu: &mut Gpu, editor: &Editor, view_id: ViewI
         //
         // Detail
         //
-        let detail = trim_detail(&item.detail, max_detail_col_w - pad_x, detail_font, gpu);
-        let detail_w = gpu::measure_text(gpu, &detail, detail_font);
-        gpu::draw_text(
-            gpu, &item.detail,
-            px + panel_w - pad_x - detail_w,
-            ty, detail_font,
-            if is_selected { Color::rgba(180, 80, 85, 200) }
-            else           { Color::rgba(110, 95, 70, 150) }
-        );
+        if detail_x + detail_w <= px + panel_w - pad_x {
+            gpu::draw_text(
+                gpu, &detail, detail_x, ty, detail_font,
+                if is_selected { Color::rgba(180, 80, 85, 200) }
+                else           { Color::rgba(110, 95, 70, 150) }
+            );
+        }
+
+        gpu::pop_clip(gpu);
     }
+
     gpu::pop_clip(gpu);
 
-    // Scrollbar if more items than visible
-    if comp.items.len() > max_items {
-        let total_h  = comp.items.len() as f32 * item_h;
-        let thumb_h  = (panel_h * (panel_h / total_h)).max(sep * 4.0);
-        let thumb_y  = py + (comp.selected as f32 / comp.items.len() as f32) * (panel_h - thumb_h);
-        gpu::draw_rect(gpu, px + panel_w - sep * 3.0, py, sep * 3.0, panel_h, Color::rgba(200, 20, 30, 12));
-        gpu::draw_rect(gpu, px + panel_w - sep * 3.0, thumb_y, sep * 3.0, thumb_h, Color::rgba(180, 20, 30, 130));
-    }
-}
+    //
+    // Draw the borders
+    //
+    gpu::draw_rect_outline(gpu, px, py, panel_w, panel_h, sep, p.lister_border);
 
-const fn kind_color(kind: CompletionItemKind) -> Color {
-    match kind {
-        CompletionItemKind::Function    => Color::rgba(86,  156, 214, 200), // blue
-        CompletionItemKind::Struct      => Color::rgba(78,  201, 176, 200), // teal
-        CompletionItemKind::Enum        => Color::rgba(184, 215, 163, 200), // green
-        CompletionItemKind::EnumVariant => Color::rgba(150, 200, 140, 200),
-        CompletionItemKind::Trait       => Color::rgba(184, 160, 220, 200), // purple
-        CompletionItemKind::TypeAlias   => Color::rgba(78,  201, 176, 180),
-        CompletionItemKind::Const       => Color::rgba(220, 220, 170, 200), // yellow
-        CompletionItemKind::Static      => Color::rgba(200, 200, 150, 180),
-        CompletionItemKind::Mod         => Color::rgba(200, 140, 80,  200), // orange
-        CompletionItemKind::Local => Color::rgba(156, 220, 254, 200), // light blue
+    //
+    //
+    // Scrollbar
+    //
+    //
+    if comp.items.len() > max_items {
+        let total_items = comp.items.len() as f32;
+        let track_h     = panel_h;
+        let thumb_h     = (track_h * (max_items as f32 / total_items)).max(sep * 4.0);
+        let thumb_y     = py + (comp.scroll_offset as f32 / (total_items - max_items as f32).max(1.0)) * (track_h - thumb_h);
+        gpu::draw_rect(gpu, px + panel_w - sep * 3.0, py,      sep * 3.0, track_h, Color::rgba(200, 20, 30, 12));
+        gpu::draw_rect(gpu, px + panel_w - sep * 3.0, thumb_y, sep * 3.0, thumb_h, Color::rgba(180, 20, 30, 130));
     }
 }
 

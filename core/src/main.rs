@@ -646,6 +646,7 @@ fn run(mut app: App) {
         //
         // Render
         //
+
         if should_redraw {
             let now = Instant::now();
             let dt = now.duration_since(app.editor.last_frame_time).as_secs_f32().min(0.05);
@@ -911,7 +912,16 @@ fn render_frame(editor: &mut Editor, gpu: &mut Gpu, command_table: &mut CommandT
         gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
         {
             render_text_layout(editor, gpu, view_id, show_cursor);
-            render_completion_dropdown(gpu, editor, view_id);
+        }
+        gpu::pop_clip(gpu);
+
+        render_completion_dropdown_background(gpu, editor, view_id);
+
+        gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+        {
+            gpu::push_overlay_mode(gpu);
+            render_completion_dropdown_foreground(gpu, editor, view_id);
+            gpu::pop_overlay_mode(gpu);
         }
         gpu::pop_clip(gpu);
 

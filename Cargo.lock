@@ -519,6 +519,7 @@ name = "editor"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "arrayvec",
  "ash",
  "ash-window",
  "bitflags 2.11.1",

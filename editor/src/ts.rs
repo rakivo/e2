@@ -1,18 +1,20 @@
 use crate::buffer::{Buffer, e2_Point, e2_InputEdit};
-use crate::{BufferId, CompletionItem, CompletionItemKind};
+use crate::{BufferId, CompletionItem};
 use crate::atum::{Atom, AtomTable};
 
-use std::borrow::Cow;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::thread;
 use std::fmt::Write;
 
+use arrayvec::ArrayString;
 use cranelift_entity::PrimaryMap;
 use crossbeam_channel::{Receiver, Sender};
 use dashmap::DashMap;
+use editor_helpers::tprint;
 use piece_tree::PieceTree;
 use rustc_hash::FxHashMap;
 use smallstr::SmallString;
@@ -48,6 +50,7 @@ pub enum ParserMessage {
     Reparse {
         buffer_id: BufferId,
         tree: PieceTree,
+        old_tree: Tree,
         buffer_last_edit_generation: u64,
     },
 }
@@ -64,6 +67,7 @@ pub enum ParseResultKind {
     SymbolsUpdate {
         functions: Vec<FunctionInfo>,
         symbols: Vec<RawSymbol>,
+        words: WordTable,
     },
 
     FuncCallOverlayUpdate {
@@ -118,6 +122,8 @@ impl DerefMut for VersionedTree {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.tree }
 }
 
+pub type WordTables = HashMap<BufferId, WordTable, nohash_hasher::BuildNoHashHasher<BufferId>>;
+
 pub struct TreeSitter {
     pub message_tx: Sender<ParserMessage>,
     pub query_tx:   Sender<ParserQuery>,
@@ -129,7 +135,8 @@ pub struct TreeSitter {
     pub trees:      Arc<DashMap<BufferId, VersionedTree>>,
 
     pub func_table: FunctionTable,
-    pub symbol_table: SymbolTable
+    pub symbol_table: SymbolTable,
+    pub word_tables: WordTables,
 }
 
 impl TreeSitter {
@@ -152,8 +159,8 @@ impl TreeSitter {
     }
 
     #[inline]
-    pub fn send_reparse(&self, buffer_id: BufferId, tree: PieceTree, buffer_last_edit_generation: u64) {
-        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, tree, buffer_last_edit_generation });
+    pub fn send_reparse(&self, buffer_id: BufferId, tree: PieceTree, old_tree: Tree, buffer_last_edit_generation: u64) {
+        _ = self.message_tx.send(ParserMessage::Reparse { buffer_id, tree, old_tree, buffer_last_edit_generation });
     }
 
     #[inline]
@@ -187,7 +194,8 @@ pub fn spawn() -> TreeSitter {
 
     TreeSitter {
         message_tx, result, query_tx, atom_table, trees,
-        func_table: Default::default(), symbol_table: SymbolTable::new()
+        func_table: Default::default(), symbol_table: SymbolTable::new(),
+        word_tables: Default::default()
     }
 }
 
@@ -217,14 +225,8 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
             },
 
             recv(edit_rx) -> msg => match msg {
-                Ok(ParserMessage::Reparse { buffer_id, tree, buffer_last_edit_generation }) => {
-                    //
-                    // Snapshot the old tree for the incremental parse hint,
-                    // clone it immediately so we hold the lock for the minimum time.
-                    //
-                    let old_tree = trees.get(&buffer_id).map(|e| e.tree.clone());
-
-                    let mut parser  = Parser::new();
+                Ok(ParserMessage::Reparse { buffer_id, tree, old_tree, buffer_last_edit_generation }) => {
+                    let mut parser = Parser::new();
 
                     parser.set_language(&tree_sitter_rust::LANGUAGE.into()).expect("failed to load Rust grammar");
 
@@ -235,7 +237,7 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     let mut callback = |byte: usize, _point: Point| chunk_callback(&tree, byte);
                     let Some(new_tree) = parser.parse_with_options(
                         &mut callback,
-                        old_tree.as_ref(),
+                        Some(&old_tree),
                         None,
                     ) else {
                         continue
@@ -247,6 +249,7 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                     let root_node = new_tree.root_node();
                     let functions = collect_functions(root_node, &tree, buffer_id, &atom_table);
                     let symbols   = collect_symbols(root_node, &tree, buffer_id, &atom_table);
+                    let words = WordTable::build(root_node, &tree, &atom_table);
 
                     //
                     // Atomically decide whether to commit,
@@ -275,16 +278,16 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
                         }
                     };
 
-                    if !committed { continue; }
+                    if !committed { continue }
 
-                    if functions.is_empty() && symbols.is_empty() { continue; }
+                    if functions.is_empty() && symbols.is_empty() && words.is_empty() { continue }
 
                     //
                     // Only send results if we actually committed
                     //
                     _ = result_tx.send(ParseResult {
                         buffer_id,
-                        kind: ParseResultKind::SymbolsUpdate { functions, symbols },
+                        kind: ParseResultKind::SymbolsUpdate { functions, symbols, words },
                     });
                 }
 
@@ -305,11 +308,19 @@ fn bg_thread(query_rx: Receiver<ParserQuery>, edit_rx: Receiver<ParserMessage>, 
 
                     let functions = collect_functions(root_node, &piece_tree, buffer_id, &atom_table);
                     let symbols   = collect_symbols(root_node, &piece_tree, buffer_id, &atom_table);
-                    if functions.is_empty() && symbols.is_empty() { continue; }
+                    let words     = WordTable::build(root_node, &piece_tree, &atom_table);
+
+                    println!(
+                        "[Collected {} functions, {} symbols and {} words from [{}] buffer]",
+                        functions.len(), symbols.len(), words.len(),
+                        buffer_id.0
+                    );
+
+                    if functions.is_empty() && symbols.is_empty() && words.is_empty() { continue }
 
                     _ = result_tx.send(ParseResult {
                         buffer_id,
-                        kind: ParseResultKind::SymbolsUpdate { functions, symbols }
+                        kind: ParseResultKind::SymbolsUpdate { functions, symbols, words }
                     });
                 }
 
@@ -603,8 +614,134 @@ fn tree_slice_to_atom(source: &PieceTree, start_byte: usize, end_byte: usize, ta
 }
 
 /// Helper that slices the tree and interns the resulting string immediately.
-fn tree_slice_to_string<'a>(source: &'a PieceTree, start_byte: usize, end_byte: usize) -> Cow<'a, str> {
-    source.slice(start_byte as u32..end_byte as u32).to_string().into()
+fn tree_slice_to_string<'a>(source: &'a PieceTree, start_byte: usize, end_byte: usize) -> SmallString<[u8; 128]> {
+    let slice = source.slice(start_byte as u32..end_byte as u32);
+    let mut flat = SmallString::with_capacity(slice.len_bytes() as usize);
+    _ = write!(&mut flat, "{}", slice);
+    flat
+}
+
+pub struct WordTable {
+    strings:    String,           // slab
+    starts:     Vec<u32>,         // into strings
+    lens:       Vec<u16>,
+    atoms:      Vec<Atom>,
+    sorted_index: Vec<u32>,         // indices sorted by string value for binary search
+}
+
+impl WordTable {
+    pub fn build(root: Node, source: &PieceTree, atom_table: &AtomTable) -> Self {
+        let mut strings = String::new();
+        let mut starts  = Vec::new();
+        let mut lens    = Vec::new();
+        let mut atoms   = Vec::new();
+
+        let mut scratch = String::new();
+
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "identifier" | "type_identifier" | "field_identifier" => {
+                    let s     = node.start_byte() as u32;
+                    let e     = node.end_byte() as u32;
+                    let slice = source.slice(s..e);
+
+                    let start = strings.len() as u32;
+                    let len_before = strings.len();
+                    _ = write!(&mut strings, "{slice}");
+                    let len = (strings.len() - len_before) as u16;
+                    let atom = atom_table.intern(&strings[start as usize..start as usize + len as usize]);
+
+                    starts.push(start);
+                    lens.push(len);
+                    atoms.push(atom);
+                }
+
+                "line_comment" | "block_comment" => {
+                    let s     = node.start_byte() as u32;
+                    let e     = node.end_byte() as u32;
+                    let slice = source.slice(s..e);
+
+                    tprint!(&mut scratch, "{slice}");       // @Memory
+
+                    let bytes = scratch.as_bytes();
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
+                            let word_start = i;
+                            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                                i += 1;
+                            }
+
+                            let word = &scratch[word_start..i];
+                            if word.len() >= 3 {
+                                let start = strings.len() as u32;
+                                strings.push_str(word);
+                                let len = (i - word_start) as u16;
+                                let atom = atom_table.intern(&strings[start as usize..start as usize + len as usize]);
+                                starts.push(start);
+                                lens.push(len);
+                                atoms.push(atom);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+
+                _ => {
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+
+        let mut sorted_index = (0..starts.len() as u32).collect::<Vec<_>>();
+        sorted_index.sort_unstable_by(|&a, &b| {
+            Self::get_str_raw(&strings, &starts, &lens, a)
+                .cmp(Self::get_str_raw(&strings, &starts, &lens, b))
+        });
+        sorted_index.dedup_by(|&mut a, &mut b| {
+            Self::get_str_raw(&strings, &starts, &lens, a) ==
+                Self::get_str_raw(&strings, &starts, &lens, b)
+        });
+
+        Self { strings, starts, lens, atoms, sorted_index }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.sorted_index.is_empty() }
+
+    #[inline]
+    pub fn len(&self) -> usize { self.sorted_index.len() }
+
+    #[inline]
+    fn get_str_raw<'a>(strings: &'a str, starts: &[u32], lens: &[u16], i: u32) -> &'a str {
+        let s = starts[i as usize] as usize;
+        &strings[s..s + lens[i as usize] as usize]
+    }
+
+    #[inline]
+    fn get_str(&self, i: u32) -> &str {
+        Self::get_str_raw(&self.strings, &self.starts, &self.lens, i)
+    }
+
+    #[inline]
+    pub fn query_prefix<'a>(&'a self, prefix: &str) -> impl Iterator<Item = Atom> + 'a {
+        let lo = self.sorted_index.partition_point(|&i| self.get_str(i) < prefix);
+        let hi = match prefix.as_bytes().last() {
+            None => self.sorted_index.len(),
+            Some(&b) => {
+                let mut end = prefix.to_owned();
+                end.pop();
+                end.push((b + 1) as char);
+                self.sorted_index.partition_point(|&i| self.get_str(i) < end.as_str())
+            }
+        };
+        self.sorted_index[lo..hi].iter().map(move |&i| self.atoms[i as usize])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,7 +778,6 @@ pub struct SymbolTable {
     pub names:        Vec<Atom>,
     pub detail_start: Vec<u32>,
     pub detail_len:   Vec<u16>,
-    pub kind:         Vec<SymbolKind>,
     pub buffer_id:    Vec<BufferId>,
     pub range_start:  Vec<u32>,
     pub range_end:    Vec<u32>,
@@ -658,7 +794,6 @@ impl SymbolTable {
             strings:      String::new(),
             detail_start: Vec::new(),
             detail_len:   Vec::new(),
-            kind:         Vec::new(),
             buffer_id:    Vec::new(),
             range_start:  Vec::new(),
             range_end:    Vec::new(),
@@ -670,7 +805,7 @@ impl SymbolTable {
         }
     }
 
-    pub fn len(&self) -> usize { self.kind.len() }
+    pub fn len(&self) -> usize { self.detail_len.len() }
 
     pub fn name(&self, i: usize) -> Atom {
         self.names[i]
@@ -687,26 +822,25 @@ impl SymbolTable {
 
     fn push_symbol(
         &mut self,
-        name: Atom, detail: &str, kind: SymbolKind,
+        name: Atom, detail: &str,
         buffer_id: BufferId, start: u32, end: u32,
     ) -> u32 {
         let ds = self.strings.len() as u32;
         self.strings.push_str(detail);
 
-        let idx = self.kind.len() as u32;
+        let index = self.detail_len.len() as u32;
         self.detail_start.push(ds);
         self.detail_len.push(detail.len() as u16);
         self.names.push(name);
-        self.kind.push(kind);
         self.buffer_id.push(buffer_id);
         self.range_start.push(start);
         self.range_end.push(end);
         self.generation.push(self.global_gen);
 
-        self.by_name.entry(name).or_default().push(idx);
-        self.by_buffer.entry(buffer_id).or_default().push(idx);
+        self.by_name.entry(name).or_default().push(index);
+        self.by_buffer.entry(buffer_id).or_default().push(index);
 
-        idx
+        index
     }
 
     pub fn remove_buffer(&mut self, buffer_id: BufferId) {
@@ -728,7 +862,7 @@ impl SymbolTable {
     ) {
         self.remove_buffer(buffer_id);
         for s in new_symbols {
-            self.push_symbol(s.name, &s.detail, s.kind, buffer_id, s.range_start, s.range_end);
+            self.push_symbol(s.name, &s.detail, buffer_id, s.range_start, s.range_end);
         }
     }
 
@@ -745,10 +879,32 @@ impl SymbolTable {
 // Intermediate type used by bg thread before inserting into table
 pub struct RawSymbol {
     pub name:        Atom,
-    pub detail:      String,
+    pub detail:      ArrayString<64>,
     pub kind:        SymbolKind,
     pub range_start: u32,
     pub range_end:   u32,
+}
+
+pub fn maybe_truncate_to_array_string<const N: usize>(s: &str) -> ArrayString<N> {
+    const ELLIPSIS: &str = "…"; // 3 bytes UTF-8
+
+    if s.len() <= N {
+        // fits as-is
+        let mut out = ArrayString::new();
+        out.push_str(s);  // can't fail
+        return out;
+    }
+
+    let mut out = ArrayString::new();
+    let limit = N.saturating_sub(ELLIPSIS.len());
+    // walk back to a char boundary
+    let mut end = limit;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&s[..end]);
+    out.push_str(ELLIPSIS);
+    out
 }
 
 pub fn collect_symbols(root: Node, source: &PieceTree, _buffer_id: BufferId, atom_table: &AtomTable) -> Vec<RawSymbol> {
@@ -763,7 +919,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
                     name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
-                    detail:      "struct".into(),
+                    detail:      maybe_truncate_to_array_string("struct"),
                     kind:        SymbolKind::Struct,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -776,7 +932,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
                 let enum_name = tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table);
                 out.push(RawSymbol {
                     name:        enum_name,
-                    detail:      "enum".into(),
+                    detail:      maybe_truncate_to_array_string("enum"),
                     kind:        SymbolKind::Enum,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -798,7 +954,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
                 let detail = parent_enum.map_or("variant".into(), |e| format!("{}::", atom_table.lookup_ref(e).as_ref()));
                 out.push(RawSymbol {
                     name:        variant_name,
-                    detail,
+                    detail:      maybe_truncate_to_array_string(&detail),
                     kind:        SymbolKind::EnumVariant,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -810,7 +966,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
                     name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
-                    detail:      "trait".into(),
+                    detail:      maybe_truncate_to_array_string("trait"),
                     kind:        SymbolKind::Trait,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -822,7 +978,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
                     name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
-                    detail:      "type".into(),
+                    detail:      maybe_truncate_to_array_string("type"),
                     kind:        SymbolKind::TypeAlias,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -837,7 +993,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
                     .unwrap_or_else(|| "const".into());
                 out.push(RawSymbol {
                     name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
-                    detail: detail.into(),
+                    detail:      maybe_truncate_to_array_string(&detail),
                     kind:        SymbolKind::Const,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -853,7 +1009,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
 
                 out.push(RawSymbol {
                     name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
-                    detail: detail.into(),
+                    detail:      maybe_truncate_to_array_string(&detail),
                     kind:        SymbolKind::Static,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -865,7 +1021,7 @@ fn collect_symbols_inner(node: Node, source: &PieceTree, out: &mut Vec<RawSymbol
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(RawSymbol {
                     name:        tree_slice_to_atom(source, name.start_byte(), name.end_byte(), atom_table),
-                    detail:      "mod".into(),
+                    detail:      maybe_truncate_to_array_string("mod"),
                     kind:        SymbolKind::Mod,
                     range_start: node.start_byte() as u32,
                     range_end:   node.end_byte() as u32,
@@ -1945,34 +2101,56 @@ where F: Fn(Node<'a>) -> bool {
 // jump_definition_prev / next
 //
 
-pub fn jump_definition_next(root: Node, cursor_byte: usize) -> Option<usize> {
-    let leaf = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+pub fn jump_definition_prev(root: Node, cursor_byte: usize) -> Option<usize> {
+    let current = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
 
-    // Start search from the node whose start is strictly after cursor
-    let start = if leaf.start_byte() > cursor_byte { leaf } else {
-        // Find first node that starts after cursor
-        let mut n = leaf;
-        loop {
-            match next_node(n) {
-                Some(next) if next.start_byte() > cursor_byte => { n = next; break; }
-                Some(next) => n = next,
-                None => return None,
-            }
+    //
+    // Find the enclosing top-level definition
+    //
+    let enclosing = find_enclosing(current, is_definition_node);
+
+    if let Some(enc) = enclosing {
+        //
+        // If cursor is already at the start, jump to previous definition's start
+        //
+        if cursor_byte <= enc.start_byte() {
+            return prev_named_matching(enc, is_definition_node).map(|n| n.start_byte());
         }
-        n
-    };
 
-    if is_definition_node(start) {
-        return Some(start.start_byte());
+        //
+        // Otherwise jump to start of enclosing definition
+        //
+        return Some(enc.start_byte());
     }
 
-    next_named_matching(start, is_definition_node).map(|n| n.start_byte())
+    //
+    // Not inside any definition,  jump to previous definition from here
+    //
+    let node_at = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+    prev_named_matching(node_at, is_definition_node).map(|n| n.start_byte())
 }
 
-pub fn jump_definition_prev(root: Node, cursor_byte: usize) -> Option<usize> {
-    let leaf = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
-    prev_named_matching(leaf, |n| is_definition_node(n) && n.start_byte() < cursor_byte)
-        .map(|n| n.start_byte())
+pub fn jump_definition_next(root: Node, cursor_byte: usize) -> Option<usize> {
+    let current = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+
+    let enclosing = find_enclosing(current, is_definition_node);
+
+    if let Some(enc) = enclosing {
+        //
+        // If cursor is already at or past the end, jump to next definition's end
+        //
+        if cursor_byte >= enc.end_byte().saturating_sub(1) {
+            return next_named_matching(enc, is_definition_node).map(|n| n.end_byte().saturating_sub(1));
+        }
+
+        //
+        // Otherwise jump to end of enclosing definition
+        //
+        return Some(enc.end_byte().saturating_sub(1));
+    }
+
+    let node_at = root.descendant_for_byte_range(cursor_byte, cursor_byte)?;
+    next_named_matching(node_at, is_definition_node).map(|n| n.end_byte().saturating_sub(1))
 }
 
 //
@@ -2214,8 +2392,7 @@ fn collect_pattern_bindings(pat: Node, source: &PieceTree, out: &mut Vec<Complet
             if atom_table.lookup_ref(name).as_ref() == "_" { return; }
             out.push(CompletionItem {
                 name: name,
-                detail: "let".into(),
-                kind:   CompletionItemKind::Local,
+                detail: maybe_truncate_to_array_string("let"),
                 score:  0,
             });
         }
@@ -2237,7 +2414,7 @@ fn collect_pattern_bindings(pat: Node, source: &PieceTree, out: &mut Vec<Complet
     }
 }
 
-pub fn extract_prefix_at_cursor(buf: &Buffer, cursor_char: usize) -> (usize, String) {
+pub fn extract_prefix_at_cursor(buf: &Buffer, cursor_char: usize) -> (u32, SmallString<[u8; 32]>) {
     let mut start = cursor_char;
     while start > 0 {
         let c = buf.text.char(start as u32 - 1);
@@ -2247,8 +2424,11 @@ pub fn extract_prefix_at_cursor(buf: &Buffer, cursor_char: usize) -> (usize, Str
             break;
         }
     }
-    let prefix: String = buf.text.slice_chars(start as _, cursor_char as _).to_string();
-    (start, prefix)
+
+    let mut s = SmallString::new();
+    tprint!(&mut s, "{}", buf.text.slice_chars(start as _, cursor_char as _));
+
+    (start as _, s)
 }
 
 pub fn query_completions(
@@ -2256,51 +2436,53 @@ pub fn query_completions(
     sym_table:    &SymbolTable,
     func_table:   &FunctionTable,
     atom_table:   &AtomTable,
-    _buffer_id:    BufferId,
-    cursor_byte: usize,
-    tree:        Option<&Tree>,
-    source:      &PieceTree,
+    word_tables:  &WordTables,
+    buffer_id:    BufferId,
+    cursor_byte:  usize,
+    tree:         Option<&Tree>,
+    source:       &PieceTree,
     limit:        usize,
 ) -> Vec<CompletionItem> {
-    if prefix.is_empty() { return vec![]; }
+    if prefix.is_empty() { return Vec::new(); }
 
     let prefix_lower = prefix.to_ascii_lowercase();
-    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut items: Vec<CompletionItem> = Vec::new();    // @Memory @Memory @Memory
 
-    // symbols
+    // Symbols
     for i in sym_table.query_prefix(prefix, atom_table) {
         let name   = sym_table.name(i);
-        let detail: Box<str> = sym_table.detail(i).into(); // @Memory
-        let kind   = sym_table.kind[i];
+        let detail = maybe_truncate_to_array_string(sym_table.detail(i)); // @Memory @Memory
         let score  = score_completion(&atom_table.lookup_ref(name), prefix);
         items.push(CompletionItem {
             name,
             detail,
-            kind: kind.into(),
             score,
         });
+
         if items.len() >= limit * 2 { break; }
     }
 
-    // functions from func_table
+    let mut scratch_name = SmallString::<[u8; 256]>::new();
+
+    // Functions from func_table
     for (_, refs) in &func_table.by_name {
         for &r in refs.as_slice() {
             let Some(info) = func_table.get(r) else { continue };
-            let name = atom_table.lookup_ref(info.name);
-            if !name.to_ascii_lowercase().starts_with(&prefix_lower) { continue; }
-            let detail: Box<str> = format_fn_detail(info, atom_table).into();
+
+            tprint!(&mut scratch_name, "{}", atom_table.lookup_ref(info.name).as_ref());
+            let name = &scratch_name;
+
+            if !name.starts_with(&prefix_lower) { continue }
+
+            let detail = maybe_truncate_to_array_string(&format_fn_detail(info, atom_table));
             let score  = score_completion(&name, prefix);
             items.push(CompletionItem {
                 name: info.name,
                 detail,
-                kind: if info.impl_name.is_some() {
-                    CompletionItemKind::Function // method
-                } else {
-                    CompletionItemKind::Function
-                },
                 score,
             });
-            if items.len() >= limit * 2 { break; }
+
+            if items.len() >= limit * 2 { break }
         }
     }
 
@@ -2314,31 +2496,55 @@ pub fn query_completions(
         );
         let prefix_lower = prefix.to_ascii_lowercase();
         for mut item in locals {
-            let name = atom_table.lookup_ref(item.name);
-            if !name.to_ascii_lowercase().starts_with(&prefix_lower) { continue; }
+            tprint!(&mut scratch_name, "{}", atom_table.lookup_ref(item.name).as_ref());
+            let name = &scratch_name;
+
+            if !name.to_ascii_lowercase().starts_with(&prefix_lower) { continue }
             item.score = score_completion(&name, prefix) + 5; // + 5 for locals
             items.push(item);
         }
     }
 
-    // sort by score, deduplicate by name
-    items.sort_unstable_by_key(|i| i.score);
-    items.dedup_by(|a, b| a.name == b.name);
+    // Words from current buffer
+    if let Some(word_table) = word_tables.get(&buffer_id) {
+        for atom in word_table.query_prefix(prefix) {
+            tprint!(&mut scratch_name, "{}", atom_table.lookup_ref(atom).as_ref());
+            let name = &scratch_name;
+
+            if name == prefix { continue }  // @Hack?
+
+            if !name.to_ascii_lowercase().starts_with(&prefix_lower) { continue }
+
+            let score = score_completion(&name, prefix).saturating_sub(2); // Below symbols/locals
+            items.push(CompletionItem {
+                name:   atom,
+                detail: maybe_truncate_to_array_string("word"),
+                score,
+            });
+
+            if items.len() >= limit * 2 { break; }
+        }
+    }
+
+    // Sort by score, deduplicate by name
+    items.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| b.score.cmp(&a.score)));
+    items.dedup_by(|a, b| a.name == b.name);  // keeps first = highest score per name
+    items.sort_unstable_by_key(|i| core::cmp::Reverse(i.score));
     items.truncate(limit);
     items
 }
 
 fn score_completion(name: &str, prefix: &str) -> u32 {
-    // exact prefix match scores 0 (best)
-    // then by length difference
-    // then alphabetical
+    // Exact prefix match scores 0 (best)
+    // Then by length difference
+    // Then alphabetical
     if name == prefix { return 0; }
     let len_diff = (name.len() as i32 - prefix.len() as i32).unsigned_abs();
     len_diff + 1
 }
 
-fn format_fn_detail(info: &FunctionInfo, atom_table: &AtomTable) -> String {
-    let mut s = String::from("(");
+fn format_fn_detail(info: &FunctionInfo, atom_table: &AtomTable) -> SmallString<[u8; 64]> {
+    let mut s = SmallString::from("(");
     for (i, param) in info.params.iter().enumerate() {
         if i > 0 { s.push_str(", "); }
         s.push_str(atom_table.lookup_ref(param.name).as_str());

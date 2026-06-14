@@ -16,7 +16,6 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 const float ATLAS_SIZE = 4096.0;
-const float BLUR_SENTINEL = -1.0;
 
 void main() {
     if (f_uv.x < -0.5) {
@@ -62,36 +61,15 @@ void main() {
         w += sin(x * 5.4977 - t * 1.9318 + y * 0.61) * 0.10;
         w += sin(x * 2.3561 - t * 1.1180 + y * 0.44) * 0.10;
 
-        // float brightness = 0.7 + 0.3 * w;
-
-        // vec3 base   = vec3(0.50, 0.04, 0.06);
-        // vec3 bright = vec3(0.86, 0.08, 0.14);
-        // vec3 col = mix(base, bright, brightness);
-
-        // float alpha = f_color.a * clamp(0.8 + 0.2 * w, 0.0, 1.0);
-        // if (alpha <= 0.01) discard;
-
-        // =========================================
-
-        // float brightness = 0.7 + 0.3 * w;
-        // vec3 col = f_color.rgb * brightness;
-
-        // float alpha = f_color.a * clamp(0.8 + 0.2 * w, 0.0, 1.0);
-        // if (alpha <= 0.01) discard;
-
-        // out_color = vec4(col * alpha, alpha);
-
-        // =========================================
-
-        // 1. Map the wave from [-1.0, 1.0] to a clean [0.0, 1.0] range
+        // Map the wave from [-1.0, 1.0] to a clean [0.0, 1.0] range
         float wave_normalized = w * 0.5 + 0.5;
 
-        // 2. Modulate the input color directly so the hue NEVER changes.
+        // Modulate the input color directly so the hue NEVER changes.
         // At the peak, it hits 100% of your Rust color. At the valley, it drops to 70%.
         float brightness = mix(0.70, 1.0, wave_normalized);
         vec3 col = f_color.rgb * brightness;
 
-        // 3. Keep the alpha baseline high so it stays punchy
+        // Keep the alpha baseline high so it stays punchy
         float alpha = f_color.a * clamp(0.9 + 0.1 * w, 0.0, 1.0);
         if (alpha <= 0.01) discard;
 

@@ -45,3 +45,4 @@ gpu-allocator = "0.28"
 ash = { version = "0.38" }#, features = ["linked"] }
 ash-window = "0.13.0"
 indexmap = "2.14.0"
+arrayvec = "0.7.6"

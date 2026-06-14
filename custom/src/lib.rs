@@ -626,6 +626,76 @@ pub fn delete_forward_until_newline(cx: &mut CommandContext) {  // :BufferScratc
 }
 
 #[command]
+pub fn duplicate_line(cx: &mut CommandContext) {
+    let (view, buf) = cx.editor.active_view_and_buffer_mut();
+    buf.begin_transaction(view.cursor.char_index);
+    view.cursor.unset_anchor();
+
+    let cursor_char = view.cursor.char_index as u32;
+    let cursor_byte = buf.text.char_to_byte(cursor_char);
+
+    const CAP: u32 = 500 * 1024 * 1024;
+
+    //
+    // Find the start of the current line
+    //
+    let line_start_byte = {
+        let cap = cursor_byte.min(CAP);
+        let start = cursor_byte - cap;
+        buf.flatten_tree_into_scratch(start as _, cursor_byte as _);
+
+        let flat = buf.scratch_space_to_flatten_tree_into.as_bytes();
+        match memchr::memrchr(b'\n', flat) {
+            None => start,
+            Some(nl) => start + nl as u32,
+        }
+    };
+
+    //
+    // Find the end of the current line (exclusive of \n)
+    //
+    let line_end_byte = {
+        let buf_len = buf.text.len_bytes();
+        let scan_len = (buf_len - cursor_byte).min(CAP);
+        buf.flatten_tree_into_scratch(cursor_byte as _, (cursor_byte + scan_len) as _);
+
+        let flat = buf.scratch_space_to_flatten_tree_into.as_bytes();
+        match memchr::memchr(b'\n', flat) {
+            None => cursor_byte + scan_len,
+            Some(nl) => cursor_byte + nl as u32,
+        }
+    };
+
+    //
+    // Extract line content into payload before any further scratch use
+    //
+    let line_byte_len = (line_end_byte - line_start_byte) as usize;
+    buf.flatten_tree_into_scratch(line_start_byte as _, line_end_byte as _);
+
+    let mut payload = SmallString::<[u8; 256]>::with_capacity(1 + line_byte_len);  // @Memory :MakeScratch
+    payload.push('\n');
+    payload.push_str(&buf.scratch_space_to_flatten_tree_into[..line_byte_len]);
+
+    //
+    // Cursor offset within the line (in chars), to restore on the duplicate
+    //
+    let col_offset = cursor_char.saturating_sub(buf.text.byte_to_char(line_start_byte));
+
+    //
+    // Move cursor to end of current line and insert
+    //
+    view.cursor.char_index = buf.text.byte_to_char(line_end_byte) as _;
+    buf.insert_literal(&payload, &mut view.cursor);
+
+    //
+    // insert_literal leaves cursor after the last inserted char (end of duplicate).
+    // Step back to the duplicate line's start and re-apply the column offset.
+    //
+    let dup_line_start_char = buf.text.byte_to_char(line_end_byte) as u32 + 1; // +1 past the \n
+    view.cursor.char_index = (dup_line_start_char + col_offset) as _;
+}
+
+#[command]
 pub fn insert_newline(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
     buf.begin_transaction(view.cursor.char_index);
@@ -857,7 +927,7 @@ pub fn recenter_top_bottom(cx: &mut CommandContext) {
     let (view, buf) = cx.editor.active_view_and_buffer();
     let cursor_char_index = view.cursor.char_index;
 
-    let (line, _) = buf.cursor_line_col(&view.cursor);
+    let (line, col) = buf.cursor_line_col(&view.cursor);
     let rect = cx.editor.panels[view.panel_id.unwrap()].rect;
 
     let stage = if *cx.editor.recenter_last_cursor_char_index() == view.cursor.char_index as u32 {
@@ -869,10 +939,12 @@ pub fn recenter_top_bottom(cx: &mut CommandContext) {
     let line_h = cx.editor.line_h();
     let (view, _buf) = cx.editor.active_view_and_buffer_mut();
 
+    let cursor_x = view.cursor_x(line, col, rect);
+
     match stage {
-        0 => view.scroll_to_cursor_centered(line, line_h, rect),
-        1 => view.scroll_to_cursor_top(line, line_h, rect),
-        _ => view.scroll_to_cursor_bottom(line, line_h, rect),
+        0 => view.scroll_to_cursor_centered_v_but_not_centered_h(line, line_h, cursor_x, rect),
+        1 => view.scroll_to_cursor_top_v_but_not_centered_h     (line, line_h, cursor_x, rect),
+        _ => view.scroll_to_cursor_bottom_v_but_not_centered_h  (line, line_h, cursor_x, rect),
     }
 
     *cx.editor.recenter_stage_mut() = (stage + 1) % 3;
@@ -2250,13 +2322,13 @@ fn update_ghost_text(state: &mut CompletionState, tree_sitter: &TreeSitter) {
         return;
     }
 
-    let selected = &state.items[state.selected];
+    let selected = &state.items[state.selected_index as usize];
 
     //
     // Ghost text is the suffix after the prefix
     //
     let selected_name = tree_sitter.atom_table.lookup_ref(selected.name);
-    if selected_name.starts_with(state.prefix.as_ref()) {
+    if selected_name.starts_with(state.prefix.as_str()) {
         state.ghost_text = Some(selected_name[state.prefix.len()..].into());
     } else {
         state.ghost_text = None;
@@ -2284,6 +2356,7 @@ pub fn completion_next(cx: &mut CommandContext) {
             &cx.editor.tree_sitter.symbol_table,
             &cx.editor.tree_sitter.func_table,
             &cx.editor.tree_sitter.atom_table,
+            &cx.editor.tree_sitter.word_tables,
             buffer_id,
             cursor_byte as _,
             tree_ref.as_deref().map(|t| &t.tree),
@@ -2298,15 +2371,18 @@ pub fn completion_next(cx: &mut CommandContext) {
         view.completion = CompletionState {
             active:       true,
             prefix:       prefix.into(),
-            prefix_start: start,
-            selected:     0,
+            prefix_start_char_index: start,
+            scroll_offset: 0,
+            selected_index:     0,
             ghost_text:   None,
             items,
         };
     } else {
-        // cycle forward
+        // Cycle forward
         let len = view.completion.items.len();
-        view.completion.selected = (view.completion.selected + 1) % len;
+        view.completion.selected_index = (view.completion.selected_index + 1) % len as u32;
+
+        view.completion.clamp_scroll(8);
     }
 
     let view_id = cx.editor.active_view_id();
@@ -2322,8 +2398,10 @@ pub fn completion_prev(cx: &mut CommandContext) {
     let view_id = cx.editor.active_view_id();
     let view = &mut cx.editor.views[view_id];
     let len = view.completion.items.len();
-    view.completion.selected = view.completion.selected.checked_sub(1).unwrap_or(len - 1);
+    view.completion.selected_index = view.completion.selected_index.checked_sub(1).unwrap_or(len as u32 - 1);
     update_ghost_text(&mut view.completion, &cx.editor.tree_sitter);
+
+    view.completion.clamp_scroll(8);
 }
 
 // @Incomplete:
@@ -2350,9 +2428,10 @@ pub fn completion_confirm(cx: &mut CommandContext) {
     let view_id = cx.editor.active_view_id();
     let view = &mut cx.editor.views[view_id];
 
-    let item = &view.completion.items[view.completion.selected];
-    let full_name = cx.editor.tree_sitter.atom_table.lookup_ref(item.name).to_owned();
-    let prefix_start = view.completion.prefix_start;
+    let item = &view.completion.items[view.completion.selected_index as usize];
+    let full_name: SmallString<[u8; 128]> = cx.editor.tree_sitter.atom_table.lookup_ref(item.name).as_ref().into();
+
+    let prefix_start = view.completion.prefix_start_char_index;
     let cursor = view.cursor.char_index;
 
     let (view, buf) = cx.editor.active_view_and_buffer_mut();
@@ -2368,7 +2447,7 @@ pub fn completion_confirm(cx: &mut CommandContext) {
         buf.text.insert_char(byte, c);
         insert_at += 1;
     }
-    view.cursor.char_index    = insert_at;
+    view.cursor.char_index    = insert_at as _;
     view.cursor.preferred_col = None;
     buf.is_dirty = true;
     buf.last_edit_generation += 1;
@@ -2422,7 +2501,9 @@ pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32
 
     let (view, _buf) = editor.view_and_buffer_mut(view_id);
     view.cursor.char_index = (line_char_index + col) as usize;
-    view.scroll_to_cursor_centered(line, line_h, rect);
+
+    let cursor_x = view.cursor_x(line, col, rect);
+    view.scroll_to_cursor_centered_v_but_not_centered_h(line, line_h, cursor_x, rect);
 }
 
 #[command]
@@ -2496,7 +2577,7 @@ fn jump_to_active_match(editor: &mut Editor, prev_match_index: Option<usize>) {
     let panel_id = editor.views[view_id].panel_id.unwrap();
     editor.views[view_id].cursor.char_index        = char_index;
     editor.views[view_id].cursor.anchor_char_index = None;
-    scroll_to_cursor_in(editor, view_id, panel_id);
+    scroll_to_cursor_in_centered(editor, view_id, panel_id);
 }
 
 fn collect_searcher_leaves(editor: &Editor) -> SmallVec<[(PanelId, Rect); 4]> {
@@ -2640,6 +2721,7 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::alt('i'), cx.command_table.intern("mark_sexp"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('p'), cx.command_table.intern("move_line_up"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('n'), cx.command_table.intern("move_line_down"));              // nocheckin
+    cx.keymap.bind(KeyCombo::ctrl_alt('m'), cx.command_table.intern("duplicate_line"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));          // nocheckin
     cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));     // nocheckin
@@ -3212,7 +3294,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             // Lister smooth scrolling
             //
 
-            if lister.tick(dt) {
+            if lister.vlist.tick(dt) {
                 *should_redraw = should_redraw.or_msg("Lister scrolling animation", &mut editor.redraw_reasons);
             }
 
@@ -3220,20 +3302,12 @@ fn setup_hooks(cx: &mut CommandContext) {
             // Lister opening animation
             //
 
-            let target = if lister.is_open() { 1.0_f32 } else { 0.0 };
-
-            _ = lister.panel.tick(dt);
+            let panel_animating = lister.panel.tick(dt);
 
             *should_redraw = should_redraw.or_if(
-                lister.panel.anim != target,
-                "Lister opening animation",
-                &mut editor.redraw_reasons
-            );
-
-            *should_redraw = should_redraw.or_if(
-                lister.panel.anim != target,
-                "Lister opening animation",
-                &mut editor.redraw_reasons
+                panel_animating,
+                "Lister animation",
+                &mut editor.redraw_reasons,
             );
         }
     });
@@ -3308,6 +3382,17 @@ fn setup_hooks(cx: &mut CommandContext) {
         let Some(event) = cx.key_input else {
             return (false, false);
         };
+
+        if cx.editor.active_view().completion.active {
+            //
+            // :Configuration
+            //
+            if event.logical == LogicalKey::Named(NamedKey::Escape) ||
+                event.mods.ctrl && event.logical == LogicalKey::Char('g')
+            {
+               cx.editor.active_view_mut().completion.active = false;
+            }
+        }
 
         let is_typing_into_search =
             cx.editor.searcher().is_open && cx.editor.active_buffer_id() == cx.editor.searcher().query_buffer;
@@ -3756,7 +3841,7 @@ fn setup_hooks(cx: &mut CommandContext) {
             gpu::pop_overlay_mode(gpu);
         }
 
-        if editor.lister().is_open() {
+        if editor.lister().is_visible() {
             //
             // Prepare lister bg
             //
@@ -3788,13 +3873,15 @@ fn setup_hooks(cx: &mut CommandContext) {
 
             gpu::push_overlay_mode(gpu);
             {
-                gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
-                {
-                    let t1 = Instant::now();
-                    render_text_layout(editor, gpu, view_id, show_cursor);
-                    editor.render_us_acc += t1.elapsed().as_micros() as f32;
+                if editor.lister().is_open() {
+                    gpu::push_clip(gpu, rect.x, rect.y, rect.w, rect.h);
+                    {
+                        let t1 = Instant::now();
+                        render_text_layout(editor, gpu, view_id, show_cursor);
+                        editor.render_us_acc += t1.elapsed().as_micros() as f32;
+                    }
+                    gpu::pop_clip(gpu);
                 }
-                gpu::pop_clip(gpu);
 
                 build_and_render_lister(gpu, editor);
 
@@ -4164,7 +4251,8 @@ const fn lister_smaller_font_size(scaled_font_size: f32) -> f32 {
 }
 
 pub fn build_and_render_lister(gpu: &mut Gpu, editor: &mut Editor) {
-    if !editor.lister().is_visible() { return }
+    let lister = editor.custom_data.lister_mut();
+    if !lister.is_visible() { return }
 
     let scale             = editor.scale;
     let font_size         = editor.font_size();
@@ -4500,7 +4588,7 @@ where
     editor.canonicalized_last_scanned_directory = SmallString::new();
     lister.scroll          = 0.0;
     lister.scroll_anim     = 0.0;
-    lister.panel.is_open   = true;
+    lister.open();
     lister.items.clear();
     lister.items.extend(items);
     lister.rebuild_filtered();
@@ -4512,10 +4600,12 @@ where
 }
 
 pub struct PanelAnim {
-    pub is_open:   bool,
-    pub anim:      f32,
-    pub anim_w:    f32,
-    pub anim_h:    f32,
+    pub is_open:    bool,
+    pub anim:       f32,  // alpha / general fade
+    pub anim_w:     f32,
+    pub anim_h:     f32,
+    pub w_progress: f32,  // internal 0..1 timer driving anim_w
+    pub h_progress: f32,  // internal 0..1 timer driving anim_h
     pub open_speed:  f32,
     pub close_speed: f32,
 }
@@ -4523,32 +4613,68 @@ pub struct PanelAnim {
 impl Default for PanelAnim {
     fn default() -> Self {
         PanelAnim {
-            open_speed: 18.0,
-            close_speed: 40.0,
-            anim_w: 0.0,
-            anim_h: 0.0,
+            open_speed:  6.0,
+            close_speed: 10.0,
+            anim:       0.0,
+            anim_w:     0.0,
+            anim_h:     0.0,
+            w_progress: 0.0,
+            h_progress: 0.0,
             is_open: false,
-            anim: 0.0
         }
     }
 }
 
 impl PanelAnim {
-    pub fn tick(&mut self, dt: f32) -> bool {
-        let target = if self.is_open { 1.0 } else { 0.0 };
-        let speed  = if self.anim > target { self.close_speed } else { self.open_speed };
-        let remaining = target - self.anim;
+    pub fn open(&mut self) {
+        self.is_open    = true;
+        self.w_progress = 0.0;
+        self.h_progress = 0.0;
+    }
 
-        if remaining.abs() < 0.005 {
+    pub fn close(&mut self) {
+        self.is_open    = false;
+        self.w_progress = 1.0;
+        self.h_progress = 1.0;
+    }
+
+    pub fn tick(&mut self, dt: f32) -> bool {
+        let target = if self.is_open { 1.0_f32 } else { 0.0 };
+        let speed  = if self.is_open { self.open_speed } else { self.close_speed };
+
+        let remaining = target - self.anim;
+        if remaining.abs() < 0.001
+            && (target - self.anim_w).abs() < 0.001
+            && (target - self.anim_h).abs() < 0.001
+        {
             self.anim   = target;
             self.anim_w = target;
             self.anim_h = target;
+            self.w_progress = target;
+            self.h_progress = target;
             return false;
         }
 
-        self.anim   += remaining * speed * dt;
-        self.anim_w += (self.anim   - self.anim_w) * (speed * 1.4 * dt).min(1.0);
-        self.anim_h += (self.anim   - self.anim_h) * (speed * 0.7 * dt).min(1.0);
+        // anim: fast fade, used for alpha
+        self.anim += remaining * speed * dt;
+
+        if self.is_open {
+            // Width races ahead at 2.5× speed
+            self.w_progress += (target - self.w_progress) * (speed * 2.5 * dt).min(1.0);
+            // Height starts chasing only after width is 35% done
+            if self.w_progress > 0.35 {
+                self.h_progress += (target - self.h_progress) * (speed * 1.1 * dt).min(1.0);
+            }
+        } else {
+            // On close, collapse height first then width
+            self.h_progress += (target - self.h_progress) * (speed * 2.5 * dt).min(1.0);
+            if self.h_progress < 0.65 {
+                self.w_progress += (target - self.w_progress) * (speed * 1.1 * dt).min(1.0);
+            }
+        }
+
+        self.anim_w = self.w_progress;
+        self.anim_h = self.h_progress;
 
         for v in [&mut self.anim, &mut self.anim_w, &mut self.anim_h] {
             *v = v.clamp(0.0, 1.0);
@@ -4556,7 +4682,7 @@ impl PanelAnim {
         true
     }
 
-    pub fn is_visible(&self) -> bool { self.anim > 0.0 }
+    pub fn is_visible(&self) -> bool { self.anim > 0.0 || self.is_open }
     pub fn alpha(&self, base: u8) -> u8 { ((base as f32) * self.anim) as u8 }
     pub fn t_w(&self) -> f32 { 1.0 - (1.0 - self.anim_w).powi(3) }
     pub fn t_h(&self) -> f32 { 1.0 - (1.0 - self.anim_h).powi(3) }
@@ -5052,8 +5178,12 @@ impl Lister {
         self.panel.is_visible()
     }
 
+    pub fn open(&mut self) {
+        self.panel.open();
+    }
+
     pub fn close(&mut self) -> Option<PanelId> {
-        self.panel.is_open = false;
+        self.panel.close();
         self.set_selected_index_to_1_instead_of_0 = false;
         self.panel_before_opening_lister.pop()
     }
@@ -5805,8 +5935,9 @@ pub fn center_screen_so_that_cursor_isnt_covered_by_undo_graph(editor: &mut Edit
     let line_h = editor.line_h();
 
     let (view, buf) = editor.active_view_and_buffer_mut();
-    let line = buf.text.char_to_line(view.cursor.char_index as _);
-    view.scroll_to_cursor_centered(line+3, line_h, rect);
+    let (line, col) = buf.text.char_to_line_col(view.cursor.char_index as _);
+    let cursor_x = view.cursor_x(line, col, rect);
+    view.scroll_to_cursor_centered_v_but_not_centered_h(line+3, line_h, cursor_x, rect);
 }
 
 pub fn get_graph_rect_and_do_scroll_if_necessary(editor: &mut Editor) -> Rect {

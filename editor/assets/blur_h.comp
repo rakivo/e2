@@ -12,7 +12,7 @@ void main() {
     if (coord.x >= size.x || coord.y >= size.y) return;
 
     vec2 uv     = (vec2(coord) + 0.5) / vec2(size);
-    float texel = 1.0 / float(size.x);
+    float texel = 1.5 / float(size.x);
 
     vec3 result = texture(src, uv).rgb * weights[0];
     for (int i = 1; i < 5; i++) {

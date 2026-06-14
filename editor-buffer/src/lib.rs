@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 use cranelift_entity::{EntityList, ListPool, PrimaryMap, packed_option::PackedOption};
 
 pub const PASTE_ANIMATION_MAX_ID: usize = 7;  // pastes: 1..=7
-pub const COPY_ANIMATION_MAX_ID:  usize = 15; // copies: 8..=15
+pub const  COPY_ANIMATION_MAX_ID: usize = 15; // copies: 8..=15
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Default)]
 pub struct e2_Point {
