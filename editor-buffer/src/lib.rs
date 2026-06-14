@@ -1,4 +1,4 @@
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, non_snake_case)]
 
 use editor_lexer::{LexState, Token, lex_from};
 
@@ -34,6 +34,7 @@ pub struct e2_InputEdit {
     pub start_position:   e2_Point,
     pub old_end_position: e2_Point,
     pub new_end_position: e2_Point,
+    pub node_after_edit:  NodeRef,
 }
 
 pub enum ByteOp {
@@ -296,7 +297,7 @@ impl Buffer {
         self.animate_paste(byte_start as u32, byte_len as _);
     }
 
-    pub fn make_delete_edit(&self, byte_start: usize, byte_end: usize) -> e2_InputEdit {
+    pub fn make_delete_edit(&self, byte_start: usize, byte_end: usize, node_AFTER_edit: NodeRef) -> e2_InputEdit {
         let start_point   = self.byte_to_point(byte_start);
         let old_end_point = self.byte_to_point(byte_end);
         e2_InputEdit {
@@ -306,10 +307,11 @@ impl Buffer {
             old_end_position: old_end_point,
             new_end_byte:     byte_start as u32,
             new_end_position: start_point,
+            node_after_edit:  node_AFTER_edit
         }
     }
 
-    pub fn make_insert_edit(&self, byte_start: usize, byte_end_after: usize) -> e2_InputEdit {
+    pub fn make_insert_edit(&self, byte_start: usize, byte_end_after: usize, node_AFTER_edit: NodeRef) -> e2_InputEdit {
         let start_point   = self.byte_to_point(byte_start);
         let new_end_point = self.byte_to_point(byte_end_after);
         e2_InputEdit {
@@ -319,6 +321,7 @@ impl Buffer {
             old_end_position: start_point,
             new_end_byte:     byte_end_after as _,
             new_end_position: new_end_point,
+            node_after_edit:  node_AFTER_edit
         }
     }
 
@@ -681,7 +684,7 @@ impl Buffer {
         self.adjust_animated_regions_for_insert(byte, c.len_utf8());
 
         let byte_end = byte + c.len_utf8();
-        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end));
+        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end, self.text.root));
 
         cursor.char_index = index + 1;
         cursor.preferred_col = None;
@@ -704,7 +707,7 @@ impl Buffer {
         self.adjust_animated_regions_for_insert(byte, c.len_utf8());
 
         let byte_end = byte + c.len_utf8();
-        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end));
+        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end, self.text.root));
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
@@ -732,7 +735,7 @@ impl Buffer {
         self.adjust_animated_regions_for_insert(byte, byte_len);
 
         let byte_end = byte + byte_len;
-        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end));
+        self.ts_edits_in_this_frame.push(self.make_insert_edit(byte, byte_end, self.text.root));
 
         self.is_dirty = true;
         self.last_edit_generation += 1;
@@ -751,11 +754,14 @@ impl Buffer {
         let byte_len   = self.text.char(index as _).len_utf8();
         let byte_end   = self.text.char_to_byte(cursor.char_index as _) as usize;
 
-        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+        let mut edit = self.make_delete_edit(byte_start, byte_end, NodeRef(0));
 
         self.text.remove(byte_start as u32..byte_end as u32);
         self.invalidate_cache_from_char(index);
         self.adjust_animated_regions_for_delete(byte_start, byte_len);
+
+        edit.node_after_edit = self.text.root;
+        self.ts_edits_in_this_frame.push(edit);
 
         cursor.char_index = index;
         cursor.preferred_col = None;
@@ -777,11 +783,14 @@ impl Buffer {
         let byte_len   = self.text.char(index as _).len_utf8();
         let byte_end   = self.text.char_to_byte(end_index as _) as usize;
 
-        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+        let mut edit = self.make_delete_edit(byte_start, byte_end, NodeRef(0));
 
         self.text.remove(byte_start as u32..byte_end as u32);
         self.invalidate_cache_from_char(index);
         self.adjust_animated_regions_for_delete(byte_start, byte_len);
+
+        edit.node_after_edit = self.text.root;
+        self.ts_edits_in_this_frame.push(edit);
 
         cursor.char_index = cursor.char_index.min(self.text.len_chars() as usize);
         cursor.preferred_col = None;
@@ -807,11 +816,14 @@ impl Buffer {
         let byte_start = self.text.char_to_byte(start as _) as usize;
         let byte_end   = self.text.char_to_byte(i as _) as usize;
 
-        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+        let mut edit = self.make_delete_edit(byte_start, byte_end, NodeRef(0));
 
         self.text.remove(byte_start as u32..byte_end as u32);
         self.invalidate_cache_from_char(start);
         self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
+
+        edit.node_after_edit = self.text.root;
+        self.ts_edits_in_this_frame.push(edit);
 
         cursor.char_index    = start.min(self.text.len_chars() as usize);
         cursor.preferred_col = None;
@@ -837,11 +849,14 @@ impl Buffer {
         let byte_start = self.text.char_to_byte(i as _) as usize;
         let byte_end   = self.text.char_to_byte(end as _) as usize;
 
-        self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+        let mut edit = self.make_delete_edit(byte_start, byte_end, NodeRef(0));
 
         self.text.remove(byte_start as u32..byte_end as u32);
         self.invalidate_cache_from_char(i);
         self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
+
+        edit.node_after_edit = self.text.root;
+        self.ts_edits_in_this_frame.push(edit);
 
         cursor.char_index    = i.min(self.text.len_chars() as usize);
         cursor.preferred_col = None;
@@ -865,11 +880,14 @@ impl Buffer {
             let byte_start = self.text.char_to_byte(start as _) as usize;
             let byte_end   = self.text.char_to_byte(end as _) as usize;
 
-            self.ts_edits_in_this_frame.push(self.make_delete_edit(byte_start, byte_end));
+            let mut edit = self.make_delete_edit(byte_start, byte_end, NodeRef(0));
 
             self.text.remove(byte_start as u32..byte_end as u32);
             self.invalidate_cache_from_char(start);
             self.adjust_animated_regions_for_delete(byte_start, byte_end - byte_start);
+
+            edit.node_after_edit = self.text.root;
+            self.ts_edits_in_this_frame.push(edit);
 
             // Move cursor to the start of the deleted range
             cursor.char_index = start;

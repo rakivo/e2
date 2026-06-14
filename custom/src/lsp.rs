@@ -1,8 +1,14 @@
-use std::collections::HashMap;
+use editor::BufferId;
+use editor::buffer::e2_InputEdit;
+use editor_helpers::tprint;
+use piece_tree::PieceTree;
+
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use smallstr::SmallString;
 use serde_json::{json, Value};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -47,6 +53,8 @@ pub struct LspClient(Option<LspClientInner>);
 struct LspClientInner {
     stdin: ChildStdin,
     next_request_id: RequestId,
+
+    opened_buffers: HashSet<BufferId>,
 
     // One entry per in-flight request. Reader thread removes the entry and
     // fires the sender when the matching response arrives.
@@ -106,17 +114,24 @@ impl LspClient {
             send_buf: Vec::with_capacity(64 * 1024), // 64k initial, grows as needed
             _server_child: server_child,
             pending_goto: None,
+            opened_buffers: Default::default()
         };
 
         inner.initialize(workspace_root);
         Self(Some(inner))
     }
 
-    #[inline] fn inner(&mut self) -> Option<&mut LspClientInner> { self.0.as_mut() }
+    #[inline] fn inner    (&self)     -> Option<&LspClientInner>     { self.0.as_ref() }
+    #[inline] fn inner_mut(&mut self) -> Option<&mut LspClientInner> { self.0.as_mut() }
+
+    pub fn is_file_opened(&self, buffer_id: BufferId) -> bool {
+        let Some(c) = self.inner() else { return false };
+        c.opened_buffers.contains(&buffer_id)
+    }
 
     // Writes the file text into `send_buf` with in-place JSON escaping
-    pub fn did_open_buf(&mut self, path: &str, text: &str) {
-        let Some(c) = self.inner() else { return };
+    pub fn did_open_buf(&mut self, path: &str, text: &str, buffer_id: BufferId) {
+        let Some(c) = self.inner_mut() else { return };
         c.send_buf.clear();
 
         let uri  = file_uri(path);
@@ -133,15 +148,23 @@ impl LspClient {
                uri, lang
         ).unwrap();
         c.send_buf.push(b'"');
-        write_json_string(text, &mut c.send_buf);
+        write_json_string(text.bytes(), &mut c.send_buf);
         c.send_buf.extend_from_slice(b"\"}}}"); // close: textDocument, params, root
+
+        // :LSPDebug
+        // if let Ok(s) = std::str::from_utf8(&c.send_buf) {
+        //     println!("[LSP DEBUG] did open: {s}");
+        // }
+
+        c.opened_buffers.insert(buffer_id);
 
         _ = flush_send_buf(&mut c.stdin, &c.send_buf);
     }
 
     #[inline]
     pub fn did_change_buf(&mut self, path: &str, text: &str, version: i32) {
-        let Some(c) = self.inner() else { return };
+        let Some(c) = self.inner_mut() else { return };
+
         c.send_buf.clear();
 
         let uri = file_uri(path);
@@ -156,8 +179,80 @@ impl LspClient {
                uri, version
         );
         c.send_buf.push(b'"');
-        write_json_string(text, &mut c.send_buf);
+        write_json_string(text.bytes(), &mut c.send_buf);
         c.send_buf.extend_from_slice(b"\"}]}}"); // close: contentChanges obj, array, params, root
+
+        _ = flush_send_buf(&mut c.stdin, &c.send_buf);
+    }
+
+    #[inline]
+    pub fn did_change_buf_from_tree(
+        &mut self,
+        path: &str,
+        version: i32,
+        ts_edits: &[e2_InputEdit],
+        tree: &mut PieceTree,  // Needs mutable access to swap the root  @Incomplete
+    ) {
+        let Some(c) = self.inner_mut() else { return };
+        if ts_edits.is_empty() { return; }
+
+        c.send_buf.clear();
+        let uri = file_uri(path);
+
+        _ = write!(
+            c.send_buf,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{\"textDocument\":{{\"uri\":\"{}\",\"version\":{}}},\"contentChanges\":[",
+            uri, version
+        );
+
+        //
+        // Save the actual current state of the buffer
+        //
+        let final_root = tree.root;
+
+        for (i, edit) in ts_edits.iter().enumerate() {
+            if i > 0 {
+                c.send_buf.push(b',');
+            }
+
+            let start_line = edit.start_position.row;
+            let start_col = edit.start_position.column;
+            let end_line = edit.old_end_position.row;
+            let end_col = edit.old_end_position.column;
+
+            _ = write!(
+                c.send_buf,
+                "{{\"range\":{{\"start\":{{\"line\":{},\"character\":{}}},\"end\":{{\"line\":{},\"character\":{}}}}},\"text\":\"",
+                start_line, start_col, end_line, end_col
+            );
+
+            //
+            // Swap the tree root to the state right after this edit
+            //
+            tree.root = edit.node_after_edit;
+
+            //
+            // Extract the text
+            //
+            let inserted_text = tree.slice(edit.start_byte..edit.new_end_byte);
+
+            write_json_string(inserted_text.bytes(), &mut c.send_buf);
+
+            c.send_buf.push(b'"');
+            c.send_buf.push(b'}');
+        }
+
+        //
+        // Snap the tree back
+        //
+        tree.root = final_root;
+
+        c.send_buf.extend_from_slice(b"]}}");
+
+        // :LSPDebug
+        // if let Ok(s) = std::str::from_utf8(&c.send_buf) {
+        //     eprintln!("[LSP DEBUG] sending incremental: {s}");
+        // }
 
         _ = flush_send_buf(&mut c.stdin, &c.send_buf);
     }
@@ -165,9 +260,9 @@ impl LspClient {
     #[allow(unused)]
     #[inline]
     pub fn did_close(&mut self, path: &str) {
-        let Some(c) = self.inner() else { return };
+        let Some(c) = self.inner_mut() else { return };
         c.notify("textDocument/didClose", json!({
-            "textDocument": { "uri": file_uri(path) }
+            "textDocument": { "uri": *file_uri(path) }
         }));
     }
 
@@ -178,9 +273,9 @@ impl LspClient {
         line:      u32,
         character: u32,
     ) {
-        let Some(c) = self.inner() else { return };
+        let Some(c) = self.inner_mut() else { return };
         let rq = c.request_async("textDocument/definition", json!({
-            "textDocument": { "uri": file_uri(path) },
+            "textDocument": { "uri": *file_uri(path) },
             "position": { "line": line, "character": character }
         }));
         c.pending_goto = Some(rq);
@@ -188,7 +283,7 @@ impl LspClient {
 
     #[inline]
     pub fn poll_goto_definition(&mut self) -> Option<Location> {
-        let c = self.inner()?;
+        let c = self.inner_mut()?;
         let val = c.pending_goto.as_ref()?.poll()?;
         c.pending_goto = None;
         parse_location(val)
@@ -205,7 +300,7 @@ impl LspClient {
     // Blocks on the shutdown response - that is correct per the LSP spec.
     #[inline]
     pub fn shutdown_blocking(&mut self) {
-        let Some(c) = self.inner() else { return };
+        let Some(c) = self.inner_mut() else { return };
         let req = c.request_async("shutdown", json!(null));
         req.wait();
         c.notify("exit", json!(null));
@@ -334,8 +429,8 @@ fn flush_send_buf(stdin: &mut ChildStdin, body: &[u8]) -> std::io::Result<()> {
 // Write `s` as a JSON string body (no surrounding quotes) into out.
 // Escapes in-place, no allocation.
 #[inline]
-fn write_json_string(s: &str, out: &mut Vec<u8>) {
-    for byte in s.bytes() {
+fn write_json_string(s: impl IntoIterator<Item = u8>, out: &mut Vec<u8>) {
+    for byte in s {
         match byte {
             b'"'        => out.extend_from_slice(b"\\\""),
             b'\\'       => out.extend_from_slice(b"\\\\"),
@@ -349,8 +444,10 @@ fn write_json_string(s: &str, out: &mut Vec<u8>) {
 }
 
 #[inline]
-fn file_uri(path: &str) -> String {
-    format!("file://{path}")
+fn file_uri(path: &str) -> SmallString<[u8; 256]> {
+    let mut s = SmallString::new();
+    tprint!(&mut s, "file://{path}");
+    s
 }
 
 #[inline]

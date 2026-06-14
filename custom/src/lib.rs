@@ -152,6 +152,8 @@ custom_data! {
 
             lsp: LspClient,
 
+            jump_stack: Vec<(u32, BufferId)>,  // char index + BufferId
+
             flashed_lines: Vec<FlashedLine>,
             highlight_scratch: Vec<Highlight>,
         }
@@ -261,7 +263,7 @@ pub fn move_to_first_character_in_current_line(cx: &mut CommandContext) {
         .take_while(|c| c.is_whitespace())
         .count();
 
-    let character_index_of_line = buf.text.line_to_byte(line);
+    let character_index_of_line = buf.text.line_to_char(line);
 
     view.cursor.char_index = character_index_of_line as usize + char_count_before_first_non_whitespace_in_line;
     view.cursor.preferred_col = None;
@@ -2487,7 +2489,7 @@ pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32
 
     let line_char_index = {
         let (_view, buf) = editor.view_and_buffer_mut(view_id);
-        buf.text.line_to_byte(line as _)
+        buf.text.line_to_char(line as _)
     };
 
     let line_h = editor.line_h();
@@ -2508,16 +2510,30 @@ pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32
 
 #[command]
 pub fn goto_definition(cx: &mut CommandContext) {
-    let (line, col, path) = {
+    let (line, col, char_index, buffer_id, path) = {
         let (view, buf) = cx.editor.active_view_and_buffer_mut();
         let (line, col) = buf.cursor_line_col(&view.cursor);
-        (line, col, buf.path.clone())
+        (line, col, view.cursor.char_index, view.buffer_id, buf.path.clone())
     };
 
     let Some(Ok(canon)) = path.map(std::fs::canonicalize) else { return };
 
+    cx.editor.custom_data.jump_stack_mut().push((char_index as _, buffer_id));
+
     let lsp = cx.editor.custom_data.lsp_mut();
     lsp.goto_definition_async(canon.to_str().unwrap(), line, col);
+}
+
+#[command]
+pub fn pop_jump_stack(cx: &mut CommandContext) {
+    let Some((char_index, buffer_id)) = cx.editor.custom_data.jump_stack_mut().pop() else {
+        return;
+    };
+
+    let (view, _buf) = cx.editor.active_view_and_buffer_mut();
+    view.switch_buffer(buffer_id);
+    view.cursor.unset_anchor();
+    view.cursor.char_index = char_index as _;
 }
 
 #[command]
@@ -2724,6 +2740,7 @@ pub fn custom_layer_init(cx: &mut CommandContext, loaded: &LoadedLib) {
     cx.keymap.bind(KeyCombo::ctrl_alt('m'), cx.command_table.intern("duplicate_line"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('r'), cx.command_table.intern("cargo_build"));              // nocheckin
     cx.keymap.bind(KeyCombo::alt('.'), cx.command_table.intern("goto_definition"));          // nocheckin
+    cx.keymap.bind(KeyCombo::alt(','), cx.command_table.intern("pop_jump_stack"));          // nocheckin
     cx.keymap.bind(KeyCombo::ctrl('l'), cx.command_table.intern("recenter_top_bottom"));     // nocheckin
     cx.keymap.bind(KeyCombo::alt('s'), cx.command_table.intern("write_buffer_onto_disk"));   // nocheckin
     cx.keymap.bind(KeyCombo::ctrl('s'), cx.command_table.intern("search"));   // nocheckin
@@ -2775,6 +2792,7 @@ fn editor_initialize_custom_data(editor: &mut Editor, _gpu: &mut Gpu) {
         searcher: Searcher::default(),
 
         lsp: LspClient::disabled(),
+        jump_stack: Vec::with_capacity(32),
 
         flashed_lines: Vec::with_capacity(32),
         highlight_scratch: Vec::with_capacity(32),
@@ -4200,11 +4218,15 @@ fn setup_hooks(cx: &mut CommandContext) {
         if editor.lsp().is_enabled() {
             let buffer = &mut editor.buffers[buffer_id];
             let Some(path) = buffer.path.clone() else { return };
+            let path = std::fs::canonicalize(&path).map(PathBuf::into_boxed_path).unwrap_or(path);
+
             let end = buffer.text.len_bytes() as usize;
             buffer.flatten_tree_into_scratch(0, end);  // :BufferScratch
+
             editor.custom_data.lsp_mut().did_open_buf(
                 path.to_str().unwrap(),
-                &buffer.scratch_space_to_flatten_tree_into
+                &buffer.scratch_space_to_flatten_tree_into,
+                buffer_id
             );
         }
     });
@@ -4215,16 +4237,39 @@ fn setup_hooks(cx: &mut CommandContext) {
             center_undo_graph_on_head(editor);
         }
 
-        if editor.lsp().is_enabled() {
-            let buffer = &mut editor.buffers[buffer_id];
+        let is_file_lsp_opened = editor.custom_data.lsp().is_file_opened(buffer_id);
 
-            let Some(path) = buffer.path.clone() else { return };
+        let buffer = &mut editor.buffers[buffer_id];
+        let Some(path) = buffer.path.clone() else { return };
+        let path = std::fs::canonicalize(&path).map(PathBuf::into_boxed_path).unwrap_or(path);
+
+        let version = buffer.last_edit_generation as _;
+
+        if !is_file_lsp_opened {
             let end = buffer.text.len_bytes() as usize;
             buffer.flatten_tree_into_scratch(0, end);  // :BufferScratch
+
+            editor.custom_data.lsp_mut().did_open_buf(
+                path.to_str().unwrap(),
+                &buffer.scratch_space_to_flatten_tree_into,
+                buffer_id
+            );
+        } else if buffer.did_snap_state {
+            let end = buffer.text.len_bytes() as usize;
+            buffer.flatten_tree_into_scratch(0, end);  // :BufferScratch
+
             editor.custom_data.lsp_mut().did_change_buf(
                 path.to_str().unwrap(),
-                &buffer.scratch_space_to_flatten_tree_into, 1
-            ); // nocheckin
+                &buffer.scratch_space_to_flatten_tree_into,
+                version
+            );
+        } else if !buffer.ts_edits_in_this_frame.is_empty() {
+            editor.custom_data.lsp_mut().did_change_buf_from_tree(
+                path.to_str().unwrap(),
+                version,
+                &buffer.ts_edits_in_this_frame,
+                &mut buffer.text    // @Incomplete: Add a method to PieceTree to swap in roots?
+            );
         }
     });
 
@@ -6099,12 +6144,14 @@ fn launch_search(editor: &mut Editor) {
 
     std::thread::spawn(move || {
         const CANCEL_CHECK_INTERVAL: usize = 512;
+
         let mut checked = 0usize;
         for m in regex.find_iter(&text) {
             checked += 1;
             if checked % CANCEL_CHECK_INTERVAL == 0 {
                 if cancel_flag.load(Ordering::Relaxed) { return; }
             }
+
             if tx.send(SearchMatch {
                 byte_start: m.start() as u32,
                 byte_end:   m.end()   as u32,

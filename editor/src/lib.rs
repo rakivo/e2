@@ -2631,7 +2631,7 @@ impl View {
 
     #[inline]
     pub fn scroll_to_cursor_centered_h(&mut self, cursor_x: f32, rect: Rect) {
-        self.scroll_x = (cursor_x - rect.w / 2.0).max(0.0);
+        self.scroll_x = (cursor_x - rect.x - rect.w / 2.0).max(0.0);
     }
 
     #[inline]
@@ -2647,7 +2647,7 @@ impl View {
 
     #[inline]
     pub fn scroll_to_cursor_top_h(&mut self, cursor_x: f32, rect: Rect) {
-        self.scroll_x = (cursor_x - rect.w / 2.0).max(0.0);
+        self.scroll_x = (cursor_x - rect.x - rect.w / 2.0).max(0.0);
     }
 
     #[inline]
@@ -2663,7 +2663,7 @@ impl View {
 
     #[inline]
     pub fn scroll_to_cursor_bottom_h(&mut self, cursor_x: f32, rect: Rect) {
-        self.scroll_x = (cursor_x - rect.w / 2.0).max(0.0);
+        self.scroll_x = (cursor_x - rect.x - rect.w / 2.0).max(0.0);
     }
 
     #[inline]
@@ -4764,6 +4764,10 @@ pub fn open_initial_buffer(editor: &mut Editor) {
 
     if let Some(p) = canon {
         editor.canonicalized_path_to_buffer_id.insert(p.into(), buffer_id);
+    }
+
+    if let Some(hook) = editor.hooks.opened_file {  // @Design: Move this into the if-block below?
+        hook(editor, buffer_id);
     }
 }
 
