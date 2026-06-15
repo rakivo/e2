@@ -24,6 +24,7 @@
 pub mod gpu;
 pub mod util;
 pub use editor_helpers::color;
+use editor_helpers::tprint;
 pub use editor_lexer as lexer;
 pub use editor_buffer as buffer;
 pub use editor_helpers::atum;
@@ -648,7 +649,7 @@ pub struct LineLayout {
     pub glyph_count:     u32,
 
     pub width:           f32,      // Total advance (all glyphs)
-    pub line_byte_start: usize,    // Rope byte offset where this line begins
+    pub line_byte_start: u32,      // Piece Tree byte offset where this line begins
 }
 
 impl LineLayout {
@@ -757,6 +758,7 @@ pub struct TextLayout {
     //
     // Recycled each rebuild
     //
+
     pub lines:        Vec<LineLayout>,
     pub glyphs:       Vec<Glyph>,
 
@@ -1016,7 +1018,7 @@ pub fn build_text_layout(
         editor.relex_us_acc += t0.elapsed().as_micros() as f32;
     }
 
-    let buffer = &editor.buffers[buffer_id];
+    let buffer = &mut editor.buffers[buffer_id];
 
     let (mut lines, mut glyphs) = if let Some(mut old) = old_layout {
         old.lines.clear();
@@ -1102,7 +1104,7 @@ pub fn build_text_layout(
             width:           0.0,
             glyph_count:     0,
             glyph_start:     0,
-            line_byte_start,
+            line_byte_start: line_byte_start as _,
         };
 
         if s_start == s_end {
@@ -1112,15 +1114,14 @@ pub fn build_text_layout(
 
         // @Note: This is fine because lex_scratch is valid UTF-8 and s_start/s_end are on char boundaries
         // because memchr splits on b'\n' which is single-byte.
-        // let line_str = &scratch_str[s_start..s_end];
-        let line_str = buffer.text.slice(s_start as u32..s_end as u32);
+        let line_slice = buffer.text.slice(s_start as u32..s_end as u32);
 
         let glyph_start = glyphs.len() as u32;
 
         let mut local_x  = 0.0f32;
         let mut abs_byte = line_byte_start;
 
-        for ch in line_str.chars() {
+        for ch in line_slice.chars() {
             //
             // Advance token cursor past tokens that end before this byte.
             // Because both tokens and lines are sorted by byte offset,
@@ -1536,7 +1537,7 @@ pub fn render_text_layout(
     let view = &editor.views[view_id];
     let Some(layout) = &view.layout else { return };
     let buffer_id = view.buffer_id;
-    let buffer = &editor.buffers[buffer_id];
+    let buffer = &mut editor.buffers[buffer_id];
 
     //
     // Draw the ghost (unactive) cursor
@@ -1573,7 +1574,121 @@ pub fn render_text_layout(
 
         let color_hook = editor.hooks.glyph_color_overrides;
 
-        for ll in &layout.lines {
+        //
+        // Collect an identificator under the cursor to try find some matches!
+        //
+        let mut ident_string = SmallString::<[u8; 256]>::new();
+        let range_of_ident = buffer.try_get_char_range_of_identifier_surrounding_this_index(view.cursor.char_index);
+        if let Some((start, end)) = range_of_ident {
+            ident_string.reserve(end.saturating_sub(start));
+            tprint!(&mut ident_string, "{}", buffer.text.slice_chars_range(start as u32..end as u32));
+        }
+
+        editor.scratch_matching_ident_highlight_matches.clear();
+
+        if !ident_string.is_empty() {
+            for (line_index, ll) in layout.lines.iter().enumerate() {
+                let glyphs = ll.glyphs(&layout.glyphs);
+                if glyphs.is_empty() { continue; }
+
+                //
+                // Check for the ident matches!
+                //
+                let ident_bytes = ident_string.as_bytes();
+
+                let line_byte_end = layout.lines
+                    .get(line_index + 1)
+                    .map(|next_line| next_line.line_byte_start)
+                    .unwrap_or_else(|| buffer.text.len_bytes() as u32);
+
+                let line_len_bytes = line_byte_end - ll.line_byte_start;
+
+                let mut chunks = piece_tree::ChunkIter::new(&buffer.text, ll.line_byte_start, line_byte_end);
+
+                if let Some(first_chunk) = chunks.next() {
+                    let line_bytes = if first_chunk.len() as u32 == line_len_bytes {
+                        first_chunk.as_bytes()
+                    } else {
+                        //
+                        // If the first chunk doesn't span the whole line, concat it with the current one
+                        //
+                        buffer.scratch_space_to_flatten_tree_into.clear();
+                        buffer.scratch_space_to_flatten_tree_into.push_str(first_chunk);
+                        for chunk in chunks {
+                            buffer.scratch_space_to_flatten_tree_into.push_str(chunk);
+                        }
+                        buffer.scratch_space_to_flatten_tree_into.as_bytes()
+                    };
+
+                    let line_str = unsafe { std::str::from_utf8_unchecked(line_bytes) };
+                    let iter = memchr::memmem::find_iter(line_bytes, ident_bytes);
+
+                    for rel_byte_offset in iter {
+                        let match_end = rel_byte_offset + ident_bytes.len();
+
+                        let prev_char_is_ident = if rel_byte_offset == 0 {
+                            false
+                        } else {
+                            line_str[..rel_byte_offset].chars().next_back()
+                                .map_or(false, editor_buffer::is_word_char_or_underscore)
+                        };
+
+                        let next_char_is_ident = if match_end >= line_str.len() {
+                            false
+                        } else {
+                            line_str[match_end..].chars().next()
+                                .map_or(false, editor_buffer::is_word_char_or_underscore)
+                        };
+
+                        if !prev_char_is_ident && !next_char_is_ident {
+                            editor.scratch_matching_ident_highlight_matches.push((line_index as _, rel_byte_offset as _));
+                        }
+                    }
+                }
+            }
+        }
+
+        //
+        // Draw the ident matches if there's more than 1 of them!
+        //
+        if editor.scratch_matching_ident_highlight_matches.len() > 1 {
+            let ident_char_len = ident_string.chars().count();
+
+            for &(line_index, rel_byte_offset) in &editor.scratch_matching_ident_highlight_matches {
+                let ll = &layout.lines[line_index as usize];
+
+                let y = context.line_y(ll.buffer_line) + line_h;
+
+                let global_byte_offset = ll.line_byte_start + rel_byte_offset;
+                let char_offset = buffer.text.byte_to_char(global_byte_offset);
+                let (_line, col) = buffer.char_to_line_col(char_offset as _);
+
+                let x = ll.x_for_col(origin_x, col, &layout.glyphs);
+
+                let mut w = 0.0;
+                for i in 0..ident_char_len {
+                    w += ll.glyph_width_at_col(col + i as u32, min_cursor_w, &layout.glyphs);
+                }
+
+                let highlight_height = line_h - cursor_h * 1.0;
+                let highlight_y = layout.lines.get(line_index.saturating_sub(1) as usize)
+                    .map_or(y, |l| context.line_y(l.buffer_line) + line_h) + cursor_h*2.0;
+
+                let alpha = 35;  // @Tune
+                let highlight_color = Color::rgba(100, 180, 240, alpha);  // @PaletteRefactor
+
+                gpu::draw_rect(
+                    gpu,
+                    x,
+                    highlight_y,
+                    w,
+                    highlight_height,
+                    highlight_color
+                );
+            }
+        }
+
+        for ll in layout.lines.iter() {
             let glyphs = ll.glyphs(&layout.glyphs);
             if glyphs.is_empty() { continue; }
 
@@ -1640,7 +1755,7 @@ pub fn render_text_layout(
             layout.glyph_width_at_col(cursor_col, min_cursor_w, ll)
             .max(min_cursor_w);
 
-        let crect = context.cursor_rect(cursor_glyph_w);
+        let cursor_rect = context.cursor_rect(cursor_glyph_w);
 
         if let Some(info) = crate::ts::lookup_overlay(
             overlay,
@@ -1702,10 +1817,10 @@ pub fn render_text_layout(
             //
 
             let margin = 8.0;
-            let mut ox = crect.x + 14.0;
-            let mut oy = crect.y - overlay_h - 6.0;
-            if ox + overlay_w > rect.x + rect.w - margin { ox = rect.x + rect.w - overlay_w - margin; }
-            if oy < rect.y + margin { oy = crect.y + crect.h + 6.0; }
+            let mut overlay_x = cursor_rect.x + 14.0;
+            let mut overlay_y = cursor_rect.y - overlay_h - 6.0;
+            if overlay_x + overlay_w > rect.x + rect.w - margin { overlay_x = rect.x + rect.w - overlay_w - margin }
+            if overlay_y             < rect.y + margin          { overlay_y = cursor_rect.y + cursor_rect.h + 6.0 }
 
             //
             // Draw
@@ -1714,22 +1829,21 @@ pub fn render_text_layout(
             let   bg_opacity = 0.62;
             let text_opacity = 0.80;
 
-            gpu::draw_rect(gpu, ox, oy, overlay_w, overlay_h, Color::hex(0x1E1E1E).with_alpha(bg_opacity));
-            gpu::draw_rect_outline(gpu, ox, oy, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A).with_alpha(bg_opacity));
+            gpu::draw_rect(gpu, overlay_x, overlay_y, overlay_w, overlay_h, Color::hex(0x1E1E1E).with_alpha(bg_opacity));
+            gpu::draw_rect_outline(gpu, overlay_x, overlay_y, overlay_w, overlay_h, 1.0, Color::hex(0x3A3A3A).with_alpha(bg_opacity));
 
-            let mut tx = ox + pad_x;
-            let ty = oy + pad_y_top + font_size;
+            let mut text_x = overlay_x + pad_x;
+            let text_y = overlay_y + pad_y_top + font_size;
             for (text, active) in &pieces {
-                let color =
-                    if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) }.with_alpha(text_opacity);
+                let color = if *active { Color::hex(0xD7BA7D) } else { Color::hex(0x9CDCFE) }.with_alpha(text_opacity);
 
-                gpu::draw_text(gpu, text, tx, ty, font_size, color);
+                gpu::draw_text(gpu, text, text_x, text_y, font_size, color);
                 if *active {
                     let w = gpu::measure_text(gpu, text, font_size);
-                    gpu::draw_rect(gpu, tx, ty + 3.0, w, 1.0, Color::hex(0xD7BA7D).with_alpha(text_opacity));
+                    gpu::draw_rect(gpu, text_x, text_y + 3.0, w, 1.0, Color::hex(0xD7BA7D).with_alpha(text_opacity));
                 }
 
-                tx += gpu::measure_text(gpu, text, font_size);
+                text_x += gpu::measure_text(gpu, text, font_size);
             }
         }
     }
@@ -2878,6 +2992,8 @@ pub struct Editor {
     pub scratch_panel_bar:     String,
     pub scratch_panel_bar_dim: String,
 
+    pub scratch_matching_ident_highlight_matches: Vec<(u32, u32)>,
+
     pub most_recently_used_buffers:  VecDeque<BufferId>,
     pub buffer_cycle_index:          Option<usize>,
 
@@ -2997,6 +3113,7 @@ impl Editor {
             time_in_seconds: 0.0,
             scratch_panel_bar: String::with_capacity(128),
             scratch_panel_bar_dim: String::with_capacity(128),
+            scratch_matching_ident_highlight_matches: Vec::with_capacity(32),
             config: Default::default(),
             ui: UiState::new(0.0, 0.0),
             logger_config,

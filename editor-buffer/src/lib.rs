@@ -1011,6 +1011,21 @@ impl Buffer {
         cursor.preferred_col = None;
     }
 
+    pub fn try_get_char_range_of_identifier_surrounding_this_index(&self, index: usize) -> Option<(usize, usize)> {
+        let mut start = index;
+        let mut end   = index;
+
+        let len = self.text.len_chars() as usize;
+
+        // Skip word chars going left
+        while start > 0 && is_word_char_or_underscore(self.text.char(start as u32 - 1)) { start -= 1; }
+
+        // Skip word chars going right
+        while end < len && is_word_char_or_underscore(self.text.char(end as u32)) { end += 1; }
+
+        (start != end).then_some((start, end))
+    }
+
     pub fn move_lines(&mut self, cursor: &mut Cursor, first_line: usize, last_line: usize, up: bool) {
         let total_lines = self.text.len_lines() as usize;
 
@@ -1554,6 +1569,11 @@ impl Buffer {
 #[inline(always)]
 pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric()
+}
+
+#[inline(always)]
+pub fn is_word_char_or_underscore(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 pub struct UndoGraphNode {
