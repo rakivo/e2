@@ -9,9 +9,11 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod lsp;
+mod rss;
 
 use editor::ts::{TreeSitter, extract_prefix_at_cursor, query_completions};
 use editor::ui::{BoxRef, KEY_NULL, Size};
+use editor::util::format_bytes;
 use editor_helpers::tprint;
 use lsp::*;
 
@@ -2349,9 +2351,9 @@ pub fn completion_next(cx: &mut CommandContext) {
         let (start, prefix) = extract_prefix_at_cursor(buf, cursor);
         if prefix.is_empty() { return }
 
-        let tree = buf.text.clone();
         let buffer_id = view.buffer_id;
         let cursor_byte = buf.text.char_to_byte(view.cursor.char_index as _);
+        let tree = &cx.editor.buffers[buffer_id].text;
         let tree_ref = cx.editor.tree_sitter.trees.get(&buffer_id);
         let items = query_completions(
             &prefix,
@@ -2482,6 +2484,32 @@ pub fn save_session(cx: &mut CommandContext) {
             cx.editor.messager.push(&message, cx.gpu);
         }
     }
+}
+
+#[command]
+pub fn print_language_server_rss_usage(cx: &mut CommandContext) {
+    let Some(inner) = cx.editor.lsp().inner() else {
+        cx.editor.messager.push(
+            "[Language Server isn't initialized!  Initialize it with 'start_language_server' command]",
+            cx.gpu
+        );
+
+        return;
+    };
+
+    let Some(rss) = rss::child_rss_bytes(&inner.server_child) else {
+        cx.editor.messager.push(
+            "[Couldn't fetch Language Server's RSS usage, sorry!]",
+            cx.gpu
+        );
+
+        return;
+    };
+
+    let s = format_bytes(rss as _);
+    cx.editor.messager.push(&format!{
+        "[Language server RSS usage]: {s}",
+    }, cx.gpu);
 }
 
 pub fn goto_location(editor: &mut Editor, view_id: ViewId, path: &str, line: u32, col: u32) {
@@ -4273,7 +4301,7 @@ fn setup_hooks(cx: &mut CommandContext) {
         }
     });
 
-    cx.editor.hooks.exiting = Some(|editor| editor.lsp_mut().shutdown_blocking());
+    cx.editor.hooks.exiting = Some(|_editor| {});
 }
 
 pub fn editor_dispatch_lister_confirm(cx: &mut CommandContext) {

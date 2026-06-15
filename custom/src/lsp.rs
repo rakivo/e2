@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use smallstr::SmallString;
 use serde_json::{json, Value};
@@ -44,13 +45,18 @@ impl PendingRequest {
     pub fn wait(self) -> Value {
         self.rx.recv().unwrap_or(Value::Null)
     }
+
+    #[inline]
+    pub fn wait_timeout(self, duration: Duration) -> Option<Value> {
+        self.rx.recv_timeout(duration).ok()
+    }
 }
 
 pub type RequestId = u64;
 
 pub struct LspClient(Option<LspClientInner>);
 
-struct LspClientInner {
+pub struct LspClientInner {
     stdin: ChildStdin,
     next_request_id: RequestId,
 
@@ -66,9 +72,17 @@ struct LspClientInner {
     send_buf: Vec<u8>,
 
     // Keep child alive. Dropping it would close stdin and kill the server.
-    _server_child: Child,
+    pub server_child: Child,
 
     pending_goto: Option<PendingRequest>,
+
+    did_shutdown: bool
+}
+
+impl Drop for LspClientInner {
+    fn drop(&mut self) {
+        self.shutdown_impl();
+    }
 }
 
 impl LspClient {
@@ -86,8 +100,7 @@ impl LspClient {
     }
 
     // Spawn the LSP server process and send initialize/initialized.
-    // Blocks until the server responds to initialize - this is the right
-    // place to block because the editor isn't ready to use LSP yet anyway.
+    // Blocks until the server responds to initialize.
     pub fn start(server_cmd: &str, server_args: &[&str], workspace_root: &str) -> Self {
         let mut server_child = Command::new(server_cmd)
             .args(server_args)
@@ -112,17 +125,18 @@ impl LspClient {
             next_request_id: 1,
             pending,
             send_buf: Vec::with_capacity(64 * 1024), // 64k initial, grows as needed
-            _server_child: server_child,
+            server_child,
             pending_goto: None,
-            opened_buffers: Default::default()
+            opened_buffers: Default::default(),
+            did_shutdown: false
         };
 
         inner.initialize(workspace_root);
         Self(Some(inner))
     }
 
-    #[inline] fn inner    (&self)     -> Option<&LspClientInner>     { self.0.as_ref() }
-    #[inline] fn inner_mut(&mut self) -> Option<&mut LspClientInner> { self.0.as_mut() }
+    #[inline] pub fn inner    (&self)     -> Option<&LspClientInner>     { self.0.as_ref() }
+    #[inline] pub fn inner_mut(&mut self) -> Option<&mut LspClientInner> { self.0.as_mut() }
 
     pub fn is_file_opened(&self, buffer_id: BufferId) -> bool {
         let Some(c) = self.inner() else { return false };
@@ -295,19 +309,22 @@ impl LspClient {
             .and_then(|c| c.pending_goto.as_ref())
             .map_or(false, |g| g.is_empty())
     }
-
-    // Call this before dropping the client.
-    // Blocks on the shutdown response - that is correct per the LSP spec.
-    #[inline]
-    pub fn shutdown_blocking(&mut self) {
-        let Some(c) = self.inner_mut() else { return };
-        let req = c.request_async("shutdown", json!(null));
-        req.wait();
-        c.notify("exit", json!(null));
-    }
 }
 
 impl LspClientInner {
+    #[inline]
+    fn shutdown_impl(&mut self) {
+        if self.did_shutdown { return }
+        self.did_shutdown = true;
+
+        let req = self.request_async("shutdown", json!(null));
+        if req.wait_timeout(Duration::from_secs(2)).is_none() {
+            eprintln!("[LSP] shutdown timed out");
+        }
+
+        self.notify("exit", json!(null));
+    }
+
     #[inline]
     fn initialize(&mut self, root: &str) {
         let root_uri = format!("file://{root}");
@@ -368,7 +385,7 @@ impl LspClientInner {
 //
 fn reader_thread(stdout: ChildStdout, pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>) {
     let mut reader = BufReader::new(stdout);
-    let mut line   = String::new();
+    let mut line   = String::with_capacity(128);
     let mut body   = Vec::with_capacity(64 * 1024);
 
     loop {
@@ -382,17 +399,19 @@ fn reader_thread(stdout: ChildStdout, pending: Arc<Mutex<HashMap<u64, Sender<Val
                 Ok(0) | Err(_) => return,  // Server closed stdout
                 _ => {}
             }
+
             let trimmed = line.trim();
-            if trimmed.is_empty() { break; }
+            if trimmed.is_empty() { break }
+
             if let Some(val) = trimmed.strip_prefix("Content-Length: ") {
                 content_len = val.parse().unwrap_or(0);
             }
         }
 
-        if content_len == 0 { continue; }
+        if content_len == 0 { continue }
 
         body.resize(content_len, 0);
-        if std::io::Read::read_exact(&mut reader, &mut body).is_err() { return; }
+        if std::io::Read::read_exact(&mut reader, &mut body).is_err() { return }
 
         let Ok(msg) = serde_json::from_slice::<Value>(&body) else { continue };
 
